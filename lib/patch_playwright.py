@@ -19,7 +19,7 @@ from pathlib import Path
 
 def _find_corebundle() -> Path | None:
     """Locate coreBundle.js inside the active venv or site-packages."""
-    # 1) project-local venv (Windows)
+    # 1) project-local venv (Windows + Linux)
     here = Path(__file__).resolve().parent.parent
     candidates = [
         here / ".venv" / "Lib" / "site-packages",
@@ -29,12 +29,24 @@ def _find_corebundle() -> Path | None:
         if base.exists():
             for p in base.rglob("playwright/driver/package/lib/coreBundle.js"):
                 return p
-    # 2) global site-packages
-    import site
-    for sp in site.getsitepackages() + [site.getusersitepackages()]:
-        p = Path(sp) / "playwright" / "driver" / "package" / "lib" / "coreBundle.js"
-        if p.exists():
-            return p
+    # 2) global site-packages (best-effort; may not exist in venv/embeddable)
+    try:
+        import site
+        sps = []
+        try:
+            sps.extend(site.getsitepackages())
+        except Exception:
+            pass
+        try:
+            sps.append(site.getusersitepackages())
+        except Exception:
+            pass
+        for sp in sps:
+            p = Path(sp) / "playwright" / "driver" / "package" / "lib" / "coreBundle.js"
+            if p.exists():
+                return p
+    except Exception:
+        pass
     return None
 
 
@@ -135,5 +147,6 @@ def patch_playwright(log_callback=None) -> bool:
 
 
 if __name__ == "__main__":
-    ok = patch_playwright(log_callback=print)
-    sys.exit(0 if ok else 1)
+    # Non-fatal: always exit 0 so start.bat doesn't treat missing patch as failure
+    patch_playwright(log_callback=print)
+    sys.exit(0)
