@@ -1,6 +1,6 @@
 # Grok Register Win
 
-![Panel](docs/panel.png)
+![Banner](docs/banner.png)
 
 Windows 下双击即用的 Grok（xAI）账号自动注册面板。基于浏览器自动化完成注册，自动换取 CPA OAuth 凭证，并开启 NSFW 偏好。
 
