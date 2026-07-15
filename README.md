@@ -104,8 +104,7 @@ $env:PANEL_PASSWORD="你的密码"
 
 ```
 grok-register-win/
-├── start.bat / 启动.bat      # 双击启动
-├── setup.bat                 # 仅安装依赖
+├── start.bat                 # 双击启动
 ├── launcher.py               # 启动器（代理探测、Playwright 修补）
 ├── grok_register_ttk.py      # 注册主程序
 ├── config.example.json
