@@ -1399,6 +1399,10 @@ INDEX_HTML = r"""
 
   <div class="card">
     <h2>运行日志</h2>
+    <div class="muted" style="margin:-6px 0 10px;font-size:12px;line-height:1.55">
+      提示：绝大多数注册失败来自网络环境，而非脚本本身。实测机场节点里<strong style="color:var(--ok);font-weight:600">日本</strong>更稳；
+      新加坡 / 美国 / 德国成功率偏低。失败时请先在 Clash 换日本节点再试。
+    </div>
     <div id="logbox">等待任务…</div>
   </div>
 
