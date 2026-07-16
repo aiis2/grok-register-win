@@ -153,7 +153,7 @@ grok-register-win/
 
 ## 更新日志
 
-### v1.0.11（2026-07-16）
+### v1.1.0（2026-07-16）
 - 修复 SSO→CPA 失败：`curl_cffi` 固定 `chrome131` 指纹被 Cloudflare 403 拦截，导致 `authorize 未进入 consent 页`
 - 启动时自动选择可用 TLS impersonate（优先 `chrome136`，并回退其它配置文件）
 - 识别 Cloudflare 拦截时输出明确错误（HTTP 状态 + impersonate），便于排查
