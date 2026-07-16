@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse
 
 
@@ -553,3 +553,128 @@ def convert_records(
         if delay > 0 and i < len(records):
             time.sleep(delay)
     return ok_list, fail_list
+
+
+# ---- CPA → Sub2API official import package (sub2api-data) ----
+# One-click import in Sub2API admin: 导入数据 → upload this JSON.
+SUB2_DATA_TYPE = "sub2api-data"
+SUB2_DATA_VERSION = 1
+SUB2_DEFAULT_CONCURRENCY = 1
+SUB2_DEFAULT_PRIORITY = 50
+
+
+def _sub2_pick_str(obj: dict, *keys: str) -> str:
+    for k in keys:
+        v = obj.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def cpa_to_sub2_account(
+    cpa: dict,
+    *,
+    name_hint: str = "",
+    concurrency: int = SUB2_DEFAULT_CONCURRENCY,
+    priority: int = SUB2_DEFAULT_PRIORITY,
+) -> Optional[dict]:
+    """Map one CLIProxyAPI-style CPA OAuth JSON → Sub2API DataAccount.
+
+    Returns None if required tokens are missing.
+    Does not re-run OAuth; pure field remap.
+    """
+    if not isinstance(cpa, dict):
+        return None
+
+    access = _sub2_pick_str(cpa, "access_token")
+    refresh = _sub2_pick_str(cpa, "refresh_token")
+    if not access and not refresh:
+        return None
+
+    email = _sub2_pick_str(cpa, "email")
+    sub = _sub2_pick_str(cpa, "sub")
+    name = (
+        _sub2_pick_str({"n": name_hint}, "n")
+        or email
+        or sub
+        or "grok-oauth"
+    )
+
+    # CPA uses "expired"; Sub2API credentials use "expires_at" (RFC3339 string).
+    expires_at = _sub2_pick_str(cpa, "expires_at", "expired")
+    if not expires_at:
+        expires_at = rfc3339(datetime.now(timezone.utc))
+
+    base_url = _sub2_pick_str(cpa, "base_url") or BASE_URL
+    token_type = _sub2_pick_str(cpa, "token_type") or "Bearer"
+
+    creds: Dict[str, Any] = {
+        "access_token": access,
+        "expires_at": expires_at,
+        "base_url": base_url,
+    }
+    if refresh:
+        creds["refresh_token"] = refresh
+    if token_type:
+        creds["token_type"] = token_type
+
+    id_token = _sub2_pick_str(cpa, "id_token")
+    if id_token:
+        creds["id_token"] = id_token
+    if email:
+        creds["email"] = email
+    if sub:
+        creds["sub"] = sub
+
+    client_id = _sub2_pick_str(cpa, "client_id")
+    if client_id:
+        creds["client_id"] = client_id
+    scope = _sub2_pick_str(cpa, "scope")
+    if scope:
+        creds["scope"] = scope
+
+    return {
+        "name": name,
+        "platform": "grok",
+        "type": "oauth",
+        "credentials": creds,
+        "concurrency": int(concurrency) if concurrency is not None else SUB2_DEFAULT_CONCURRENCY,
+        "priority": int(priority) if priority is not None else SUB2_DEFAULT_PRIORITY,
+    }
+
+
+def build_sub2_payload(
+    cpa_entries: List[dict],
+    *,
+    name_hints: Optional[List[str]] = None,
+    concurrency: int = SUB2_DEFAULT_CONCURRENCY,
+    priority: int = SUB2_DEFAULT_PRIORITY,
+) -> dict:
+    """Build official Sub2API import JSON (type=sub2api-data, version=1).
+
+    ``proxies`` is always [] — bind proxy groups in Sub2API after import.
+    Bad/incomplete CPA entries are skipped.
+    """
+    accounts: List[dict] = []
+    hints = name_hints or []
+    for i, entry in enumerate(cpa_entries or []):
+        hint = hints[i] if i < len(hints) else ""
+        acc = cpa_to_sub2_account(
+            entry,
+            name_hint=hint,
+            concurrency=concurrency,
+            priority=priority,
+        )
+        if acc:
+            accounts.append(acc)
+
+    return {
+        "type": SUB2_DATA_TYPE,
+        "version": SUB2_DATA_VERSION,
+        "exported_at": rfc3339(datetime.now(timezone.utc)),
+        "proxies": [],
+        "accounts": accounts,
+    }

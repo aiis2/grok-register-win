@@ -96,6 +96,8 @@ for _p in (str(SSO2CPA_PATH), str(BASE_DIR / "lib"), str(Path(__file__).resolve(
         sys.path.insert(0, _p)
 try:
     from sso2cpa_core import (  # type: ignore
+        build_sub2_payload,
+        cpa_to_sub2_account,
         convert_one,
         normalize_sso,
         safe_filename as cpa_safe_filename,
@@ -106,6 +108,8 @@ try:
     _CPA_CORE_ERR = ""
 except Exception as _e:  # pragma: no cover
     convert_one = None  # type: ignore
+    build_sub2_payload = None  # type: ignore
+    cpa_to_sub2_account = None  # type: ignore
     normalize_sso = lambda t: (t or "").strip()  # type: ignore
     cpa_safe_filename = lambda s: re.sub(r"[^\w.@+-]+", "_", s or "unknown")[:100]  # type: ignore
     sso_fingerprint = lambda s: hashlib.sha256((s or "").encode()).hexdigest()  # type: ignore
@@ -1248,6 +1252,9 @@ INDEX_HTML = r"""
     a.btn.primary,button.btn.primary{background:linear-gradient(135deg,var(--accent2),var(--accent));border-color:transparent;color:#fff;font-weight:600;box-shadow:0 4px 12px rgba(79,140,255,.3)}
     a.btn.primary:hover,button.btn.primary:hover{box-shadow:0 6px 18px rgba(79,140,255,.45)}
     a.btn.ok,button.btn.ok{background:linear-gradient(135deg,#1f9d63,#3dd68c);border:0;color:#042;font-weight:600;box-shadow:0 4px 12px rgba(61,214,140,.25)}
+    a.btn.ok:hover,button.btn.ok:hover{box-shadow:0 6px 18px rgba(61,214,140,.4)}
+    a.btn.sub2,button.btn.sub2{background:linear-gradient(135deg,#6d28d9,#a78bfa);border:0;color:#fff;font-weight:600;box-shadow:0 4px 12px rgba(167,139,250,.28)}
+    a.btn.sub2:hover,button.btn.sub2:hover{box-shadow:0 6px 18px rgba(167,139,250,.45)}
     a.btn.danger,button.btn.danger{background:#2a1717;border-color:#5a2b2b;color:#ffb4b4}
     a.btn.danger:hover,button.btn.danger:hover{background:#381c1c}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:16px 0 20px}
@@ -1294,6 +1301,7 @@ INDEX_HTML = r"""
     <div class="actions">
       <a class="btn primary" href="/download/sso.txt" title="email----password----sso">⬇ 下载 SSO (TXT)</a>
       <a class="btn ok" href="/download/cpa.zip" title="CPA OAuth JSON（CLIProxyAPI 可用）">⬇ 下载 CPA (JSON)</a>
+      <a class="btn sub2" href="/download/sub2.zip" title="Sub2API 官方导入包 type=sub2api-data：单账号 JSON + all 合集">⬇ 下载 Sub2 (JSON)</a>
     </div>
   </header>
 
@@ -1854,6 +1862,203 @@ def download_cpa_zip():
     fname = f"cpa_oauth_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     return send_file(
         buf, as_attachment=True, download_name=fname, mimetype="application/zip"
+    )
+
+
+def _load_cpa_entries_for_sub2() -> Tuple[List[dict], List[str]]:
+    """Read existing CPA JSON files for Sub2 export. No re-OAuth."""
+    entries: List[dict] = []
+    name_hints: List[str] = []
+    for p in list_cpa_files():
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                continue
+            entries.append(obj)
+            # xai-email.json → email hint; strip optional -fingerprint suffix
+            stem = p.stem
+            hint = stem[4:] if stem.lower().startswith("xai-") else stem
+            name_hints.append(hint or "")
+        except Exception:
+            continue
+    return entries, name_hints
+
+
+def _fallback_sub2_payload(cpa_entries: List[dict], name_hints: List[str]) -> dict:
+    """If sso2cpa_core import failed, still build a minimal sub2api-data package."""
+    accounts: List[dict] = []
+    for i, cpa in enumerate(cpa_entries):
+        if not isinstance(cpa, dict):
+            continue
+        access = str(cpa.get("access_token") or "").strip()
+        refresh = str(cpa.get("refresh_token") or "").strip()
+        if not access and not refresh:
+            continue
+        email = str(cpa.get("email") or "").strip()
+        sub = str(cpa.get("sub") or "").strip()
+        hint = name_hints[i] if i < len(name_hints) else ""
+        name = hint or email or sub or "grok-oauth"
+        expires_at = str(cpa.get("expires_at") or cpa.get("expired") or "").strip()
+        if not expires_at:
+            expires_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        creds = {
+            "access_token": access,
+            "expires_at": expires_at,
+            "base_url": str(cpa.get("base_url") or "https://cli-chat-proxy.grok.com/v1").strip(),
+        }
+        if refresh:
+            creds["refresh_token"] = refresh
+        token_type = str(cpa.get("token_type") or "Bearer").strip()
+        if token_type:
+            creds["token_type"] = token_type
+        for k in ("id_token", "email", "sub", "client_id", "scope"):
+            v = str(cpa.get(k) or "").strip()
+            if v:
+                creds[k] = v
+        accounts.append(
+            {
+                "name": name,
+                "platform": "grok",
+                "type": "oauth",
+                "credentials": creds,
+                "concurrency": 1,
+                "priority": 50,
+            }
+        )
+    return {
+        "type": "sub2api-data",
+        "version": 1,
+        "exported_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "proxies": [],
+        "accounts": accounts,
+    }
+
+
+def _build_sub2_accounts(
+    cpa_entries: List[dict], name_hints: List[str]
+) -> List[dict]:
+    """Map CPA entries → Sub2 DataAccount list (no re-OAuth)."""
+    if build_sub2_payload is not None:
+        payload = build_sub2_payload(cpa_entries, name_hints=name_hints)
+        return list(payload.get("accounts") or [])
+    payload = _fallback_sub2_payload(cpa_entries, name_hints)
+    return list(payload.get("accounts") or [])
+
+
+def _sub2_package(accounts: List[dict]) -> dict:
+    """Official Sub2API import wrapper around account list."""
+    if build_sub2_payload is not None:
+        # reuse core helper for type/version/exported_at; pass empty CPA list
+        # then inject accounts (avoids re-mapping)
+        base = build_sub2_payload([])
+        base["accounts"] = accounts
+        return base
+    return {
+        "type": "sub2api-data",
+        "version": 1,
+        "exported_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "proxies": [],
+        "accounts": accounts,
+    }
+
+
+def _sub2_safe_arcname(name: str, used: Set[str]) -> str:
+    """Unique zip member name: grok-{name}.json"""
+    base = cpa_safe_filename(name or "grok-oauth")
+    fname = f"grok-{base}.json"
+    if fname not in used:
+        used.add(fname)
+        return fname
+    i = 2
+    while True:
+        alt = f"grok-{base}-{i}.json"
+        if alt not in used:
+            used.add(alt)
+            return alt
+        i += 1
+
+
+@app.get("/download/sub2.zip")
+def download_sub2_zip():
+    """主接口 3：Sub2API 官方导入包 ZIP（对齐 CPA zip 结构）。
+
+    从已转换的 CPA JSON 现场映射，不重新注册/换票。
+
+    zip 内容：
+      README.txt
+      grok-*.json     — 每个账号一份完整 sub2api-data（可单独导入）
+      all.json        — 全部账号合集（推荐一键导入）
+      EMPTY.txt       — 无账号时的说明
+    """
+    need = require_login()
+    if need:
+        return need
+    cpa_entries, name_hints = _load_cpa_entries_for_sub2()
+    accounts = _build_sub2_accounts(cpa_entries, name_hints)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        readme = (
+            "Grok Register → Sub2API 官方导入包 (sub2api-data)\n"
+            "================================================\n\n"
+            "1) all.json：全部账号合集，推荐直接导入 Sub2API。\n"
+            "   管理后台 → 账号 → 导入数据 → 上传 all.json\n"
+            "2) grok-*.json：每个账号一份完整 sub2api-data（也可单独导入）。\n"
+            "3) type=sub2api-data / version=1 / platform=grok / type=oauth\n"
+            "4) 由已转换的 CPA OAuth 凭证现场映射，不重新注册/换票。\n"
+            "5) proxies 为空；导入后请在 Sub2API 里绑定分组/代理。\n"
+            "6) 若 zip 为空：先注册，或点面板「补转未转换 CPA」。\n"
+        )
+        zf.writestr("README.txt", readme)
+
+        used_names: Set[str] = set()
+        for acc in accounts:
+            try:
+                single = _sub2_package([acc])
+                raw = json.dumps(single, ensure_ascii=False, indent=2) + "\n"
+                arc = _sub2_safe_arcname(str(acc.get("name") or ""), used_names)
+                zf.writestr(arc, raw)
+            except Exception as e:
+                bad = _sub2_safe_arcname(
+                    f"BAD-{acc.get('name') or 'unknown'}", used_names
+                )
+                zf.writestr(bad.replace(".json", ".txt"), str(e))
+
+        all_pkg = _sub2_package(accounts)
+        zf.writestr(
+            "all.json",
+            json.dumps(all_pkg, ensure_ascii=False, indent=2) + "\n",
+        )
+
+        if not accounts:
+            zf.writestr(
+                "EMPTY.txt",
+                "暂无已转换账号。注册成功后会自动转 CPA，再点「下载 Sub2」；"
+                "或先点面板「补转未转换 CPA」。\n",
+            )
+
+    buf.seek(0)
+    fname = f"sub2api_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    return send_file(
+        buf, as_attachment=True, download_name=fname, mimetype="application/zip"
+    )
+
+
+@app.get("/download/sub2.json")
+def download_sub2_json():
+    """兼容旧链接：返回 all 合集 JSON（等同 zip 内 all.json）。"""
+    need = require_login()
+    if need:
+        return need
+    cpa_entries, name_hints = _load_cpa_entries_for_sub2()
+    accounts = _build_sub2_accounts(cpa_entries, name_hints)
+    payload = _sub2_package(accounts)
+    body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    fname = f"sub2api_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    return Response(
+        body,
+        mimetype="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 
