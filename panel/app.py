@@ -100,7 +100,6 @@ try:
         cpa_to_sub2_account,
         convert_one,
         normalize_sso,
-        parse_uploaded_records,
         safe_filename as cpa_safe_filename,
         sso_fingerprint,
     )
@@ -111,7 +110,6 @@ except Exception as _e:  # pragma: no cover
     convert_one = None  # type: ignore
     build_sub2_payload = None  # type: ignore
     cpa_to_sub2_account = None  # type: ignore
-    parse_uploaded_records = None  # type: ignore
     normalize_sso = lambda t: (t or "").strip()  # type: ignore
     cpa_safe_filename = lambda s: re.sub(r"[^\w.@+-]+", "_", s or "unknown")[:100]  # type: ignore
     sso_fingerprint = lambda s: hashlib.sha256((s or "").encode()).hexdigest()  # type: ignore
@@ -497,325 +495,6 @@ def enqueue_missing_accounts(limit: int = 500) -> int:
     return n
 
 
-def enqueue_all_sso_exchange(limit: int = 1000, force: bool = True) -> dict:
-    """Queue every local SSO for OAuth exchange (try all; expiry unknown).
-
-    Returns counts: queued / skipped / total.
-    """
-    queued = 0
-    skipped = 0
-    total = 0
-    for acc in unique_accounts():
-        if total >= limit:
-            break
-        sso = (acc.get("sso") or "").strip()
-        if not sso:
-            continue
-        total += 1
-        ok, reason = enqueue_cpa_convert(
-            email=acc.get("email") or "",
-            sso=sso,
-            password=acc.get("password") or "",
-            source=acc.get("source") or "one-click-refresh",
-            force=force,
-        )
-        if ok:
-            queued += 1
-        else:
-            skipped += 1
-    return {"queued": queued, "skipped": skipped, "total": total}
-
-
-def _looks_like_cpa_entry(obj: object) -> bool:
-    if not isinstance(obj, dict):
-        return False
-    access = str(obj.get("access_token") or "").strip()
-    refresh = str(obj.get("refresh_token") or "").strip()
-    if not access and not refresh:
-        return False
-    # CLIProxyAPI / our exporter shape
-    if str(obj.get("auth_kind") or "").lower() == "oauth":
-        return True
-    if str(obj.get("type") or "").lower() in ("xai", "grok"):
-        return True
-    if obj.get("expired") or obj.get("expires_at") or obj.get("base_url"):
-        return True
-    return bool(access and refresh)
-
-
-def _extract_cpa_entries_from_obj(obj: object) -> List[dict]:
-    """Pull CPA OAuth dicts from JSON object / array / all.json / sub2 accounts."""
-    out: List[dict] = []
-    if _looks_like_cpa_entry(obj):
-        out.append(obj)  # type: ignore[arg-type]
-        return out
-    if isinstance(obj, list):
-        for item in obj:
-            out.extend(_extract_cpa_entries_from_obj(item))
-        return out
-    if not isinstance(obj, dict):
-        return out
-    # CPA zip all.json is a bare array; also support {"accounts":[cpa...]}
-    for key in ("accounts", "items", "data", "cpa"):
-        val = obj.get(key)
-        if isinstance(val, list):
-            for item in val:
-                if _looks_like_cpa_entry(item):
-                    out.append(item)  # type: ignore[arg-type]
-                elif isinstance(item, dict) and isinstance(item.get("credentials"), dict):
-                    # Sub2API account → flatten credentials to CPA-like for store
-                    creds = dict(item["credentials"])
-                    if not _looks_like_cpa_entry(creds):
-                        continue
-                    flat = dict(creds)
-                    if not flat.get("email"):
-                        flat["email"] = str(item.get("name") or "").strip()
-                    if not flat.get("type"):
-                        flat["type"] = "xai"
-                    if not flat.get("auth_kind"):
-                        flat["auth_kind"] = "oauth"
-                    if flat.get("expires_at") and not flat.get("expired"):
-                        flat["expired"] = flat["expires_at"]
-                    out.append(flat)
-    return out
-
-
-def _cpa_email_key(email: str) -> str:
-    return cpa_safe_filename(str(email or "").strip() or "unknown")
-
-
-def find_cpa_files_for_email(email: str) -> List[Path]:
-    """All xai-{email}.json and xai-{email}-*.json variants."""
-    key = _cpa_email_key(email)
-    if not key or key == "unknown":
-        return []
-    out: List[Path] = []
-    for p in CPA_DIR.glob("xai-*.json"):
-        stem = p.stem  # xai-email or xai-email-fp
-        body = stem[4:] if stem.lower().startswith("xai-") else stem
-        if body == key or body.startswith(key + "-"):
-            out.append(p)
-    return out
-
-
-def find_cpa_files_for_sso(sso: str) -> List[Path]:
-    """CPA files whose stored sso fingerprint matches."""
-    sso = normalize_sso(sso)
-    if not sso:
-        return []
-    fp = sso_fingerprint(sso)
-    out: List[Path] = []
-    for p in list_cpa_files():
-        try:
-            obj = json.loads(p.read_text(encoding="utf-8"))
-            old_sso = normalize_sso(str(obj.get("sso") or ""))
-            if old_sso and sso_fingerprint(old_sso) == fp:
-                out.append(p)
-        except Exception:
-            continue
-    return out
-
-
-def delete_cpa_paths(paths: List[Path], reason: str = "") -> int:
-    n = 0
-    for p in paths:
-        try:
-            if p.exists():
-                p.unlink()
-                n += 1
-                log_line(f"[CPA] 删除 {p.name}" + (f" · {reason}" if reason else ""))
-        except Exception as e:
-            log_line(f"[CPA] 删除失败 {p.name}: {e}")
-    return n
-
-
-def save_cpa_entry_file(entry: dict, source: str = "upload") -> Tuple[bool, str]:
-    """Write one CPA OAuth JSON. Success: keep single xai-{email}.json (dedupe)."""
-    if not _looks_like_cpa_entry(entry):
-        return False, "not a CPA oauth entry"
-    email = str(entry.get("email") or "").strip() or "unknown"
-    sso = normalize_sso(str(entry.get("sso") or ""))
-    fp = sso_fingerprint(sso) if sso else hashlib.sha256(
-        (str(entry.get("refresh_token") or entry.get("access_token") or email)).encode("utf-8")
-    ).hexdigest()
-    entry = dict(entry)
-    entry.setdefault("type", "xai")
-    entry.setdefault("auth_kind", "oauth")
-    entry["_source"] = source
-    if sso:
-        entry["sso"] = sso
-
-    # Always canonical name; remove other variants for same email (dedupe on success)
-    fname = f"xai-{_cpa_email_key(email)}.json"
-    path = CPA_DIR / fname
-    keep = {path.resolve()}
-    extras = [p for p in find_cpa_files_for_email(email) if p.resolve() not in keep]
-    path.write_text(
-        json.dumps(entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    if extras:
-        delete_cpa_paths(extras, reason="换票/入库成功去重")
-
-    if sso:
-        save_cpa_index_item(
-            fp,
-            {
-                "email": email,
-                "file": fname,
-                "at": datetime.now().isoformat(timespec="seconds"),
-                "auth_kind": entry.get("auth_kind"),
-                "source": source,
-            },
-        )
-        with _cpa_lock:
-            _cpa_done.add(fp)
-    with _cpa_lock:
-        _cpa_state["ok"] = int(_cpa_state.get("ok") or 0) + 1
-        _cpa_state["last_ok_email"] = email
-        _cpa_state["last_error"] = ""
-    return True, fname
-
-
-def _parse_upload_blob(raw: bytes, filename: str = "") -> Tuple[List[dict], List[dict]]:
-    """Return (sso_records, cpa_entries) from one uploaded file body."""
-    sso_records: List[dict] = []
-    cpa_entries: List[dict] = []
-    name = (filename or "").lower()
-
-    # Prefer JSON CPA detect first
-    text = raw.decode("utf-8", "replace").strip()
-    if text:
-        try:
-            obj = json.loads(text)
-            cpa_entries = _extract_cpa_entries_from_obj(obj)
-        except Exception:
-            obj = None
-            cpa_entries = []
-
-        if not cpa_entries and parse_uploaded_records is not None:
-            try:
-                sso_records = parse_uploaded_records(raw, filename=filename)
-            except Exception:
-                sso_records = []
-        elif not cpa_entries and parse_uploaded_records is None:
-            # minimal txt fallback: email----password----sso
-            for line in text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "----" in line:
-                    parts = line.split("----")
-                    sso_records.append(
-                        {
-                            "email": parts[0].strip(),
-                            "password": parts[1].strip() if len(parts) > 2 else "",
-                            "sso": normalize_sso(parts[-1]),
-                        }
-                    )
-                else:
-                    tok = normalize_sso(line)
-                    if tok:
-                        sso_records.append({"email": "", "password": "", "sso": tok})
-
-    # filename hint only; no extra action needed
-    _ = name
-    return sso_records, cpa_entries
-
-
-def process_upload_files(files) -> dict:
-    """Handle uploaded SSO/CPA files (and zip). Queue SSO convert + save CPA JSON."""
-    queued = 0
-    saved = 0
-    skipped = 0
-    errors: List[str] = []
-    seen_sso: Set[str] = set()
-
-    def handle_one(raw: bytes, filename: str) -> None:
-        nonlocal queued, saved, skipped
-        sso_records, cpa_entries = _parse_upload_blob(raw, filename=filename)
-        for entry in cpa_entries:
-            ok, info = save_cpa_entry_file(entry, source=f"upload:{filename}")
-            if ok:
-                saved += 1
-                log_line(f"[SSO换票] CPA 入库 {info}")
-            else:
-                skipped += 1
-                errors.append(f"{filename}: {info}")
-        for rec in sso_records:
-            sso = normalize_sso(rec.get("sso") or "")
-            if not sso:
-                skipped += 1
-                continue
-            if sso in seen_sso:
-                skipped += 1
-                continue
-            seen_sso.add(sso)
-            ok, reason = enqueue_cpa_convert(
-                email=str(rec.get("email") or "").strip(),
-                sso=sso,
-                password=str(rec.get("password") or "").strip(),
-                source=f"upload:{filename}",
-                force=True,
-            )
-            if ok:
-                queued += 1
-            else:
-                skipped += 1
-                if reason not in ("already converted or queued",):
-                    errors.append(f"{filename}: {reason}")
-        if not cpa_entries and not sso_records:
-            errors.append(f"{filename}: 未识别到 SSO 或 CPA 凭证")
-
-    for f in files or []:
-        filename = getattr(f, "filename", "") or "upload.bin"
-        try:
-            raw = f.read()
-        except Exception as e:
-            errors.append(f"{filename}: 读取失败 {e}")
-            continue
-        if not raw:
-            errors.append(f"{filename}: 空文件")
-            continue
-        lower = filename.lower()
-        if lower.endswith(".zip"):
-            try:
-                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir():
-                            continue
-                        inner = info.filename
-                        base = Path(inner).name
-                        if base.startswith(".") or base.lower() in (
-                            "readme.txt",
-                            "empty.txt",
-                            "failed.jsonl",
-                        ):
-                            continue
-                        if not (
-                            base.lower().endswith(".json")
-                            or base.lower().endswith(".txt")
-                        ):
-                            continue
-                        try:
-                            handle_one(zf.read(info), base)
-                        except Exception as e:
-                            errors.append(f"{base}: {e}")
-            except Exception as e:
-                errors.append(f"{filename}: zip 无效 {e}")
-            continue
-        try:
-            handle_one(raw, filename)
-        except Exception as e:
-            errors.append(f"{filename}: {e}")
-
-    return {
-        "queued": queued,
-        "saved": saved,
-        "skipped": skipped,
-        "errors": errors[:20],
-    }
-
-
 def _cpa_worker_loop():
     log_line(
         f"[CPA] worker start · core={'ok' if _CPA_CORE_OK else 'FAIL'} · auto={AUTO_CPA} · dir={CPA_DIR}"
@@ -829,15 +508,6 @@ def _cpa_worker_loop():
         email = item.get("email") or ""
         sso = item.get("sso") or ""
         fp = item.get("fp") or sso_fingerprint(sso)
-        source = str(item.get("source") or "")
-        # Snapshot existing files for this sso/email (duplicate / stale cleanup)
-        existing = []
-        seen_paths: Set[str] = set()
-        for p in find_cpa_files_for_sso(sso) + find_cpa_files_for_email(email):
-            key = str(p.resolve())
-            if key not in seen_paths:
-                seen_paths.add(key)
-                existing.append(p)
         with _cpa_lock:
             _cpa_state["running"] = True
             _cpa_state["pending"] = max(0, int(_cpa_state.get("pending") or 0) - 1)
@@ -849,29 +519,44 @@ def _cpa_worker_loop():
             if item.get("password") and not entry.get("password"):
                 entry["password"] = item["password"]
             entry["_source"] = "grok-register-auto-cpa"
-            entry["_source_file"] = source
+            entry["_source_file"] = item.get("source") or ""
             email_out = entry.get("email") or email or "unknown"
-            # Success: write canonical file + remove duplicate variants
-            ok, fname = save_cpa_entry_file(entry, source=source or "cpa-worker")
-            if not ok:
-                raise RuntimeError(fname)
+            fname = f"xai-{cpa_safe_filename(email_out)}.json"
+            path = CPA_DIR / fname
+            if path.exists():
+                try:
+                    old = json.loads(path.read_text(encoding="utf-8"))
+                    old_fp = sso_fingerprint(normalize_sso(old.get("sso") or ""))
+                except Exception:
+                    old_fp = ""
+                if old_fp and old_fp != fp:
+                    fname = f"xai-{cpa_safe_filename(email_out)}-{fp[:8]}.json"
+                    path = CPA_DIR / fname
+            path.write_text(
+                json.dumps(entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            save_cpa_index_item(
+                fp,
+                {
+                    "email": email_out,
+                    "file": fname,
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                    "auth_kind": entry.get("auth_kind"),
+                },
+            )
             with _cpa_lock:
                 _cpa_done.add(fp)
                 _cpa_inflight.discard(fp)
-            log_line(f"[CPA] OK {email_out} -> {fname}（成功去重只留一份）")
+                _cpa_state["ok"] = int(_cpa_state.get("ok") or 0) + 1
+                _cpa_state["last_ok_email"] = email_out
+                _cpa_state["last_error"] = ""
+            log_line(f"[CPA] OK {email_out} -> {fname}")
         except Exception as e:
             err = str(e)
             with _cpa_lock:
                 _cpa_inflight.discard(fp)
                 _cpa_state["fail"] = int(_cpa_state.get("fail") or 0) + 1
                 _cpa_state["last_error"] = err
-            # Fail: delete existing duplicate/stale CPA for this sso/email
-            deleted = delete_cpa_paths(
-                existing, reason=f"换票失败清理 · {err[:80]}"
-            )
-            if deleted:
-                with _cpa_lock:
-                    _cpa_done.discard(fp)
             try:
                 with open(CPA_FAILED_PATH, "a", encoding="utf-8") as f:
                     f.write(
@@ -881,7 +566,6 @@ def _cpa_worker_loop():
                                 "email": email,
                                 "fp": fp,
                                 "error": err,
-                                "deleted_files": deleted,
                             },
                             ensure_ascii=False,
                         )
@@ -889,10 +573,7 @@ def _cpa_worker_loop():
                     )
             except Exception:
                 pass
-            log_line(
-                f"[CPA] FAIL {email or fp[:12]}: {err}"
-                + (f" · 已删除旧凭证 {deleted} 个" if deleted else "")
-            )
+            log_line(f"[CPA] FAIL {email or fp[:12]}: {err}")
         finally:
             with _cpa_lock:
                 _cpa_state["running"] = not _cpa_q.empty()
@@ -1656,23 +1337,6 @@ INDEX_HTML = r"""
   </div>
 
   <div class="card">
-    <h2>SSO 换票</h2>
-    <div class="row" style="align-items:center">
-      <label style="flex:2">上传文件（SSO / CPA / ZIP）
-        <input type="file" id="upload_files" multiple
-          accept=".txt,.json,.zip,text/plain,application/json,application/zip"
-          style="padding:8px;min-width:0;width:100%"/>
-      </label>
-      <button class="btn primary" type="button" id="btn_upload" onclick="uploadCredentials()">🔄 SSO 换票</button>
-    </div>
-    <div class="muted" style="margin-top:10px;font-size:12px;line-height:1.55">
-      用已有 <strong>SSO</strong> 换 OAuth 凭证（不重新注册）。支持：SSO 文本（<code>email----password----sso</code>）、CPA JSON、ZIP。
-      SSO 入队换票；CPA 直接入库。完成后点上方「下载 CPA / Sub2」。
-    </div>
-    <div class="muted" style="margin-top:8px;font-size:12px;display:none" id="upload_hint"></div>
-  </div>
-
-  <div class="card">
     <h2>邮箱服务</h2>
     <div class="row">
       <label>邮箱源
@@ -1742,16 +1406,12 @@ INDEX_HTML = r"""
     <div style="padding:14px 14px 0;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between">
       <h2 style="margin:0">账号文件</h2>
       <div class="actions" style="margin:0">
-        <button class="btn primary" type="button" onclick="refreshAllSso()" title="对账号文件里全部 SSO 尝试换票（无法预知是否过期）">🔄 一键换票</button>
         <button class="btn" type="button" onclick="toggleSelectAllFiles(true)">全选</button>
         <button class="btn" type="button" onclick="toggleSelectAllFiles(false)">取消全选</button>
         <button class="btn danger" type="button" onclick="deleteSelectedFiles()">删除选中</button>
       </div>
     </div>
-    <div class="muted" style="padding:8px 14px 0;font-size:12px">
-      勾选已下载/不需要的 accounts_*.txt，删除后不会再出现在「下载 SSO」合并结果里。
-      <strong>一键换票</strong>：无法预知 SSO 是否过期，会对全部账号尝试换票；成功更新 CPA，失败清理对应旧凭证。
-    </div>
+    <div class="muted" style="padding:8px 14px 0;font-size:12px">勾选已下载/不需要的 accounts_*.txt，删除后不会再出现在「下载 SSO」合并结果里。</div>
     {% if files %}
     <table>
       <thead>
@@ -1914,61 +1574,6 @@ async function backfillCpa(){
     toast(j.message||('已入队 '+j.queued));
     poll();
   }catch(e){toast('补转失败: '+e.message)}
-}
-async function refreshAllSso(){
-  if(!confirm('对账号文件里的全部 SSO 尝试换票？\\n无法预知是否过期：成功则更新 CPA，失败则删除对应旧凭证。')){
-    return;
-  }
-  try{
-    const j=await api('/api/cpa/refresh-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:1000})});
-    toast(j.message||('已入队换票 '+j.queued));
-    poll();
-  }catch(e){toast('一键换票失败: '+e.message)}
-}
-function setUploadHint(text){
-  const el=document.getElementById('upload_hint');
-  if(!el) return;
-  const t=String(text||'').trim();
-  el.textContent=t;
-  el.style.display=t ? '' : 'none';
-}
-async function uploadCredentials(){
-  const input=document.getElementById('upload_files');
-  if(!input || !input.files || !input.files.length){
-    toast('请先选择要换票的文件（SSO / CPA / ZIP）');
-    return;
-  }
-  const fd=new FormData();
-  for(const f of input.files){ fd.append('files', f); }
-  const btn=document.getElementById('btn_upload');
-  if(btn) btn.disabled=true;
-  setUploadHint('SSO 换票处理中…');
-  try{
-    const r=await fetch('/api/cpa/upload',{method:'POST',body:fd,credentials:'same-origin'});
-    const j=await r.json().catch(()=>({}));
-    if(!r.ok || j.ok===false){
-      throw new Error(j.error||j.message||('HTTP '+r.status));
-    }
-    const msg=j.message||(`换票入队 ${j.queued||0} · 入库 ${j.saved||0}`);
-    toast(msg);
-    let hint=`SSO 换票入队: ${j.queued||0} · CPA 入库: ${j.saved||0} · 跳过: ${j.skipped||0}`;
-    if(j.errors && j.errors.length){
-      hint += ' · 问题: '+j.errors.slice(0,3).join('；');
-    }
-    if((j.queued||0)>0){
-      hint += ' · 换票完成后点「下载 CPA / Sub2」';
-    }else if((j.saved||0)>0){
-      hint += ' · 可直接下载 CPA / Sub2';
-    }
-    setUploadHint(hint);
-    input.value='';
-    poll();
-  }catch(e){
-    toast('SSO 换票失败: '+e.message);
-    setUploadHint('SSO 换票失败: '+e.message);
-  }finally{
-    if(btn) btn.disabled=false;
-  }
 }
 let lastLogLen=0;
 async function poll(){
@@ -2621,130 +2226,6 @@ def api_cpa_backfill():
     n = enqueue_missing_accounts(limit=limit)
     log_line(f"[CPA] 手动补转入队: {n}")
     return jsonify({"ok": True, "queued": n, "message": f"已入队 {n} 个待转换 SSO"})
-
-
-@app.post("/api/cpa/refresh-all")
-def api_cpa_refresh_all():
-    """One-click: try SSO→OAuth for every account in accounts_*.txt.
-
-    SSO expiry is unknown — we attempt all. Success updates CPA; failure
-    deletes stale CPA for that sso/email (see worker policy).
-    """
-    need = require_login()
-    if need:
-        return need
-    data = request.get_json(force=True, silent=True) or {}
-    try:
-        limit = int(data.get("limit") or 1000)
-    except Exception:
-        limit = 1000
-    limit = max(1, min(limit, 2000))
-    if not _CPA_CORE_OK:
-        return jsonify({"ok": False, "error": f"core unavailable: {_CPA_CORE_ERR}"}), 500
-
-    stats = enqueue_all_sso_exchange(limit=limit, force=True)
-    queued = int(stats.get("queued") or 0)
-    total = int(stats.get("total") or 0)
-    skipped = int(stats.get("skipped") or 0)
-    log_line(
-        f"[一键换票] 账号SSO={total} · 入队={queued} · 跳过={skipped}"
-    )
-    if total <= 0:
-        return jsonify(
-            {
-                "ok": False,
-                "queued": 0,
-                "total": 0,
-                "error": "账号文件里没有可用 SSO（先注册或上传 accounts 文本）",
-            }
-        ), 400
-    if queued <= 0:
-        return jsonify(
-            {
-                "ok": False,
-                "queued": 0,
-                "total": total,
-                "skipped": skipped,
-                "error": "没有新任务入队（可能均在队列中）",
-            }
-        ), 400
-    return jsonify(
-        {
-            "ok": True,
-            "queued": queued,
-            "total": total,
-            "skipped": skipped,
-            "message": f"已对 {total} 个 SSO 中的 {queued} 个入队换票（无法预知是否过期，成功更新 / 失败清理）",
-            "cpa": cpa_stats(),
-        }
-    )
-
-
-@app.post("/api/cpa/upload")
-def api_cpa_upload():
-    """Upload external SSO/CPA files → queue convert or save into data/cpa/."""
-    need = require_login()
-    if need:
-        return need
-    files = request.files.getlist("files") or []
-    # also accept single field name "file"
-    if not files and request.files.get("file") is not None:
-        files = [request.files.get("file")]
-    files = [f for f in files if f and getattr(f, "filename", None)]
-    if not files:
-        return jsonify({"ok": False, "error": "请选择文件（SSO txt / CPA json / zip）"}), 400
-    if len(files) > 30:
-        return jsonify({"ok": False, "error": "一次最多 30 个文件"}), 400
-
-    result = process_upload_files(files)
-    queued = int(result.get("queued") or 0)
-    saved = int(result.get("saved") or 0)
-    skipped = int(result.get("skipped") or 0)
-    errors = result.get("errors") or []
-
-    log_line(
-        f"[SSO换票] files={len(files)} · 入队={queued} · CPA入库={saved} · 跳过={skipped}"
-    )
-    if not queued and not saved:
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "queued": queued,
-                    "saved": saved,
-                    "skipped": skipped,
-                    "errors": errors,
-                    "error": "未识别到可用 SSO/CPA："
-                    + ("；".join(errors[:3]) if errors else "格式不支持"),
-                }
-            ),
-            400,
-        )
-
-    parts = []
-    if queued:
-        parts.append(f"SSO 换票入队 {queued}")
-    if saved:
-        parts.append(f"CPA 入库 {saved}")
-    if skipped:
-        parts.append(f"跳过 {skipped}")
-    msg = "，".join(parts) if parts else "SSO 换票完成"
-    if queued:
-        msg += "；完成后下载 CPA / Sub2"
-    elif saved:
-        msg += "；可直接下载 CPA / Sub2"
-
-    return jsonify(
-        {
-            "ok": True,
-            "queued": queued,
-            "saved": saved,
-            "skipped": skipped,
-            "errors": errors,
-            "message": msg,
-            "cpa": cpa_stats(),
-        }
-    )
 
 
 def _normalize_browser_engine(value: str) -> str:
