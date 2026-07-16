@@ -157,6 +157,7 @@ grok-register-win/
 - 映射字段：`expired`→`credentials.expires_at`，`platform=grok`，`type=oauth`，`proxies=[]`
 - Sub2 按钮样式与 SSO/CPA 同为渐变实心按钮
 - 启动注册区增加网络提示（日本节点更稳）；邮箱区空 hint 自动隐藏；README FAQ 补充节点建议
+- 仓库横幅更新：卖点改为「SSO / CPA / Sub2 多格式导出」
 
 ### v1.0.6（2026-07-16）
 - 修复 CPA 转换在中文路径下失败：curl_cffi 无法处理非 ASCII CA 证书路径，启动时自动复制到 `%TEMP%`
