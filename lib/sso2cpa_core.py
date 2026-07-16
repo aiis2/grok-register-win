@@ -46,14 +46,47 @@ def _fix_curl_ca_bundle():
 
 _fix_curl_ca_bundle()
 
+# Cloudflare on auth.x.ai rejects some curl_cffi TLS fingerprints (e.g. chrome131 → 403).
+# Prefer profiles that currently pass; fall back if a build lacks a target.
+_IMPERSONATE_CANDIDATES = (
+    "chrome136",
+    "chrome",
+    "chrome131",
+    "chrome124",
+    "chrome120",
+    "edge101",
+)
+
 try:
     from curl_cffi import requests as cf_requests
 
+    def _pick_impersonate() -> str:
+        last_err: Optional[Exception] = None
+        for name in _IMPERSONATE_CANDIDATES:
+            try:
+                # Constructing Session validates the impersonate profile.
+                s = cf_requests.Session(impersonate=name)
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                return name
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err:
+            raise last_err
+        return "chrome"
+
+    _IMPERSONATE = _pick_impersonate()
+
     def _session():
-        return cf_requests.Session(impersonate="chrome131")
+        return cf_requests.Session(impersonate=_IMPERSONATE)
 
 except ImportError:
     import requests as cf_requests  # type: ignore
+
+    _IMPERSONATE = ""
 
     def _session():
         return cf_requests.Session()
@@ -388,10 +421,26 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
         raise ConvertError(f"authorize 请求失败: {e}") from e
 
     final_url = str(resp.url)
+    body = resp.text or ""
+    body_l = body[:2000].lower()
+    if (
+        resp.status_code == 403
+        or "attention required" in body_l
+        or "just a moment" in body_l
+        or "cf-browser-verification" in body_l
+        or ("cloudflare" in body_l and "consent" not in final_url)
+    ):
+        raise ConvertError(
+            f"authorize 被 Cloudflare 拦截 (HTTP {resp.status_code}, "
+            f"impersonate={_IMPERSONATE or 'n/a'}): {final_url}"
+        )
     if "sign-in" in final_url or "sign-up" in final_url:
         raise ConvertError("SSO 无效或已过期（跳到登录页）")
     if "/oauth2/consent" not in final_url:
-        raise ConvertError(f"authorize 未进入 consent 页: {final_url}")
+        raise ConvertError(
+            f"authorize 未进入 consent 页 (HTTP {resp.status_code}, "
+            f"impersonate={_IMPERSONATE or 'n/a'}): {final_url}"
+        )
 
     # The consent page has a regular HTML form that POSTs to auth.x.ai/oauth2/authorize
     # with the OAuth params as form-encoded data. Not a Next.js Server Action.

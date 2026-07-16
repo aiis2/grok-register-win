@@ -153,6 +153,11 @@ grok-register-win/
 
 ## 更新日志
 
+### v1.0.11（2026-07-16）
+- 修复 SSO→CPA 失败：`curl_cffi` 固定 `chrome131` 指纹被 Cloudflare 403 拦截，导致 `authorize 未进入 consent 页`
+- 启动时自动选择可用 TLS impersonate（优先 `chrome136`，并回退其它配置文件）
+- 识别 Cloudflare 拦截时输出明确错误（HTTP 状态 + impersonate），便于排查
+
 ### v1.0.10（2026-07-16）
 - 修 Playwright/Camoufox 提交后崩溃：补全 `pageError.location` 补丁（1.60 有多处未覆盖）
 - Cookie 弹窗 `page_eval` 超时改为短超时软失败，不再卡死 60 秒
