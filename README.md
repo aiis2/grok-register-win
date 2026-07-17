@@ -173,6 +173,7 @@ grok-register-win/
 - 面板「邮箱服务」仅保留**自定义 / 自建临时邮 API**，并展示说明横幅
 - 未配置自建 API 时，注册任务启动前直接提示并失败，避免空跑
 - 文档改为以自建 cloudflare_temp_email 兼容接口为主
+- **收验证码方式对齐 any-auto-register**：`before_ids` 忽略旧信、`otp_sent_at` 过滤发码前邮件、统一 Grok `ABC-DEF` 提码；新增 `lib/mailbox_core.py`
 
 ### v1.1.0（2026-07-16）
 - 修复 SSO→CPA 失败：`curl_cffi` 固定 `chrome131` 指纹被 Cloudflare 403 拦截，导致 `authorize 未进入 consent 页`

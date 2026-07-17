@@ -42,6 +42,36 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
+# any-auto-register 风格收码：before_ids / otp_sent_at / 统一提码
+_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+try:
+    from mailbox_core import (  # type: ignore
+        GROK_CODE_PATTERN,
+        extract_code as mailbox_extract_code,
+        message_id as mailbox_message_id,
+        message_text_blob as mailbox_message_text_blob,
+        should_skip_message as mailbox_should_skip_message,
+        wait_code_from_messages,
+        GPTMailClient,
+        TempMailLolClient,
+        MailboxAccount,
+    )
+
+    _MAILBOX_CORE_OK = True
+except Exception:
+    _MAILBOX_CORE_OK = False
+    GROK_CODE_PATTERN = r"[A-Z0-9]{3}-[A-Z0-9]{3}"
+    mailbox_extract_code = None
+    mailbox_message_id = None
+    mailbox_message_text_blob = None
+    mailbox_should_skip_message = None
+    wait_code_from_messages = None
+    GPTMailClient = None
+    TempMailLolClient = None
+    MailboxAccount = None
+
 
 def is_page_disconnected_error(exc):
     """Chromium PageDisconnectedError or Camoufox/Playwright closed target."""
@@ -1539,7 +1569,15 @@ def get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    before_ids=None,
+    otp_sent_at=None,
 ):
+    """拉取验证码。
+
+    before_ids / otp_sent_at 对齐 any-auto-register：
+    - before_ids: 发码前已有邮件 id，避免读到旧码
+    - otp_sent_at: 发码时间戳，跳过更早的邮件
+    """
     provider = get_email_provider()
     if provider in ("tempmailer", "inboxkitten", "inbox_kitten"):
         raise Exception(
@@ -1564,6 +1602,20 @@ def get_oai_code(
             log_callback=log_callback,
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
+            before_ids=before_ids,
+            otp_sent_at=otp_sent_at,
+        )
+    if provider in ("gptmail", "tempmail_lol") and _MAILBOX_CORE_OK:
+        return optional_public_get_oai_code(
+            provider,
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            before_ids=before_ids,
+            otp_sent_at=otp_sent_at,
         )
     return duckmail_get_oai_code(
         dev_token,
@@ -1576,14 +1628,26 @@ def get_oai_code(
 
 
 def extract_verification_code(text, subject=""):
-    """从邮件主题/正文提取 xAI/Grok 验证码（对齐 grok-reg-tool 策略）。"""
+    """从邮件主题/正文提取 xAI/Grok 验证码。
+
+    优先使用 mailbox_core（any-auto-register 风格：去 URL、语义优先、Grok ABC-DEF）。
+    """
+    if mailbox_extract_code is not None:
+        code = mailbox_extract_code(
+            text or "",
+            subject or "",
+            code_pattern=GROK_CODE_PATTERN,
+            prefer_grok=True,
+        )
+        if code:
+            return code
+
     content = text or ""
     if subject:
         content = f"Subject: {subject}\n{content}"
     if not content:
         return None
 
-    # Subject 行优先：6F2-CT8 xAI confirmation code
     match = re.search(
         r"(?:Subject:\s*)?([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI",
         content,
@@ -1592,7 +1656,6 @@ def extract_verification_code(text, subject=""):
     if match:
         return match.group(1).upper()
 
-    # 独立 XXX-XXX（避免被邮箱/长串误伤）
     match = re.search(
         r"(?<![A-Z0-9-])([A-Z0-9]{3}-[A-Z0-9]{3})(?![A-Z0-9-])",
         content,
@@ -1601,7 +1664,6 @@ def extract_verification_code(text, subject=""):
     if match:
         return match.group(1).upper()
 
-    # 文案旁带标签
     match = re.search(
         r"(?:verification\s+code|验证码|your\s+code|confirmation\s+code)[:\s]*[<>\s]*([A-Z0-9]{3}-[A-Z0-9]{3})\b",
         content,
@@ -1610,7 +1672,6 @@ def extract_verification_code(text, subject=""):
     if match:
         return match.group(1).upper()
 
-    # HTML 灰底块常见样式
     match = re.search(
         r"background-color:\s*#F3F3F3[^>]*>[\s\S]*?([A-Z0-9]{3}-[A-Z0-9]{3})[\s\S]*?</p>",
         content,
@@ -1629,7 +1690,6 @@ def extract_verification_code(text, subject=""):
         if match:
             return match.group(1)
 
-    # 6 位数字兜底（排除常见噪声）
     for code in re.findall(r">\s*(\d{6})\s*<", content):
         if code != "177010":
             return code
@@ -1637,6 +1697,103 @@ def extract_verification_code(text, subject=""):
         if code != "177010":
             return code
     return None
+
+
+def snapshot_inbox_ids(dev_token, email=None, log_callback=None):
+    """发码前快照当前邮件 id（对齐 any-auto-register before_ids）。"""
+    provider = get_email_provider()
+    ids = set()
+    try:
+        if provider == "cloudflare":
+            api_base = get_cloudflare_api_base()
+            if api_base and dev_token:
+                for msg in cloudflare_get_messages(api_base, dev_token) or []:
+                    if not isinstance(msg, dict):
+                        continue
+                    mid = str(msg.get("id") or msg.get("msgid") or "").strip()
+                    if mid:
+                        ids.add(mid)
+        elif provider == "duckmail" and dev_token:
+            # duckmail list if available via existing helpers
+            try:
+                messages = duckmail_list_messages(dev_token)  # type: ignore[name-defined]
+            except Exception:
+                messages = []
+            for msg in messages or []:
+                if isinstance(msg, dict):
+                    mid = str(msg.get("id") or "").strip()
+                    if mid:
+                        ids.add(mid)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 快照收件箱 id 失败（可忽略）: {exc}")
+    if log_callback and ids:
+        log_callback(f"[*] 发码前收件箱已有 {len(ids)} 封邮件，将忽略旧信")
+    return ids
+
+
+def optional_public_get_oai_code(
+    provider,
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    before_ids=None,
+    otp_sent_at=None,
+):
+    """Optional public backends using mailbox_core receive loop (not recommended for xAI)."""
+    if not _MAILBOX_CORE_OK or wait_code_from_messages is None:
+        raise Exception("mailbox_core 不可用")
+    proxies = get_proxies()
+    if provider == "tempmail_lol":
+        client = TempMailLolClient(proxies=proxies, http_get=http_get, http_post=http_post)
+        acct = MailboxAccount(email=email, token=dev_token, account_id=dev_token)
+
+        def list_messages():
+            return client.list_messages(acct)
+
+        return wait_code_from_messages(
+            list_messages,
+            before_ids=before_ids,
+            otp_sent_at=otp_sent_at,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            cancel_callback=cancel_callback,
+            sleep_fn=lambda s: sleep_with_cancel(s, cancel_callback),
+            code_pattern=GROK_CODE_PATTERN,
+            log_callback=log_callback,
+            provider_label="tempmail.lol",
+        )
+
+    # gptmail
+    api_base = str(config.get("gptmail_api_base") or "https://mail.chatgpt.org.uk").rstrip("/")
+    api_key = str(config.get("gptmail_api_key") or "").strip()
+    client = GPTMailClient(
+        api_base=api_base,
+        api_key=api_key,
+        domain=str(config.get("gptmail_domain") or config.get("defaultDomains") or "").strip(),
+        proxies=proxies,
+        http_get=http_get,
+    )
+    acct = MailboxAccount(email=email, token=dev_token or email, account_id=email)
+
+    def list_messages():
+        return client.list_messages(acct)
+
+    return wait_code_from_messages(
+        list_messages,
+        before_ids=before_ids,
+        otp_sent_at=otp_sent_at,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        cancel_callback=cancel_callback,
+        sleep_fn=lambda s: sleep_with_cancel(s, cancel_callback),
+        code_pattern=GROK_CODE_PATTERN,
+        log_callback=log_callback,
+        provider_label="gptmail",
+    )
 
 
 def duckmail_get_oai_code(
@@ -1700,13 +1857,62 @@ def cloudflare_get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    before_ids=None,
+    otp_sent_at=None,
 ):
+    """Cloudflare / 自建 temp-email 收码。
+
+    接收方式对齐 any-auto-register：
+    - before_ids：发码前已有邮件 id，跳过旧信
+    - otp_sent_at：跳过发码前的时间戳邮件
+    - 统一 extract_verification_code（Grok ABC-DEF 优先）
+    """
     api_base = get_cloudflare_api_base()
     if not api_base:
         raise Exception("Cloudflare API Base 未配置")
+
+    # Prefer unified receive loop when mailbox_core is available
+    if _MAILBOX_CORE_OK and wait_code_from_messages is not None:
+        before = set(before_ids or set())
+        next_resend_at = time.time() + 35
+
+        def list_messages():
+            nonlocal next_resend_at
+            if resend_callback and time.time() >= next_resend_at:
+                try:
+                    resend_callback()
+                    if log_callback:
+                        log_callback("[*] 已触发重新发送验证码")
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+                next_resend_at = time.time() + 35
+            return cloudflare_get_messages(api_base, dev_token) or []
+
+        def detail_fetcher(msg):
+            mid = str(msg.get("id") or msg.get("msgid") or "").strip()
+            if not mid:
+                return {}
+            return cloudflare_get_message_detail(api_base, dev_token, mid) or {}
+
+        return wait_code_from_messages(
+            list_messages,
+            before_ids=before,
+            otp_sent_at=otp_sent_at,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            cancel_callback=cancel_callback,
+            sleep_fn=lambda s: sleep_with_cancel(s, cancel_callback),
+            code_pattern=GROK_CODE_PATTERN,
+            log_callback=log_callback,
+            detail_fetcher=detail_fetcher,
+            provider_label="Cloudflare",
+        )
+
+    # Fallback legacy loop (no mailbox_core)
     deadline = time.time() + timeout
-    # 同一封邮件正文可能延迟可读，允许多次重试解析，避免偶发漏码
     seen_attempts = {}
+    before = set(before_ids or set())
     next_resend_at = time.time() + 35
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1733,13 +1939,14 @@ def cloudflare_get_oai_code(
             msg_id = msg.get("id") or msg.get("msgid")
             if not msg_id:
                 continue
+            if str(msg_id) in before:
+                continue
             attempt = int(seen_attempts.get(msg_id, 0))
             if attempt >= 5:
                 continue
             seen_attempts[msg_id] = attempt + 1
             recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
             msg_addr = str(msg.get("address", "")).lower()
-            # 优先匹配目标邮箱；若结构不一致也允许继续解析，避免接口字段漂移导致漏码
             address_matched = True
             if recipients:
                 address_matched = email.lower() in recipients
@@ -2604,12 +2811,20 @@ return false;
             """
         )
 
+    # any-auto-register style: snapshot inbox before waiting for OTP mail
+    before_ids = snapshot_inbox_ids(dev_token, email=email, log_callback=log_callback)
+    otp_sent_at = time.time()
+    if log_callback:
+        log_callback("[*] 开始轮询验证码邮件（忽略发码前旧信）")
+
     code = get_oai_code(
         dev_token,
         email,
         log_callback=log_callback,
         cancel_callback=cancel_callback,
         resend_callback=_resend_code,
+        before_ids=before_ids,
+        otp_sent_at=otp_sent_at,
     )
     if not code:
         raise Exception("获取验证码失败")
