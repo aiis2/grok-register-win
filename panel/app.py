@@ -21,6 +21,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -72,10 +73,7 @@ LOG_DIR = Path(os.environ.get("PANEL_LOG_DIR", str(BASE_DIR / "data" / "logs")))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # SSO → real CPA (CLIProxyAPI OAuth JSON)
-CPA_DIR = Path(os.environ.get("CPA_DIR", str(BASE_DIR / "data" / "cpa"))).resolve()
-CPA_DIR.mkdir(parents=True, exist_ok=True)
-CPA_INDEX_PATH = CPA_DIR / "index.json"
-CPA_FAILED_PATH = CPA_DIR / "failed.jsonl"
+CPA_DIR_ENV = "CPA_DIR"
 SSO2CPA_PATH = Path(
     os.environ.get("SSO2CPA_PATH", str(BASE_DIR / "lib"))
 ).resolve()
@@ -96,6 +94,8 @@ ENABLE_CLASH_UI = os.environ.get("ENABLE_CLASH_UI", "1").strip() not in (
 for _p in (str(SSO2CPA_PATH), str(BASE_DIR / "lib"), str(Path(__file__).resolve().parent)):
     if _p and _p not in sys.path:
         sys.path.insert(0, _p)
+from credential_store import CredentialLayout, ensure_layout  # type: ignore
+
 try:
     from sso2cpa_core import (  # type: ignore
         build_sub2_payload,
@@ -122,6 +122,52 @@ HK_RE = re.compile(r"(香港|Hong\s*Kong|\bHK\b|🇭🇰)", re.I)
 
 app = Flask(__name__)
 app.secret_key = SECRET
+
+
+@dataclass(frozen=True)
+class CpaPaths:
+    directory: Path
+    index_path: Path
+    failed_path: Path
+
+
+def current_credential_layout(cfg: Optional[dict] = None) -> CredentialLayout:
+    data = cfg if isinstance(cfg, dict) else load_config()
+    return ensure_layout(CredentialLayout.from_config(BASE_DIR, data))
+
+
+def current_cpa_paths(cfg: Optional[dict] = None) -> CpaPaths:
+    override_value = str(os.environ.get(CPA_DIR_ENV) or "").strip()
+    if override_value:
+        configured = Path(override_value)
+        directory = (
+            configured.resolve()
+            if configured.is_absolute()
+            else (BASE_DIR / configured).resolve()
+        )
+        if directory.exists() and not directory.is_dir():
+            raise ValueError(f"CPA 路径不是目录: {directory}")
+        directory.mkdir(parents=True, exist_ok=True)
+    else:
+        directory = current_credential_layout(cfg).cpa_dir
+    return CpaPaths(
+        directory=directory,
+        index_path=directory / "index.json",
+        failed_path=directory / "failed.jsonl",
+    )
+
+
+def _account_read_directories() -> List[Path]:
+    current = current_credential_layout().sso_dir
+    legacy = BASE_DIR.resolve()
+    return [current] if current == legacy else [current, legacy]
+
+
+def _cpa_read_directories() -> List[Path]:
+    current = current_cpa_paths().directory
+    legacy = (BASE_DIR / "data" / "cpa").resolve()
+    return [current] if current == legacy else [current, legacy]
+
 
 # --------------- job state ---------------
 _job_lock = threading.Lock()
@@ -280,11 +326,20 @@ def require_login():
 
 
 def list_account_files() -> List[Path]:
-    return sorted(
-        BASE_DIR.glob("accounts_*.txt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    files: List[Path] = []
+    seen_names: Set[str] = set()
+    for directory in _account_read_directories():
+        candidates = sorted(
+            directory.glob("accounts_*.txt"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in candidates:
+            if path.name in seen_names:
+                continue
+            seen_names.add(path.name)
+            files.append(path)
+    return files
 
 
 def read_account_lines(path: Path) -> List[str]:
@@ -362,9 +417,12 @@ def load_cpa_index() -> None:
     global _cpa_done
     done: Set[str] = set()
     ok_count = 0
-    if CPA_INDEX_PATH.exists():
+    for directory in _cpa_read_directories():
+        index_path = directory / "index.json"
+        if not index_path.exists():
+            continue
         try:
-            data = json.loads(CPA_INDEX_PATH.read_text(encoding="utf-8"))
+            data = json.loads(index_path.read_text(encoding="utf-8"))
             items = data.get("items") if isinstance(data, dict) else data
             if isinstance(items, dict):
                 for fp, meta in items.items():
@@ -379,7 +437,7 @@ def load_cpa_index() -> None:
         except Exception:
             pass
     # also scan existing json files
-    for p in CPA_DIR.glob("xai-*.json"):
+    for p in list_cpa_files():
         try:
             obj = json.loads(p.read_text(encoding="utf-8"))
             sso = normalize_sso(obj.get("sso") or "")
@@ -396,15 +454,16 @@ def load_cpa_index() -> None:
 
 def save_cpa_index_item(fp: str, meta: dict) -> None:
     items: Dict[str, dict] = {}
-    if CPA_INDEX_PATH.exists():
+    index_path = current_cpa_paths().index_path
+    if index_path.exists():
         try:
-            data = json.loads(CPA_INDEX_PATH.read_text(encoding="utf-8"))
+            data = json.loads(index_path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("items"), dict):
                 items = data["items"]
         except Exception:
             items = {}
     items[fp] = meta
-    CPA_INDEX_PATH.write_text(
+    index_path.write_text(
         json.dumps(
             {"updated_at": datetime.now().isoformat(timespec="seconds"), "items": items},
             ensure_ascii=False,
@@ -416,7 +475,20 @@ def save_cpa_index_item(fp: str, meta: dict) -> None:
 
 
 def list_cpa_files() -> List[Path]:
-    return sorted(CPA_DIR.glob("xai-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files: List[Path] = []
+    seen_names: Set[str] = set()
+    for directory in _cpa_read_directories():
+        candidates = sorted(
+            directory.glob("xai-*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in candidates:
+            if path.name in seen_names:
+                continue
+            seen_names.add(path.name)
+            files.append(path)
+    return files
 
 
 def cpa_stats() -> dict:
@@ -426,7 +498,7 @@ def cpa_stats() -> dict:
     files = list_cpa_files()
     st["files"] = len(files)
     st["done"] = done_n
-    st["dir"] = str(CPA_DIR)
+    st["dir"] = str(current_cpa_paths().directory)
     return st
 
 
@@ -500,8 +572,9 @@ def enqueue_missing_accounts(limit: int = 500) -> int:
 
 
 def _cpa_worker_loop():
+    initial_cpa_dir = current_cpa_paths().directory
     log_line(
-        f"[CPA] worker start · core={'ok' if _CPA_CORE_OK else 'FAIL'} · auto={AUTO_CPA} · dir={CPA_DIR}"
+        f"[CPA] worker start · core={'ok' if _CPA_CORE_OK else 'FAIL'} · auto={AUTO_CPA} · dir={initial_cpa_dir}"
     )
     if not _CPA_CORE_OK:
         log_line(f"[CPA] core import error: {_CPA_CORE_ERR}")
@@ -526,7 +599,8 @@ def _cpa_worker_loop():
             entry["_source_file"] = item.get("source") or ""
             email_out = entry.get("email") or email or "unknown"
             fname = f"xai-{cpa_safe_filename(email_out)}.json"
-            path = CPA_DIR / fname
+            cpa_paths = current_cpa_paths()
+            path = cpa_paths.directory / fname
             if path.exists():
                 try:
                     old = json.loads(path.read_text(encoding="utf-8"))
@@ -535,7 +609,7 @@ def _cpa_worker_loop():
                     old_fp = ""
                 if old_fp and old_fp != fp:
                     fname = f"xai-{cpa_safe_filename(email_out)}-{fp[:8]}.json"
-                    path = CPA_DIR / fname
+                    path = cpa_paths.directory / fname
             path.write_text(
                 json.dumps(entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
@@ -562,7 +636,7 @@ def _cpa_worker_loop():
                 _cpa_state["fail"] = int(_cpa_state.get("fail") or 0) + 1
                 _cpa_state["last_error"] = err
             try:
-                with open(CPA_FAILED_PATH, "a", encoding="utf-8") as f:
+                with open(current_cpa_paths().failed_path, "a", encoding="utf-8") as f:
                     f.write(
                         json.dumps(
                             {
@@ -2476,10 +2550,11 @@ def safe_name(name: str) -> Optional[Path]:
         return None
     if not re.fullmatch(r"accounts_[\w.-]+\.txt", name):
         return None
-    path = (BASE_DIR / name).resolve()
-    if path.parent != BASE_DIR or not path.exists():
-        return None
-    return path
+    for directory in _account_read_directories():
+        path = (directory / name).resolve()
+        if path.parent == directory.resolve() and path.is_file():
+            return path
+    return None
 
 
 @app.get("/preview/<name>")
@@ -2622,9 +2697,10 @@ def download_cpa_zip():
             "all.json",
             json.dumps(all_entries, ensure_ascii=False, indent=2) + "\n",
         )
-        if CPA_FAILED_PATH.exists():
+        failed_path = current_cpa_paths().failed_path
+        if failed_path.exists():
             try:
-                zf.write(CPA_FAILED_PATH, arcname="failed.jsonl")
+                zf.write(failed_path, arcname="failed.jsonl")
             except Exception:
                 pass
         if not files:
@@ -3100,5 +3176,5 @@ start_cpa_worker()
 
 if __name__ == "__main__":
     print(f"Grok Register Panel -> http://0.0.0.0:{PORT}")
-    print(f"CPA auto-convert dir -> {CPA_DIR} core={_CPA_CORE_OK}")
+    print(f"CPA auto-convert dir -> {current_cpa_paths().directory} core={_CPA_CORE_OK}")
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
