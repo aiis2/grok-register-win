@@ -621,21 +621,79 @@ def load_config() -> dict:
     return {}
 
 
+def normalize_email_provider(value: str) -> str:
+    provider = str(value or "cfworker").strip().lower()
+    aliases = {
+        "custom": "cfworker",
+        "cloudflare": "cloudflare_temp_email",
+        "cloudflare-temp-email": "cloudflare_temp_email",
+        "yyds": "maliapi",
+    }
+    if provider in ("tempmailer", "inboxkitten", "inbox_kitten"):
+        return "cfworker"
+    return aliases.get(provider, provider or "cfworker")
+
+
+def normalize_cloudflare_temp_email_config(
+    data: Optional[dict] = None, fallback: Optional[dict] = None
+) -> dict:
+    """Return canonical Cloudflare Temp Email fields without conflating cfworker."""
+    source = data if isinstance(data, dict) else {}
+    old = fallback if isinstance(fallback, dict) else {}
+
+    def pick(key: str, *legacy_keys: str) -> str:
+        if key in source:
+            return str(source.get(key) or "").strip()
+        if key in old:
+            return str(old.get(key) or "").strip()
+        for legacy in legacy_keys:
+            if legacy in source:
+                return str(source.get(legacy) or "").strip()
+            if legacy in old:
+                return str(old.get(legacy) or "").strip()
+        return ""
+
+    api_base = pick("cloudflare_api_base").rstrip("/")
+    if api_base and not api_base.lower().startswith(("http://", "https://")):
+        api_base = f"https://{api_base}"
+    return {
+        "cloudflare_api_base": api_base,
+        "cloudflare_admin_password": pick(
+            "cloudflare_admin_password", "cloudflare_api_key"
+        ),
+        "cloudflare_domain": pick(
+            "cloudflare_domain", "defaultDomains"
+        ).lower().lstrip("@"),
+        "cloudflare_site_password": pick(
+            "cloudflare_site_password", "cfworker_custom_auth"
+        ),
+    }
+
+
+def validate_cloudflare_temp_email_config(data: dict) -> dict:
+    normalized = normalize_cloudflare_temp_email_config(data)
+    for key in (
+        "cloudflare_api_base",
+        "cloudflare_admin_password",
+        "cloudflare_domain",
+    ):
+        if not normalized[key]:
+            raise ValueError(f"Cloudflare Temp Email 需要配置: {key}")
+    return normalized
+
+
 def email_config_public(cfg: Optional[dict] = None) -> dict:
     """Email settings for panel UI (multi-provider dropdown)."""
     c = cfg if isinstance(cfg, dict) else load_config()
-    provider = str(c.get("email_provider") or "cfworker").strip().lower()
-    if provider in ("tempmailer", "inboxkitten", "inbox_kitten", "custom"):
-        provider = "cfworker" if provider != "custom" else "cfworker"
-    if provider == "custom":
-        provider = "cfworker"
-    # alias yyds -> maliapi for UI
-    if provider == "yyds":
-        provider = "maliapi"
+    provider = normalize_email_provider(c.get("email_provider") or "cfworker")
+    cloudflare = normalize_cloudflare_temp_email_config(c)
 
     choices = [
         {"id": "cfworker", "label": "CF Worker / 自建域名"},
-        {"id": "cloudflare", "label": "自定义 cloudflare_temp_email"},
+        {
+            "id": "cloudflare_temp_email",
+            "label": "Cloudflare Temp Email / 自建域名",
+        },
         {"id": "moemail", "label": "MoeMail (sall.cc)"},
         {"id": "tempmail_lol", "label": "TempMail.lol（自动生成）"},
         {"id": "duckmail", "label": "DuckMail"},
@@ -660,24 +718,13 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
         "provider": provider,
         "choices": choices,
         "email_failover": bool(c.get("email_failover", True)),
-        # generic / cfworker / cloudflare
-        "cfworker_api_url": str(c.get("cfworker_api_url") or c.get("cloudflare_api_base") or "").strip(),
-        "cfworker_admin_token": str(c.get("cfworker_admin_token") or c.get("cloudflare_api_key") or "").strip(),
-        "cfworker_domain": str(c.get("cfworker_domain") or c.get("defaultDomains") or "").strip(),
+        # generic CF Worker and dedicated cloudflare_temp_email stay separate
+        "cfworker_api_url": str(c.get("cfworker_api_url") or "").strip(),
+        "cfworker_admin_token": str(c.get("cfworker_admin_token") or "").strip(),
+        "cfworker_domain": str(c.get("cfworker_domain") or "").strip(),
         "cfworker_custom_auth": str(c.get("cfworker_custom_auth") or "").strip(),
         "cfworker_subdomain": str(c.get("cfworker_subdomain") or "").strip(),
-        "custom_api_base": str(c.get("cloudflare_api_base") or c.get("cfworker_api_url") or "").strip(),
-        "custom_api_key": str(c.get("cloudflare_api_key") or c.get("cfworker_admin_token") or "").strip(),
-        "custom_auth_mode": (
-            "bearer"
-            if str(c.get("cloudflare_auth_mode") or "").strip().lower()
-            in ("auth", "bearer", "authorization")
-            else str(c.get("cloudflare_auth_mode") or "x-admin-auth").strip()
-        ),
-        "custom_domain": str(c.get("defaultDomains") or c.get("cfworker_domain") or "").strip(),
-        "custom_path_accounts": str(c.get("cloudflare_path_accounts") or "/admin/new_address").strip(),
-        "custom_path_messages": str(c.get("cloudflare_path_messages") or "/api/mails").strip(),
-        "custom_path_token": str(c.get("cloudflare_path_token") or "/api/token").strip(),
+        **cloudflare,
         # providers
         "moemail_api_url": str(c.get("moemail_api_url") or "https://sall.cc").strip(),
         "moemail_api_key": str(c.get("moemail_api_key") or "").strip(),
@@ -719,16 +766,13 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
 def apply_email_config_from_ui(data: dict) -> dict:
     """Merge panel email form into config.json and return public view."""
     cfg = load_config()
-    provider = str(data.get("provider") or "cfworker").strip().lower()
-    if provider in ("tempmailer", "inboxkitten", "inbox_kitten"):
+    raw_provider = str(data.get("provider") or "cfworker").strip().lower()
+    if raw_provider in ("tempmailer", "inboxkitten", "inbox_kitten"):
         raise ValueError("内置公共 Tempmailer 已移除，请选择其它邮箱源")
-    if provider == "custom":
-        provider = "cfworker"
-    if provider == "yyds":
-        provider = "maliapi"
+    provider = normalize_email_provider(raw_provider)
 
     valid = {
-        "cfworker", "cloudflare", "moemail", "tempmail_lol", "duckmail", "gptmail",
+        "cfworker", "cloudflare_temp_email", "moemail", "tempmail_lol", "duckmail", "gptmail",
         "maliapi", "luckmail", "skymail", "cloudmail", "freemail", "opentrashmail", "laoudo",
     }
     if provider not in valid:
@@ -742,23 +786,17 @@ def apply_email_config_from_ui(data: dict) -> dict:
         return str(data.get(key, cfg.get(key, default)) or default).strip()
 
     # always store fields (so switching providers keeps values)
-    cfg["cfworker_api_url"] = g("cfworker_api_url") or g("custom_api_base")
-    cfg["cfworker_admin_token"] = g("cfworker_admin_token") or g("custom_api_key")
-    cfg["cfworker_domain"] = g("cfworker_domain") or g("custom_domain")
+    cfg["cfworker_api_url"] = g("cfworker_api_url")
+    cfg["cfworker_admin_token"] = g("cfworker_admin_token")
+    cfg["cfworker_domain"] = g("cfworker_domain")
     cfg["cfworker_custom_auth"] = g("cfworker_custom_auth")
     cfg["cfworker_subdomain"] = g("cfworker_subdomain")
 
-    # cloudflare_temp_email legacy keys
-    cfg["cloudflare_api_base"] = g("custom_api_base") or g("cfworker_api_url")
-    cfg["cloudflare_api_key"] = g("custom_api_key") or g("cfworker_admin_token")
-    mode = g("custom_auth_mode", "x-admin-auth").lower() or "x-admin-auth"
-    if mode not in ("none", "bearer", "x-api-key", "x-admin-auth", "query-key"):
-        mode = "x-admin-auth"
-    cfg["cloudflare_auth_mode"] = "auth" if mode == "bearer" else mode
-    cfg["defaultDomains"] = g("custom_domain") or g("cfworker_domain")
-    cfg["cloudflare_path_accounts"] = g("custom_path_accounts", "/admin/new_address") or "/admin/new_address"
-    cfg["cloudflare_path_messages"] = g("custom_path_messages", "/api/mails") or "/api/mails"
-    cfg["cloudflare_path_token"] = g("custom_path_token", "/api/token") or "/api/token"
+    cloudflare = normalize_cloudflare_temp_email_config(data, cfg)
+    cfg.update(cloudflare)
+    # Compatibility reads in older releases. New code never depends on these.
+    cfg["cloudflare_api_key"] = cloudflare["cloudflare_admin_password"]
+    cfg["defaultDomains"] = cloudflare["cloudflare_domain"]
 
     for key in (
         "moemail_api_url", "moemail_api_key",
@@ -782,7 +820,11 @@ def apply_email_config_from_ui(data: dict) -> dict:
     # required fields soft-check for selected provider
     need = {
         "cfworker": ["cfworker_api_url"],
-        "cloudflare": ["cloudflare_api_base"],
+        "cloudflare_temp_email": [
+            "cloudflare_api_base",
+            "cloudflare_admin_password",
+            "cloudflare_domain",
+        ],
         "luckmail": ["luckmail_api_key"],
         "skymail": ["skymail_token"],
         "cloudmail": ["cloudmail_api_base"],
@@ -793,11 +835,6 @@ def apply_email_config_from_ui(data: dict) -> dict:
     }
     for field in need.get(provider, []):
         if not str(cfg.get(field) or "").strip():
-            # allow cloudflare/cfworker alias
-            if provider == "cfworker" and cfg.get("cloudflare_api_base"):
-                continue
-            if provider == "cloudflare" and cfg.get("cfworker_api_url"):
-                continue
             raise ValueError(f"邮箱源 {provider} 需要配置: {field}")
 
     cfg.pop("tempmailer_api_base", None)
@@ -805,6 +842,43 @@ def apply_email_config_from_ui(data: dict) -> dict:
     cfg.pop("tempmailer_domains", None)
     save_config(cfg)
     return email_config_public(cfg)
+
+
+def probe_cloudflare_temp_email(data: dict) -> dict:
+    """Probe settings endpoints only; this must never create an address."""
+    import requests
+
+    config = validate_cloudflare_temp_email_config(data)
+    headers = {
+        "Accept": "application/json",
+        "x-admin-auth": config["cloudflare_admin_password"],
+        "x-lang": "zh",
+    }
+    if config["cloudflare_site_password"]:
+        headers["x-custom-auth"] = config["cloudflare_site_password"]
+
+    for index, path in enumerate(("/open_api/settings", "/api/settings")):
+        try:
+            response = requests.request(
+                "GET",
+                f"{config['cloudflare_api_base']}{path}",
+                headers=headers,
+                timeout=8,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Cloudflare Temp Email 连接失败: {exc}") from exc
+        if 200 <= response.status_code < 300:
+            return {
+                "ok": True,
+                "endpoint": path,
+                "message": f"连接成功，设置端点可用: {path}",
+            }
+        if index == 0 and response.status_code in (404, 405):
+            continue
+        raise RuntimeError(
+            f"Cloudflare Temp Email 连接测试失败: HTTP {response.status_code}"
+        )
+    raise RuntimeError("Cloudflare Temp Email 设置端点不可用: HTTP 404/405")
 
 
 def resolve_proxy_url() -> str:
@@ -1634,6 +1708,7 @@ INDEX_HTML = r"""
         <input type="checkbox" id="email_failover" style="width:auto;min-width:0"/> 失败时自动换源
       </label>
       <button class="btn primary" onclick="saveEmailConfig()">保存邮箱设置</button>
+      <button class="btn" id="btn_email_test" onclick="testCloudflareEmailConnection()" style="display:none">测试连接</button>
     </div>
 
     <div id="box_cfworker" class="mail-box" style="display:none;margin-top:10px">
@@ -1658,39 +1733,24 @@ INDEX_HTML = r"""
       </div>
     </div>
 
-    <div id="box_cloudflare" class="mail-box" style="display:none;margin-top:10px">
-      <div class="muted" style="font-size:12px;margin-bottom:8px">兼容 cloudflare_temp_email：创建地址 + 收信。</div>
+    <div id="box_cloudflare_temp_email" class="mail-box" style="display:none;margin-top:10px">
+      <div class="muted" style="font-size:12px;margin-bottom:8px;line-height:1.55">
+        对接 dreamhunter2333/cloudflare_temp_email：管理员接口创建地址，地址 JWT 拉取解析邮件。连接测试只读取设置，不会创建邮箱。
+      </div>
       <div class="row">
         <label style="flex:2">API 根地址
-          <input type="text" id="custom_api_base" placeholder="https://mail.example.com"/>
+          <input type="url" id="cloudflare_api_base" placeholder="https://mail.example.com" autocomplete="url"/>
         </label>
-        <label>API Key
-          <input type="password" id="custom_api_key" placeholder="x-admin-auth"/>
+        <label>管理员密码
+          <input type="password" id="cloudflare_admin_password" placeholder="x-admin-auth" autocomplete="new-password"/>
         </label>
       </div>
       <div class="row" style="margin-top:8px">
-        <label>鉴权方式
-          <select id="custom_auth_mode">
-            <option value="x-admin-auth">x-admin-auth</option>
-            <option value="bearer">Bearer</option>
-            <option value="x-api-key">X-API-Key</option>
-            <option value="query-key">?key=</option>
-            <option value="none">无</option>
-          </select>
-        </label>
         <label>域名
-          <input type="text" id="custom_domain" placeholder="mail.example.com"/>
+          <input type="text" id="cloudflare_domain" placeholder="mail.example.com" autocomplete="off"/>
         </label>
-      </div>
-      <div class="row" style="margin-top:8px">
-        <label>创建路径
-          <input type="text" id="custom_path_accounts" placeholder="/admin/new_address"/>
-        </label>
-        <label>收信路径
-          <input type="text" id="custom_path_messages" placeholder="/api/mails"/>
-        </label>
-        <label>Token 路径
-          <input type="text" id="custom_path_token" placeholder="/api/token"/>
+        <label>站点访问密码
+          <input type="password" id="cloudflare_site_password" placeholder="可选，x-custom-auth" autocomplete="new-password"/>
         </label>
       </div>
     </div>
@@ -1914,15 +1974,8 @@ function onEmailProviderChange(){
   document.querySelectorAll('.mail-box').forEach(el=>{ el.style.display='none'; });
   const box=document.getElementById('box_'+p);
   if(box) box.style.display='block';
-  // cloudflare alias box
-  if(p==='cloudflare'){
-    const b=document.getElementById('box_cloudflare');
-    if(b) b.style.display='block';
-  }
-  if(p==='cfworker'){
-    const b=document.getElementById('box_cfworker');
-    if(b) b.style.display='block';
-  }
+  const testButton=document.getElementById('btn_email_test');
+  if(testButton) testButton.style.display=p==='cloudflare_temp_email'?'':'none';
 }
 function _val(id){const el=document.getElementById(id); return el?el.value:'';}
 function _set(id,v){const el=document.getElementById(id); if(el) el.value=v||'';}
@@ -1947,13 +2000,10 @@ async function loadEmailConfig(){
     _set('cfworker_domain', e.cfworker_domain);
     _set('cfworker_custom_auth', e.cfworker_custom_auth);
     _set('cfworker_subdomain', e.cfworker_subdomain);
-    _set('custom_api_base', e.custom_api_base);
-    _set('custom_api_key', e.custom_api_key);
-    _set('custom_auth_mode', e.custom_auth_mode||'x-admin-auth');
-    _set('custom_domain', e.custom_domain);
-    _set('custom_path_accounts', e.custom_path_accounts||'/admin/new_address');
-    _set('custom_path_messages', e.custom_path_messages||'/api/mails');
-    _set('custom_path_token', e.custom_path_token||'/api/token');
+    _set('cloudflare_api_base', e.cloudflare_api_base);
+    _set('cloudflare_admin_password', e.cloudflare_admin_password);
+    _set('cloudflare_domain', e.cloudflare_domain);
+    _set('cloudflare_site_password', e.cloudflare_site_password);
     _set('moemail_api_url', e.moemail_api_url||'https://sall.cc');
     _set('moemail_api_key', e.moemail_api_key);
     _set('gptmail_base_url', e.gptmail_base_url||'https://mail.chatgpt.org.uk');
@@ -2002,13 +2052,10 @@ async function saveEmailConfig(){
     cfworker_domain: _val('cfworker_domain'),
     cfworker_custom_auth: _val('cfworker_custom_auth'),
     cfworker_subdomain: _val('cfworker_subdomain'),
-    custom_api_base: _val('custom_api_base'),
-    custom_api_key: _val('custom_api_key'),
-    custom_auth_mode: _val('custom_auth_mode')||'x-admin-auth',
-    custom_domain: _val('custom_domain'),
-    custom_path_accounts: _val('custom_path_accounts'),
-    custom_path_messages: _val('custom_path_messages'),
-    custom_path_token: _val('custom_path_token'),
+    cloudflare_api_base: _val('cloudflare_api_base'),
+    cloudflare_admin_password: _val('cloudflare_admin_password'),
+    cloudflare_domain: _val('cloudflare_domain'),
+    cloudflare_site_password: _val('cloudflare_site_password'),
     moemail_api_url: _val('moemail_api_url'),
     moemail_api_key: _val('moemail_api_key'),
     gptmail_base_url: _val('gptmail_base_url'),
@@ -2050,6 +2097,28 @@ async function saveEmailConfig(){
       setEmailHint('已保存 · 当前: '+(j.email.provider||''));
     }
   }catch(e){toast('保存失败: '+e.message)}
+}
+async function testCloudflareEmailConnection(){
+  const button=document.getElementById('btn_email_test');
+  const body={
+    cloudflare_api_base: _val('cloudflare_api_base'),
+    cloudflare_admin_password: _val('cloudflare_admin_password'),
+    cloudflare_domain: _val('cloudflare_domain'),
+    cloudflare_site_password: _val('cloudflare_site_password'),
+  };
+  if(button) button.disabled=true;
+  try{
+    const j=await api('/api/config/email/test',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)
+    });
+    toast(j.message||'邮箱服务连接成功');
+    setEmailHint(j.message||'Cloudflare Temp Email 连接成功');
+  }catch(e){
+    toast('连接失败: '+e.message);
+    setEmailHint('连接失败: '+e.message);
+  }finally{
+    if(button) button.disabled=false;
+  }
 }
 function setEmailHint(text){
   const el=document.getElementById('email_hint');
@@ -2737,6 +2806,19 @@ def api_set_email_config():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"ok": True, "message": "邮箱设置已保存", "email": email})
+
+
+@app.post("/api/config/email/test")
+def api_test_email_config():
+    need = require_login()
+    if need:
+        return need
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        result = probe_cloudflare_temp_email(data)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify(result)
 
 
 @app.get("/api/job/status")
