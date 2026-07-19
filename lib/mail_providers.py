@@ -3,7 +3,7 @@
 """Multi mailbox provider adapter (any-auto-register base_mailbox).
 
 Used by grok_register_ttk to support dropdown providers:
-  cfworker, cloudflare, moemail, tempmail_lol, duckmail, gptmail,
+  cfworker, cloudflare_temp_email, moemail, tempmail_lol, duckmail, gptmail,
   maliapi, luckmail, skymail, cloudmail, freemail, opentrashmail, laoudo
 """
 
@@ -35,7 +35,7 @@ except Exception as exc:
 
 MAIL_PROVIDER_CHOICES = [
     ("cfworker", "CF Worker / 自建域名"),
-    ("cloudflare", "自定义 cloudflare_temp_email"),
+    ("cloudflare_temp_email", "Cloudflare Temp Email / 自建域名"),
     ("moemail", "MoeMail (sall.cc)"),
     ("tempmail_lol", "TempMail.lol（自动生成）"),
     ("duckmail", "DuckMail"),
@@ -66,7 +66,8 @@ def normalize_provider(name: str) -> str:
     p = str(name or "").strip().lower()
     aliases = {
         "custom": "cfworker",
-        "cloudflare_temp_email": "cfworker",
+        "cloudflare": "cloudflare_temp_email",
+        "cloudflare-temp-email": "cloudflare_temp_email",
         "cf-worker": "cfworker",
         "cf_worker": "cfworker",
         "tempmail": "tempmail_lol",
@@ -81,10 +82,20 @@ def normalize_provider(name: str) -> str:
 
 def extra_from_config(config: dict) -> dict:
     c = config or {}
-    cf_url = str(c.get("cfworker_api_url") or c.get("cloudflare_api_base") or "").strip()
-    cf_token = str(c.get("cfworker_admin_token") or c.get("cloudflare_api_key") or "").strip()
-    cf_domain = str(c.get("cfworker_domain") or c.get("defaultDomains") or "").strip()
+    cf_url = str(c.get("cfworker_api_url") or "").strip()
+    cf_token = str(c.get("cfworker_admin_token") or "").strip()
+    cf_domain = str(c.get("cfworker_domain") or "").strip()
     return {
+        "cloudflare_api_base": str(c.get("cloudflare_api_base") or "").strip(),
+        "cloudflare_admin_password": str(
+            c.get("cloudflare_admin_password") or c.get("cloudflare_api_key") or ""
+        ).strip(),
+        "cloudflare_domain": str(
+            c.get("cloudflare_domain") or c.get("defaultDomains") or ""
+        ).strip(),
+        "cloudflare_site_password": str(
+            c.get("cloudflare_site_password") or c.get("cfworker_custom_auth") or ""
+        ).strip(),
         "moemail_api_url": str(c.get("moemail_api_url") or "https://sall.cc").strip(),
         "moemail_api_key": str(c.get("moemail_api_key") or "").strip(),
         "skymail_api_base": str(c.get("skymail_api_base") or "https://api.skymail.ink").strip(),
@@ -160,10 +171,18 @@ def provider_ready(config: dict, provider: str) -> bool:
         return bool(str(c.get("opentrashmail_api_url") or "").strip())
     if p == "laoudo":
         return bool(str(c.get("laoudo_email") or "").strip())
-    if p in ("cfworker", "cloudflare", "custom"):
-        return bool(
-            str(c.get("cfworker_api_url") or c.get("cloudflare_api_base") or "").strip()
+    if p == "cloudflare_temp_email":
+        extra = extra_from_config(c)
+        return all(
+            extra[key]
+            for key in (
+                "cloudflare_api_base",
+                "cloudflare_admin_password",
+                "cloudflare_domain",
+            )
         )
+    if p == "cfworker":
+        return bool(str(c.get("cfworker_api_url") or "").strip())
     return False
 
 
@@ -171,16 +190,15 @@ def make_mailbox(config: dict, provider: str, proxy: str = "", log_callback=None
     if not import_ok():
         raise RuntimeError(f"base_mailbox 未加载: {_IMPORT_ERR}")
     prov = normalize_provider(provider)
-    factory = "cfworker" if prov in ("cloudflare", "custom") else prov
     extra = extra_from_config(config)
-    box = bm.create_mailbox(factory, extra=extra, proxy=proxy or None)
+    box = bm.create_mailbox(prov, extra=extra, proxy=proxy or None)
     try:
         box._log_fn = log_callback
     except Exception:
         pass
     if log_callback:
-        log_callback(f"[*] 邮箱适配器: {factory}")
-    return box, factory
+        log_callback(f"[*] 邮箱适配器: {prov}")
+    return box, prov
 
 
 def get_email_and_token(

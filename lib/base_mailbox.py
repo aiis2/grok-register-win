@@ -306,6 +306,14 @@ def create_mailbox(
             password=extra.get("opentrashmail_password", ""),
             proxy=proxy,
         )
+    elif provider == "cloudflare_temp_email":
+        return CloudflareTempEmailMailbox(
+            api_base=extra.get("cloudflare_api_base", ""),
+            admin_password=extra.get("cloudflare_admin_password", ""),
+            domain=extra.get("cloudflare_domain", ""),
+            site_password=extra.get("cloudflare_site_password", ""),
+            proxy=proxy,
+        )
     elif provider == "cfworker":
         return CFWorkerMailbox(
             api_url=extra.get("cfworker_api_url", ""),
@@ -2496,6 +2504,33 @@ class CloudflareTempEmailMailbox(BaseMailbox):
             for message_id in (self._message_id(mail),)
             if message_id
         }
+
+    def delete_email(self, account: MailboxAccount) -> bool:
+        """Delete an address using its JWT, with admin-id compatibility fallback."""
+        jwt = self._address_jwt(account)
+        if not jwt:
+            raise RuntimeError("Cloudflare Temp Email 地址 JWT 缺失")
+        try:
+            data = self._request_json(
+                "DELETE",
+                "/api/delete_address",
+                headers=self._address_headers(jwt),
+                timeout=15,
+            )
+        except CloudflareTempEmailRequestError as exc:
+            if exc.status_code not in (403, 404, 405):
+                raise
+            extra = account.extra if isinstance(account.extra, dict) else {}
+            address_id = extra.get("address_id")
+            if address_id in (None, ""):
+                return False
+            data = self._request_json(
+                "DELETE",
+                f"/admin/delete_address/{address_id}",
+                headers=self._admin_headers(),
+                timeout=15,
+            )
+        return not isinstance(data, dict) or data.get("success") is not False
 
     def wait_for_code(
         self,

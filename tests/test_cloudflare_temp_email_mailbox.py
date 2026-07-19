@@ -345,3 +345,91 @@ def test_poll_does_not_fallback_on_server_error(monkeypatch):
         )
 
     assert len(calls) == 1
+
+
+def test_delete_address_prefers_address_jwt(monkeypatch):
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(200, {"success": True})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin-secret",
+        domain="example.com",
+        site_password="site-secret",
+    )
+    account = MailboxAccount(
+        "alice@example.com",
+        "address-jwt",
+        {"jwt": "address-jwt", "address_id": 7},
+    )
+
+    assert box.delete_email(account) is True
+    assert len(calls) == 1
+    method, url, kwargs = calls[0]
+    assert (method, url) == (
+        "DELETE",
+        "https://mail.example.com/api/delete_address",
+    )
+    assert kwargs["headers"]["Authorization"] == "Bearer address-jwt"
+    assert kwargs["headers"]["x-custom-auth"] == "site-secret"
+    assert "x-admin-auth" not in kwargs["headers"]
+
+
+@pytest.mark.parametrize("user_status", [403, 404, 405])
+def test_delete_address_falls_back_to_admin_id(monkeypatch, user_status):
+    calls = []
+    responses = iter(
+        [
+            FakeResponse(user_status, {"error": "disabled"}, "disabled"),
+            FakeResponse(200, {"success": True}),
+        ]
+    )
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin-secret",
+        domain="example.com",
+    )
+
+    assert box.delete_email(
+        MailboxAccount(
+            "alice@example.com",
+            "address-jwt",
+            {"jwt": "address-jwt", "address_id": 7},
+        )
+    ) is True
+    assert [call[1] for call in calls] == [
+        "https://mail.example.com/api/delete_address",
+        "https://mail.example.com/admin/delete_address/7",
+    ]
+    assert calls[1][2]["headers"]["x-admin-auth"] == "admin-secret"
+
+
+def test_delete_address_does_not_hide_unrelated_server_failure(monkeypatch):
+    def fake_request(method, url, **kwargs):
+        return FakeResponse(500, {"error": "broken"}, "broken")
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin-secret",
+        domain="example.com",
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        box.delete_email(
+            MailboxAccount(
+                "alice@example.com",
+                "address-jwt",
+                {"jwt": "address-jwt", "address_id": 7},
+            )
+        )

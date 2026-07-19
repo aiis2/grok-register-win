@@ -16,17 +16,15 @@
     "gptmail",
     "maliapi",
     "luckmail",
-    "cloudflare"
+    "cloudflare_temp_email"
   ],
   "cfworker_api_url": "",
   "cfworker_admin_token": "",
   "cfworker_domain": "",
   "cloudflare_api_base": "",
-  "cloudflare_api_key": "",
-  "cloudflare_auth_mode": "x-admin-auth",
-  "cloudflare_path_accounts": "/admin/new_address",
-  "cloudflare_path_messages": "/api/mails",
-  "cloudflare_path_token": "/api/token",
+  "cloudflare_admin_password": "",
+  "cloudflare_domain": "",
+  "cloudflare_site_password": "",
   "moemail_api_url": "https://sall.cc",
   "moemail_api_key": "",
   "gptmail_base_url": "https://mail.chatgpt.org.uk",
@@ -38,6 +36,5 @@
   "maliapi_api_key": "",
   "luckmail_base_url": "https://mails.luckyous.com/",
   "luckmail_api_key": "",
-  "luckmail_project_code": "grok",
-  "defaultDomains": ""
+  "luckmail_project_code": "grok"
 }

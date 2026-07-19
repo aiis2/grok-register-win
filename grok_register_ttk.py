@@ -117,6 +117,10 @@ UI_ACTIVE_BG = "#4a6078"
 DEFAULT_CONFIG = {
     "duckmail_api_key": "",
     "cloudflare_api_base": "",
+    "cloudflare_admin_password": "",
+    "cloudflare_domain": "",
+    "cloudflare_site_password": "",
+    # 旧版兼容键；读取配置时由 mail_providers 映射到上述规范字段。
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
     "cloudflare_path_domains": "/api/domains",
@@ -129,7 +133,7 @@ DEFAULT_CONFIG = {
     # 注意：公共 Tempmailer / inboxkitten 已因滥用被拒收 xAI 邮件，不再内置
     "email_failover": True,
     "email_providers": [
-        "cfworker","cloudflare","moemail","tempmail_lol","duckmail","gptmail",
+        "cfworker","cloudflare_temp_email","moemail","tempmail_lol","duckmail","gptmail",
         "maliapi","luckmail","skymail","cloudmail","freemail","opentrashmail","laoudo","yyds",
     ],
     "moemail_api_url": "https://sall.cc",
@@ -1428,6 +1432,8 @@ def get_email_provider():
     p = str(config.get("email_provider") or "cfworker").strip().lower()
     if p in ("tempmailer", "inboxkitten", "inbox_kitten", "custom"):
         return "cfworker"
+    if p in ("cloudflare", "cloudflare-temp-email"):
+        return "cloudflare_temp_email"
     return p or "cfworker"
 
 
@@ -1440,8 +1446,17 @@ def email_provider_ready(provider: str) -> bool:
         return False
     if p in ("tempmail_lol", "moemail", "gptmail", "duckmail"):
         return True
-    if p in ("cfworker", "cloudflare", "custom"):
-        return bool(str(config.get("cfworker_api_url") or config.get("cloudflare_api_base") or "").strip())
+    if p == "cloudflare_temp_email":
+        return all(
+            str(value or "").strip()
+            for value in (
+                config.get("cloudflare_api_base"),
+                config.get("cloudflare_admin_password") or config.get("cloudflare_api_key"),
+                config.get("cloudflare_domain") or config.get("defaultDomains"),
+            )
+        )
+    if p in ("cfworker", "custom"):
+        return bool(str(config.get("cfworker_api_url") or "").strip())
     if p == "luckmail":
         return bool(str(config.get("luckmail_api_key") or "").strip())
     if p in ("maliapi", "yyds"):
@@ -1464,7 +1479,7 @@ def get_email_provider_chain():
     if primary and primary not in chain:
         chain.insert(0, primary)
     if not chain:
-        chain = [primary or "cloudflare"]
+        chain = [primary or "cloudflare_temp_email"]
     # 去重保持顺序
     seen = set()
     ordered = []
@@ -1474,7 +1489,7 @@ def get_email_provider_chain():
             ordered.append(p)
     ready = [p for p in ordered if email_provider_ready(p)]
     # 若一个都没 ready，仍返回 primary 以免完全不可用
-    return ready or ([primary] if primary else ["cloudflare"])
+    return ready or ([primary] if primary else ["cloudflare_temp_email"])
 
 
 def rotate_email_provider(log_callback=None, reason=""):
