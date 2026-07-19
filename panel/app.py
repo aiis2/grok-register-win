@@ -2279,6 +2279,7 @@ INDEX_HTML = r"""
     a.btn.sub2:hover,button.btn.sub2:hover{box-shadow:0 6px 18px rgba(167,139,250,.45)}
     a.btn.danger,button.btn.danger{background:#2a1717;border-color:#5a2b2b;color:#ffb4b4}
     a.btn.danger:hover,button.btn.danger:hover{background:#381c1c}
+    a.btn:disabled,button.btn:disabled,input:disabled,select:disabled{opacity:.48;cursor:not-allowed;transform:none;box-shadow:none}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:16px 0 20px}
     .stat{background:linear-gradient(180deg,var(--card) 0%,var(--card2) 100%);border:1px solid var(--line);border-radius:14px;padding:14px 16px;position:relative;overflow:hidden;transition:border-color .15s}
     .stat:hover{border-color:var(--accent)}
@@ -2304,10 +2305,39 @@ INDEX_HTML = r"""
     #logbox::-webkit-scrollbar-thumb{background:var(--line2);border-radius:4px}
     .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:#555;vertical-align:middle}
     .dot.run{background:var(--ok);box-shadow:0 0 10px var(--ok);animation:pulse 1.5s ease-in-out infinite}
+    .control-note{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:rgba(110,168,254,.045);color:var(--muted);font-size:12px;line-height:1.55}
+    .worker-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+    .worker-head strong{font-family:Bahnschrift,"Arial Narrow",sans-serif;font-size:12px;letter-spacing:.7px;text-transform:uppercase;color:var(--muted)}
+    .worker-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:9px;margin-top:10px}
+    .worker-empty{grid-column:1/-1;border:1px dashed var(--line2);border-radius:11px;padding:14px;color:var(--muted2);font-size:12px;text-align:center}
+    .worker-card{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:11px;background:linear-gradient(145deg,#111721,#171e2b);padding:11px 12px 10px}
+    .worker-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--muted2)}
+    .worker-card.running::before{background:var(--ok);box-shadow:0 0 12px rgba(61,214,140,.75)}
+    .worker-card.completed::before{background:var(--accent)}
+    .worker-card.failed::before,.worker-card.incomplete::before{background:var(--bad)}
+    .worker-card.stopped::before,.worker-card.stopping::before{background:var(--warn)}
+    .worker-top,.worker-metrics{display:flex;align-items:center;justify-content:space-between;gap:8px}
+    .worker-id{font-family:Bahnschrift,"Arial Narrow",sans-serif;font-size:15px;font-weight:700;letter-spacing:.8px}
+    .worker-status{font-size:11px;color:var(--muted);padding:2px 7px;border-radius:999px;background:var(--chip)}
+    .worker-range{margin:7px 0 8px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;font-size:11.5px}
+    .worker-metrics{font-size:11px;color:var(--muted2)}
+    .storage-shell{display:grid;grid-template-columns:minmax(280px,1.35fr) minmax(260px,1fr);gap:16px;align-items:stretch}
+    .storage-control{border:1px solid var(--line);border-radius:13px;background:linear-gradient(145deg,#101620,#171e2b);padding:14px}
+    .storage-control label{width:100%}
+    .storage-control input{width:100%;font-family:ui-monospace,Consolas,monospace}
+    .storage-actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:11px}
+    .storage-path{margin-top:10px;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:#0d121a;color:var(--muted);font-family:ui-monospace,Consolas,monospace;font-size:11.5px;word-break:break-all}
+    .storage-state{margin-top:9px;min-height:18px;color:var(--muted);font-size:12px;line-height:1.5}
+    .storage-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+    .storage-stat{border:1px solid var(--line);border-radius:11px;background:var(--bg2);padding:11px}
+    .storage-stat .label{font-size:10.5px;letter-spacing:.45px;text-transform:uppercase;color:var(--muted2)}
+    .storage-stat .value{margin-top:5px;font-family:Bahnschrift,"Arial Narrow",sans-serif;font-size:18px;color:var(--fg)}
+    .storage-warning{grid-column:1/-1;padding:9px 10px;border:1px solid #5b3b14;border-radius:10px;background:rgba(180,100,20,.1);color:#f0c674;font-size:11.5px;line-height:1.5}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
     .toast{position:fixed;right:20px;bottom:20px;background:var(--card2);border:1px solid var(--line2);padding:12px 16px;border-radius:10px;display:none;z-index:9;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:13px}
     code{background:var(--chip);padding:2px 6px;border-radius:4px;font-size:12px;color:var(--accent)}
-    @media(max-width:800px){ th:nth-child(3),td:nth-child(3){display:none} .row{flex-direction:column;align-items:stretch} input,select{min-width:0} }
+    @media(max-width:800px){ th:nth-child(3),td:nth-child(3){display:none} .row{flex-direction:column;align-items:stretch} input,select{min-width:0}.storage-shell{grid-template-columns:1fr}.worker-grid{grid-template-columns:1fr 1fr} }
+    @media(max-width:520px){.worker-grid{grid-template-columns:1fr}.storage-actions{flex-direction:column}.storage-actions .btn{justify-content:center}.storage-stats{grid-template-columns:1fr 1fr}}
   </style>
 </head>
 <body>
@@ -2334,6 +2364,7 @@ INDEX_HTML = r"""
     <div class="stat"><div class="k">CPA 队列</div><div class="v" style="font-size:16px" id="st_cpa_q">0 / 0 / 0</div></div>
     <div class="stat"><div class="k">任务状态</div><div class="v" style="font-size:16px"><span class="dot" id="st_dot"></span><span id="st_status">idle</span></div></div>
     <div class="stat"><div class="k">注册 成功/失败</div><div class="v" style="font-size:16px"><span id="st_sf">0 / 0</span></div></div>
+    <div class="stat"><div class="k">并发槽 活跃/有效</div><div class="v" style="font-size:16px"><span id="st_concurrency">0 / 0</span></div></div>
   </div>
 
   <div class="card">
@@ -2341,6 +2372,9 @@ INDEX_HTML = r"""
     <div class="row">
       <label>轮数
         <input type="number" id="count" min="1" max="500" value="1"/>
+      </label>
+      <label>注册并发度
+        <input type="number" id="register_concurrency" min="1" max="10" value="{{ register_concurrency }}"/>
       </label>
       <label>浏览器引擎
         <select id="browser_engine" onchange="saveBrowserEngine()">
@@ -2352,6 +2386,9 @@ INDEX_HTML = r"""
       <button class="btn danger" id="btn_stop" onclick="stopJob()">■ 停止</button>
       <button class="btn" onclick="backfillCpa()" title="把尚未转成 CPA 的历史 SSO 入队">补转未转换 CPA</button>
     </div>
+    <div class="control-note">
+      并发度支持 1–10。每个槽使用独立 CLI 进程、有头浏览器和临时 Profile；同一槽会在账号批次内复用浏览器，超时只重启该槽。
+    </div>
     <div class="muted" style="margin-top:10px;font-size:12px" id="cpa_hint">
       代理走本机 Clash（config.json 的 proxy，常见 7897）。节点在 Clash 里选。注册成功后自动转 CPA。
       Camoufox 首次使用会自动下载浏览器二进制。
@@ -2359,6 +2396,40 @@ INDEX_HTML = r"""
     <div class="muted" style="margin-top:8px;font-size:12px;line-height:1.55">
       提示：绝大多数注册失败来自网络环境，而非脚本本身。实测机场节点里<strong style="color:var(--ok);font-weight:600">日本</strong>更稳；
       新加坡 / 美国 / 德国成功率偏低。失败时请先在 Clash 换日本节点再试。
+    </div>
+    <div class="worker-head">
+      <strong>Worker Process Matrix</strong>
+      <span class="muted" style="font-size:11px">范围 · 当前轮次 · PID · 成功/失败</span>
+    </div>
+    <div class="worker-grid" id="worker_grid">
+      <div class="worker-empty">任务启动后，这里会显示每个独立浏览器槽的状态。</div>
+    </div>
+  </div>
+
+  <div class="card" id="credential_storage_card">
+    <h2>凭据仓库</h2>
+    <div class="storage-shell">
+      <div class="storage-control">
+        <label>凭据根目录
+          <input type="text" id="credentials_dir" spellcheck="false" placeholder="data/credentials 或绝对路径"/>
+        </label>
+        <div class="storage-actions">
+          <button class="btn primary" type="button" id="credential_save" onclick="saveCredentialPath()">保存新路径</button>
+          <button class="btn ok" type="button" id="credential_migrate" onclick="migrateCredentialPath()">迁移并切换</button>
+        </div>
+        <div class="storage-path" id="credential_resolved">正在读取当前路径…</div>
+        <div class="storage-state" id="credential_state" aria-live="polite"></div>
+      </div>
+      <div class="storage-stats">
+        <div class="storage-stat"><div class="label">SSO 文件</div><div class="value" id="cred_sso_files">0</div></div>
+        <div class="storage-stat"><div class="label">邮箱 JWT 文件</div><div class="value" id="cred_mail_files">0</div></div>
+        <div class="storage-stat"><div class="label">CPA 文件</div><div class="value" id="cred_cpa_files">0</div></div>
+        <div class="storage-stat"><div class="label">总量 / 空间</div><div class="value" id="cred_total_files">0</div><div class="muted" id="cred_total_bytes" style="font-size:10.5px;margin-top:2px">0 B</div></div>
+        <div class="storage-warning" id="credential_warning">
+          “迁移并切换”按复制 → SHA-256 校验 → 配置切换 → 删除来源执行；不会覆盖同名异内容文件，冲突文件会自动改名。
+          <span id="cred_legacy">历史位置待迁移：0 个文件</span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2636,6 +2707,127 @@ async function api(url, opt){
   if(!r.ok) throw new Error(j.error||r.statusText||'request failed');
   return j;
 }
+function formatBytes(value){
+  const bytes=Number(value||0);
+  if(bytes<1024) return bytes+' B';
+  if(bytes<1024*1024) return (bytes/1024).toFixed(1)+' KiB';
+  return (bytes/(1024*1024)).toFixed(1)+' MiB';
+}
+function renderWorkerStates(st){
+  const grid=document.getElementById('worker_grid');
+  if(!grid) return;
+  const workers=Array.isArray(st.workers)?st.workers:[];
+  grid.replaceChildren();
+  if(!workers.length){
+    const empty=document.createElement('div');
+    empty.className='worker-empty';
+    empty.textContent='任务启动后，这里会显示每个独立浏览器槽的状态。';
+    grid.appendChild(empty);
+    return;
+  }
+  const labels={pending:'等待',running:'运行中',finishing:'清理中',completed:'已完成',failed:'失败',incomplete:'未完成',stopping:'停止中',stopped:'已停止'};
+  const classes=new Set(['pending','running','finishing','completed','failed','incomplete','stopping','stopped']);
+  workers.forEach(worker=>{
+    const status=String(worker.status||'pending');
+    const card=document.createElement('div');
+    card.className='worker-card '+(classes.has(status)?status:'pending');
+
+    const top=document.createElement('div'); top.className='worker-top';
+    const id=document.createElement('div'); id.className='worker-id'; id.textContent='W'+String(worker.worker_id||'?');
+    const state=document.createElement('div'); state.className='worker-status'; state.textContent=labels[status]||status;
+    top.append(id,state);
+
+    const start=Number(worker.start_index||0);
+    const count=Number(worker.batch_count||0);
+    const end=start&&count ? start+count-1 : 0;
+    const range=document.createElement('div'); range.className='worker-range';
+    range.textContent=(start&&end?`#${start}–#${end}`:'未分配')+' · 当前 '+(worker.current_round||'—');
+
+    const metrics=document.createElement('div'); metrics.className='worker-metrics';
+    const pid=document.createElement('span'); pid.textContent='PID '+(worker.pid||'—');
+    const result=document.createElement('span'); result.textContent=`${worker.success||0} 成 / ${worker.fail||0} 败`;
+    metrics.append(pid,result);
+    card.append(top,range,metrics);
+    grid.appendChild(card);
+  });
+}
+let credentialActionBusy=false;
+let credentialControlsBlocked=false;
+function setCredentialActionsDisabled(blocked){
+  credentialControlsBlocked=!!blocked;
+  ['credential_save','credential_migrate'].forEach(id=>{
+    const button=document.getElementById(id);
+    if(button) button.disabled=credentialActionBusy||credentialControlsBlocked;
+  });
+  const input=document.getElementById('credentials_dir');
+  if(input) input.disabled=credentialActionBusy||credentialControlsBlocked;
+}
+function setCredentialState(text, bad){
+  const state=document.getElementById('credential_state');
+  if(!state) return;
+  state.textContent=String(text||'');
+  state.style.color=bad?'var(--bad)':'var(--muted)';
+}
+function renderCredentialConfig(data){
+  const stats=data.stats||{};
+  _set('credentials_dir',data.configured||'data/credentials');
+  const resolved=document.getElementById('credential_resolved');
+  if(resolved) resolved.textContent='当前解析路径 · '+(data.resolved_path||'—');
+  const values={
+    cred_sso_files:stats.sso_files||0,
+    cred_mail_files:stats.mail_files||0,
+    cred_cpa_files:stats.cpa_files||0,
+    cred_total_files:stats.total_files||0,
+  };
+  Object.entries(values).forEach(([id,value])=>{
+    const el=document.getElementById(id); if(el) el.textContent=String(value);
+  });
+  const bytes=document.getElementById('cred_total_bytes');
+  if(bytes) bytes.textContent=formatBytes(stats.total_bytes||0);
+  const legacy=document.getElementById('cred_legacy');
+  if(legacy) legacy.textContent=' 历史位置待迁移：'+String(data.legacy_files||0)+' 个文件';
+  const notes=[];
+  notes.push(data.writable?'目录可写':'目录不可写');
+  if(data.cpa_env_override) notes.push('CPA_DIR 环境变量正在覆盖 CPA 子目录');
+  if(data.migration){
+    const m=data.migration;
+    notes.push(`已迁移 ${m.copied||0}，跳过 ${m.skipped||0}，冲突改名 ${m.renamed||0}，删除来源 ${m.removed||0}`);
+    if((m.warnings||[]).length) notes.push('警告 '+m.warnings.length+' 条');
+  }
+  setCredentialState(notes.join(' · '),!data.writable);
+  setCredentialActionsDisabled(credentialControlsBlocked||!!data.running);
+}
+async function loadCredentialConfig(){
+  try{
+    renderCredentialConfig(await api('/api/config/credentials'));
+  }catch(e){setCredentialState('读取凭据目录失败: '+e.message,true)}
+}
+async function saveCredentialPath(){
+  const credentials_dir=_val('credentials_dir').trim();
+  credentialActionBusy=true; setCredentialActionsDisabled(credentialControlsBlocked);
+  try{
+    const data=await api('/api/config/credentials',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credentials_dir})
+    });
+    renderCredentialConfig(data); toast('凭据目录已保存');
+  }catch(e){setCredentialState('保存失败: '+e.message,true);toast('保存失败: '+e.message)}
+  finally{credentialActionBusy=false;setCredentialActionsDisabled(credentialControlsBlocked)}
+}
+async function migrateCredentialPath(){
+  const credentials_dir=_val('credentials_dir').trim();
+  const message='确认迁移全部 SSO、邮箱 JWT 与 CPA 凭据到新目录？\n\n系统会复制文件、执行 SHA-256 校验、切换配置，最后删除已验证的来源文件。不会覆盖同名异内容文件，冲突项会自动改名。';
+  if(!confirm(message)) return;
+  credentialActionBusy=true; setCredentialActionsDisabled(credentialControlsBlocked);
+  setCredentialState('正在复制并校验，请勿关闭面板…',false);
+  try{
+    const data=await api('/api/config/credentials/migrate',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credentials_dir})
+    });
+    renderCredentialConfig(data);
+    toast('凭据迁移与目录切换完成');
+  }catch(e){setCredentialState('迁移失败，原配置与来源文件已保留: '+e.message,true);toast('迁移失败: '+e.message)}
+  finally{credentialActionBusy=false;setCredentialActionsDisabled(credentialControlsBlocked)}
+}
 function onEmailProviderChange(){
   const p=document.getElementById('email_provider').value||'cfworker';
   document.querySelectorAll('.mail-box').forEach(el=>{ el.style.display='none'; });
@@ -2835,12 +3027,17 @@ async function saveBrowserEngine(){
 }
 async function startJob(){
   const count=parseInt(document.getElementById('count').value||'1',10);
+  const concurrency=parseInt(document.getElementById('register_concurrency').value||'1',10);
+  if(!Number.isInteger(concurrency)||concurrency<1||concurrency>10){
+    toast('注册并发度必须是 1–10 的整数');
+    return;
+  }
   try{
     // auto-save email settings before start
     try{ await saveEmailConfig(); }catch(e){}
     try{ await saveBrowserEngine(); }catch(e){}
     const j=await api('/api/job/start',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({count, browser_engine: document.getElementById('browser_engine').value})});
+      body:JSON.stringify({count, concurrency, browser_engine: document.getElementById('browser_engine').value})});
     toast(j.message||'已启动');
     poll();
   }catch(e){toast('启动失败: '+e.message)}
@@ -2868,6 +3065,13 @@ async function poll(){
     document.getElementById('st_dot').className='dot'+(st.running?' run':'');
     document.getElementById('st_sf').textContent=`${st.success||0} / ${st.fail||0}`;
     document.getElementById('btn_start').disabled=!!st.running;
+    document.getElementById('btn_stop').disabled=!st.running;
+    document.getElementById('register_concurrency').disabled=!!st.running;
+    document.getElementById('browser_engine').disabled=!!st.running;
+    const concurrencyStat=document.getElementById('st_concurrency');
+    if(concurrencyStat) concurrencyStat.textContent=`${st.active_workers||0} / ${st.effective_concurrency||0}`;
+    renderWorkerStates(st);
+    setCredentialActionsDisabled(!!st.running||!!cpa.running||Number(cpa.pending||0)>0);
     if(document.getElementById('st_cpa_ok')){
       document.getElementById('st_cpa_ok').textContent=String(cpa.files||0);
     }
@@ -2893,6 +3097,7 @@ async function poll(){
 }
 loadEmailConfig();
 loadBrowserEngine();
+loadCredentialConfig();
 poll();
 setInterval(poll, 2000);
 </script>
@@ -2982,6 +3187,13 @@ def index():
                 ),
             }
         )
+    cfg = load_config()
+    try:
+        register_concurrency = normalize_registration_concurrency(
+            cfg.get("register_concurrency", 1)
+        )
+    except ValueError:
+        register_concurrency = 1
     return render_template_string(
         INDEX_HTML,
         base_dir=str(BASE_DIR),
@@ -2989,6 +3201,7 @@ def index():
         file_count=len(files_meta),
         account_count=total,
         cpa_files=len(list_cpa_files()),
+        register_concurrency=register_concurrency,
     )
 
 
@@ -3614,6 +3827,20 @@ def api_job_status():
         return need
     with _job_lock:
         job = dict(_job)
+        worker_map = _job.get("workers") or {}
+        job["workers"] = [
+            dict(worker)
+            for _key, worker in sorted(
+                worker_map.items(), key=lambda item: int(item[0])
+            )
+        ]
+        job["outcomes"] = dict(_job.get("outcomes") or {})
+        job["effective_concurrency"] = len(job["workers"])
+        job["active_workers"] = sum(
+            1
+            for worker in job["workers"]
+            if worker.get("pid") is not None and worker.get("status") == "running"
+        )
     return jsonify({"ok": True, "job": job, "logs": list(_logs), "cpa": cpa_stats()})
 
 
@@ -3694,15 +3921,26 @@ def api_job_start():
         count = int(data.get("count") or 1)
     except Exception:
         count = 1
+    cfg = load_config()
+    if "concurrency" in data:
+        raw_concurrency = data.get("concurrency")
+    elif "register_concurrency" in data:
+        raw_concurrency = data.get("register_concurrency")
+    else:
+        raw_concurrency = cfg.get("register_concurrency", 1)
+    try:
+        concurrency = normalize_registration_concurrency(raw_concurrency)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    cfg["register_concurrency"] = concurrency
     if "browser_engine" in data:
         eng = _normalize_browser_engine(data.get("browser_engine"))
-        cfg = load_config()
         cfg["browser_engine"] = eng
-        save_config(cfg)
-    ok, msg = start_job(count)
+    save_config_atomic(cfg)
+    ok, msg = start_job(count, concurrency)
     if not ok:
         return jsonify({"ok": False, "error": msg}), 400
-    return jsonify({"ok": True, "message": msg})
+    return jsonify({"ok": True, "message": msg, "concurrency": concurrency})
 
 
 @app.post("/api/job/stop")
