@@ -38,5 +38,19 @@
   "maliapi_api_key": "",
   "luckmail_base_url": "https://mails.luckyous.com/",
   "luckmail_api_key": "",
-  "luckmail_project_code": "grok"
+  "luckmail_project_code": "grok",
+  "freemail_api_url": "",
+  "freemail_admin_token": "",
+  "freemail_username": "",
+  "freemail_password": "",
+  "freemail_domain": "",
+  "mail_test_sender_mode": "auto",
+  "mail_test_timeout_sec": 90,
+  "mail_test_smtp_host": "",
+  "mail_test_smtp_port": 587,
+  "mail_test_smtp_security": "starttls",
+  "mail_test_smtp_username": "",
+  "mail_test_smtp_password": "",
+  "mail_test_smtp_from": "",
+  "mail_test_direct_mx_enabled": false
 }

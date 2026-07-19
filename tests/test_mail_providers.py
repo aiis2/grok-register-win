@@ -8,6 +8,7 @@ from mail_providers import (
     make_mailbox,
     normalize_provider,
     provider_ready,
+    resolved_provider_config,
 )
 
 
@@ -103,6 +104,46 @@ def test_provider_choices_expose_only_canonical_cloudflare_id():
 
     assert "cloudflare_temp_email" in ids
     assert "cloudflare" not in ids
+
+
+def test_freemail_environment_fills_missing_configuration():
+    resolved = resolved_provider_config(
+        {},
+        environ={
+            "MAIL_WEB_URL": " mail.example.com/ ",
+            "ADMIN_NAME": " admin ",
+            "ADMIN_PASSWORD": " secret ",
+        },
+    )
+
+    assert resolved["freemail_api_url"] == "https://mail.example.com"
+    assert resolved["freemail_username"] == "admin"
+    assert resolved["freemail_password"] == "secret"
+
+
+def test_explicit_freemail_configuration_wins_over_environment():
+    resolved = resolved_provider_config(
+        {
+            "freemail_api_url": "https://configured.example.com/",
+            "freemail_username": "configured-user",
+            "freemail_password": "configured-password",
+        },
+        environ={
+            "MAIL_WEB_URL": "https://environment.example.com",
+            "ADMIN_NAME": "environment-user",
+            "ADMIN_PASSWORD": "environment-password",
+        },
+    )
+
+    assert resolved["freemail_api_url"] == "https://configured.example.com"
+    assert resolved["freemail_username"] == "configured-user"
+    assert resolved["freemail_password"] == "configured-password"
+
+
+def test_freemail_environment_makes_provider_ready(monkeypatch):
+    monkeypatch.setenv("MAIL_WEB_URL", "mail.example.com")
+
+    assert provider_ready({}, "freemail") is True
 
 
 def test_cleanup_active_cloudflare_address_and_reset_state(monkeypatch):

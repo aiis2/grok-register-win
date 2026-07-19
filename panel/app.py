@@ -102,6 +102,7 @@ from credential_store import (  # type: ignore
     migrate_credentials,
     normalize_credentials_setting,
 )
+from mail_providers import resolved_provider_config  # type: ignore
 
 try:
     from sso2cpa_core import (  # type: ignore
@@ -862,6 +863,7 @@ def validate_cloudflare_temp_email_config(data: dict) -> dict:
 def email_config_public(cfg: Optional[dict] = None) -> dict:
     """Email settings for panel UI (multi-provider dropdown)."""
     c = cfg if isinstance(cfg, dict) else load_config()
+    resolved = resolved_provider_config(c)
     provider = normalize_email_provider(c.get("email_provider") or "cfworker")
     cloudflare = normalize_cloudflare_temp_email_config(c)
 
@@ -927,9 +929,25 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
         "cloudmail_admin_email": str(c.get("cloudmail_admin_email") or "").strip(),
         "cloudmail_admin_password": str(c.get("cloudmail_admin_password") or "").strip(),
         "cloudmail_domain": str(c.get("cloudmail_domain") or "").strip(),
-        "freemail_api_url": str(c.get("freemail_api_url") or "").strip(),
+        "freemail_api_url": str(resolved.get("freemail_api_url") or "").strip(),
         "freemail_admin_token": str(c.get("freemail_admin_token") or "").strip(),
+        "freemail_username": str(resolved.get("freemail_username") or "").strip(),
+        "freemail_password_configured": bool(str(c.get("freemail_password") or "").strip()),
+        "freemail_env_url_available": bool(os.environ.get("MAIL_WEB_URL", "").strip()),
+        "freemail_env_username_available": bool(os.environ.get("ADMIN_NAME", "").strip()),
+        "freemail_env_password_available": bool(os.environ.get("ADMIN_PASSWORD", "").strip()),
         "freemail_domain": str(c.get("freemail_domain") or "").strip(),
+        "mail_test_sender_mode": str(c.get("mail_test_sender_mode") or "auto").strip().lower(),
+        "mail_test_timeout_sec": int(c.get("mail_test_timeout_sec") or 90),
+        "mail_test_smtp_host": str(c.get("mail_test_smtp_host") or "").strip(),
+        "mail_test_smtp_port": int(c.get("mail_test_smtp_port") or 587),
+        "mail_test_smtp_security": str(c.get("mail_test_smtp_security") or "starttls").strip().lower(),
+        "mail_test_smtp_username": str(c.get("mail_test_smtp_username") or "").strip(),
+        "mail_test_smtp_password_configured": bool(
+            str(c.get("mail_test_smtp_password") or "").strip()
+        ),
+        "mail_test_smtp_from": str(c.get("mail_test_smtp_from") or "").strip(),
+        "mail_test_direct_mx_enabled": bool(c.get("mail_test_direct_mx_enabled", False)),
         "opentrashmail_api_url": str(c.get("opentrashmail_api_url") or "").strip(),
         "opentrashmail_domain": str(c.get("opentrashmail_domain") or "").strip(),
         "opentrashmail_password": str(c.get("opentrashmail_password") or "").strip(),
@@ -962,6 +980,16 @@ def apply_email_config_from_ui(data: dict) -> dict:
     def g(key, default=""):
         return str(data.get(key, cfg.get(key, default)) or default).strip()
 
+    def secret(key):
+        submitted = str(data.get(key) or "").strip()
+        if submitted:
+            cfg[key] = submitted
+
+    def as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
     # always store fields (so switching providers keeps values)
     cfg["cfworker_api_url"] = g("cfworker_api_url")
     cfg["cfworker_admin_token"] = g("cfworker_admin_token")
@@ -983,12 +1011,48 @@ def apply_email_config_from_ui(data: dict) -> dict:
         "luckmail_base_url", "luckmail_api_key", "luckmail_project_code", "luckmail_domain",
         "skymail_api_base", "skymail_token", "skymail_domain",
         "cloudmail_api_base", "cloudmail_admin_email", "cloudmail_admin_password", "cloudmail_domain",
-        "freemail_api_url", "freemail_admin_token", "freemail_domain",
+        "freemail_api_url", "freemail_admin_token", "freemail_username", "freemail_domain",
         "opentrashmail_api_url", "opentrashmail_domain", "opentrashmail_password",
         "laoudo_auth", "laoudo_email", "laoudo_account_id",
     ):
         if key in data or key in cfg:
             cfg[key] = g(key, cfg.get(key, ""))
+
+    secret("freemail_password")
+    secret("mail_test_smtp_password")
+
+    sender_mode = g("mail_test_sender_mode", "auto").lower()
+    if sender_mode not in ("auto", "native", "smtp", "direct_mx"):
+        raise ValueError("mail_test_sender_mode 必须是 auto/native/smtp/direct_mx")
+    smtp_security = g("mail_test_smtp_security", "starttls").lower()
+    if smtp_security not in ("ssl", "starttls", "plain"):
+        raise ValueError("mail_test_smtp_security 必须是 ssl/starttls/plain")
+    try:
+        timeout_sec = int(data.get("mail_test_timeout_sec", cfg.get("mail_test_timeout_sec", 90)))
+        smtp_port = int(data.get("mail_test_smtp_port", cfg.get("mail_test_smtp_port", 587)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("邮箱测试超时和 SMTP 端口必须是整数") from exc
+    if not 15 <= timeout_sec <= 300:
+        raise ValueError("mail_test_timeout_sec 必须在 15~300 秒之间")
+    if not 1 <= smtp_port <= 65535:
+        raise ValueError("mail_test_smtp_port 必须在 1~65535 之间")
+    cfg.update(
+        {
+            "mail_test_sender_mode": sender_mode,
+            "mail_test_timeout_sec": timeout_sec,
+            "mail_test_smtp_host": g("mail_test_smtp_host"),
+            "mail_test_smtp_port": smtp_port,
+            "mail_test_smtp_security": smtp_security,
+            "mail_test_smtp_username": g("mail_test_smtp_username"),
+            "mail_test_smtp_from": g("mail_test_smtp_from"),
+            "mail_test_direct_mx_enabled": as_bool(
+                data.get(
+                    "mail_test_direct_mx_enabled",
+                    cfg.get("mail_test_direct_mx_enabled", False),
+                )
+            ),
+        }
+    )
 
     # sync yyds keys for legacy
     if cfg.get("maliapi_api_key") and not cfg.get("yyds_api_key"):
@@ -1010,8 +1074,9 @@ def apply_email_config_from_ui(data: dict) -> dict:
         "laoudo": ["laoudo_email"],
         "maliapi": ["maliapi_api_key"],
     }
+    ready_config = resolved_provider_config(cfg)
     for field in need.get(provider, []):
-        if not str(cfg.get(field) or "").strip():
+        if not str(ready_config.get(field) or "").strip():
             raise ValueError(f"邮箱源 {provider} 需要配置: {field}")
 
     cfg.pop("tempmailer_api_base", None)

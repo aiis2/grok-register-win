@@ -49,6 +49,12 @@ MAIL_PROVIDER_CHOICES = [
     ("laoudo", "Laoudo 固定邮箱"),
 ]
 
+ENV_FALLBACKS = {
+    "freemail_api_url": "MAIL_WEB_URL",
+    "freemail_username": "ADMIN_NAME",
+    "freemail_password": "ADMIN_PASSWORD",
+}
+
 # active mailbox for wait_for_code
 _ACTIVE_BOX = None
 _ACTIVE_ACCT = None
@@ -81,8 +87,34 @@ def normalize_provider(name: str) -> str:
     return aliases.get(p, p or "cfworker")
 
 
+def resolved_provider_config(config: dict, environ=None) -> dict:
+    """Return a copy with supported environment fallbacks applied.
+
+    Values explicitly stored in the application config always win.  The
+    environment mapping is intentionally small so credentials never leak into
+    config.json merely because the application used them.
+    """
+    resolved = dict(config or {})
+    env = os.environ if environ is None else environ
+    for config_key, environment_key in ENV_FALLBACKS.items():
+        if not str(resolved.get(config_key) or "").strip():
+            value = str(env.get(environment_key) or "").strip()
+            if value:
+                resolved[config_key] = value
+
+    api_url = str(resolved.get("freemail_api_url") or "").strip()
+    if api_url:
+        if "://" not in api_url:
+            api_url = f"https://{api_url}"
+        resolved["freemail_api_url"] = api_url.rstrip("/")
+    for key in ("freemail_username", "freemail_password"):
+        if key in resolved:
+            resolved[key] = str(resolved.get(key) or "").strip()
+    return resolved
+
+
 def extra_from_config(config: dict) -> dict:
-    c = config or {}
+    c = resolved_provider_config(config)
     cf_url = str(c.get("cfworker_api_url") or "").strip()
     cf_token = str(c.get("cfworker_admin_token") or "").strip()
     cf_domain = str(c.get("cfworker_domain") or "").strip()
@@ -149,7 +181,7 @@ def extra_from_config(config: dict) -> dict:
 
 
 def provider_ready(config: dict, provider: str) -> bool:
-    c = config or {}
+    c = resolved_provider_config(config)
     p = normalize_provider(provider)
     if p in ("tempmailer", "inboxkitten", "inbox_kitten"):
         return False

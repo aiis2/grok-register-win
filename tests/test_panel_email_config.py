@@ -229,3 +229,98 @@ def test_favicon_probe_does_not_pollute_browser_console():
     response = panel_app.app.test_client().get("/favicon.ico")
 
     assert response.status_code == 204
+
+
+def test_public_config_masks_new_sender_secrets_and_reports_sources(monkeypatch):
+    monkeypatch.setenv("MAIL_WEB_URL", "https://environment.example.com")
+    monkeypatch.setenv("ADMIN_NAME", "environment-user")
+    monkeypatch.setenv("ADMIN_PASSWORD", "environment-password")
+
+    public = panel_app.email_config_public(
+        {
+            "freemail_password": "stored-freemail-password",
+            "mail_test_smtp_password": "stored-smtp-password",
+        }
+    )
+
+    assert "freemail_password" not in public
+    assert "mail_test_smtp_password" not in public
+    assert public["freemail_password_configured"] is True
+    assert public["mail_test_smtp_password_configured"] is True
+    assert public["freemail_env_url_available"] is True
+    assert public["freemail_env_username_available"] is True
+    assert public["freemail_env_password_available"] is True
+
+
+def test_blank_new_sender_passwords_preserve_existing_values(isolated_config):
+    _write_config(
+        isolated_config,
+        {
+            "email_provider": "freemail",
+            "freemail_api_url": "https://mail.example.com",
+            "freemail_username": "admin",
+            "freemail_password": "existing-freemail-password",
+            "mail_test_smtp_password": "existing-smtp-password",
+        },
+    )
+
+    panel_app.apply_email_config_from_ui(
+        {
+            "provider": "freemail",
+            "freemail_api_url": "https://mail.example.com",
+            "freemail_username": "admin",
+            "freemail_password": "",
+            "mail_test_smtp_password": "",
+        }
+    )
+    saved = json.loads(isolated_config.read_text(encoding="utf-8"))
+
+    assert saved["freemail_password"] == "existing-freemail-password"
+    assert saved["mail_test_smtp_password"] == "existing-smtp-password"
+
+
+def test_nonblank_new_sender_passwords_replace_existing_values(isolated_config):
+    _write_config(
+        isolated_config,
+        {
+            "email_provider": "freemail",
+            "freemail_api_url": "https://mail.example.com",
+            "freemail_password": "old-freemail-password",
+            "mail_test_smtp_password": "old-smtp-password",
+        },
+    )
+
+    panel_app.apply_email_config_from_ui(
+        {
+            "provider": "freemail",
+            "freemail_api_url": "https://mail.example.com",
+            "freemail_password": "new-freemail-password",
+            "mail_test_smtp_password": "new-smtp-password",
+        }
+    )
+    saved = json.loads(isolated_config.read_text(encoding="utf-8"))
+
+    assert saved["freemail_password"] == "new-freemail-password"
+    assert saved["mail_test_smtp_password"] == "new-smtp-password"
+
+
+def test_mail_test_configuration_is_normalized_and_has_safe_defaults(isolated_config):
+    public = panel_app.apply_email_config_from_ui(
+        {
+            "provider": "moemail",
+            "mail_test_sender_mode": "SMTP",
+            "mail_test_timeout_sec": "75",
+            "mail_test_smtp_host": " smtp.example.com ",
+            "mail_test_smtp_port": "587",
+            "mail_test_smtp_security": "STARTTLS",
+            "mail_test_smtp_username": " sender ",
+            "mail_test_smtp_from": " sender@example.com ",
+            "mail_test_direct_mx_enabled": True,
+        }
+    )
+
+    assert public["mail_test_sender_mode"] == "smtp"
+    assert public["mail_test_timeout_sec"] == 75
+    assert public["mail_test_smtp_port"] == 587
+    assert public["mail_test_smtp_security"] == "starttls"
+    assert public["mail_test_direct_mx_enabled"] is True
