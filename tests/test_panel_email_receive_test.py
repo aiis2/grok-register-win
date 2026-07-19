@@ -4,6 +4,7 @@ import copy
 import json
 import re
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -320,3 +321,36 @@ def test_html_receive_test_client_contract_is_generic_and_secret_safe():
     assert "_set('freemail_password', e.freemail_password)" not in html
     assert "_set('mail_test_smtp_password', e.mail_test_smtp_password)" not in html
     assert ".textContent=test.code" not in html
+
+
+def test_documentation_describes_mailbox_receive_testing_and_safe_defaults():
+    root = Path(panel_app.__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    example = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
+    release = (root / "docs" / "releases" / "v1.5.0.md").read_text(
+        encoding="utf-8"
+    )
+
+    for phrase in (
+        "原生 API → SMTP → Direct MX",
+        "MAIL_WEB_URL",
+        "ADMIN_NAME",
+        "ADMIN_PASSWORD",
+        "Direct MX 默认关闭",
+        "checking → creating → snapshotting → sending → waiting → verifying → cleaning",
+        "不会回显",
+    ):
+        assert phrase in readme
+    assert "version-v1.5.0" in readme
+    assert example["mail_test_direct_mx_enabled"] is False
+    assert example["mail_test_sender_mode"] == "auto"
+    for feature in (
+        "Cloudflare Temp Email",
+        "Chromium",
+        "1–10",
+        "凭据",
+        "收件验证",
+        "Windows CI",
+        "aiis2",
+    ):
+        assert feature in release
