@@ -23,6 +23,7 @@ import json
 import base64
 import select
 import socket
+from pathlib import Path
 
 # Ensure stdout/stderr use UTF-8 on Windows (default is GBK/CP936)
 if sys.platform == "win32":
@@ -46,6 +47,12 @@ from curl_cffi import requests
 _LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
 if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
+from credential_store import (  # type: ignore
+    CredentialLayout,
+    create_worker_output_paths,
+    ensure_layout,
+)
+
 try:
     import mail_providers as mail_providers  # type: ignore
 except Exception:
@@ -103,7 +110,8 @@ def is_page_disconnected_error(exc):
     )
 
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONFIG_FILE = str(PROJECT_ROOT / "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
 
 UI_BG = "#242424"
@@ -180,6 +188,7 @@ DEFAULT_CONFIG = {
     "allow_proxy_fallback": False,
     "enable_nsfw": True,
     "register_count": 1,
+    "credentials_dir": "data/credentials",
     # 单账号整轮硬超时（秒）；超时后跳过该账号进入下一个（面板也会在同超时后杀进程）
     "round_timeout_sec": 300,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -224,6 +233,17 @@ def save_config():
             json.dump(config, f, indent=4, ensure_ascii=False)
     except Exception as e:
         print(f"保存配置失败: {e}")
+
+
+def get_registration_worker_id() -> int:
+    try:
+        return max(1, int(os.environ.get("GROK_WORKER_ID", "1") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def current_credential_layout() -> CredentialLayout:
+    return ensure_layout(CredentialLayout.from_config(PROJECT_ROOT, config))
 
 
 def ensure_stable_python_runtime():
@@ -4538,6 +4558,7 @@ def format_round_marker(
     total: int,
     attempt: int = 1,
     status: str = "",
+    worker_id: int | None = None,
 ) -> str:
     """Build a stable batch marker containing counters only, never account data."""
     marker_kind = str(kind or "").strip().lower()
@@ -4552,6 +4573,8 @@ def format_round_marker(
         if normalized_status not in ("success", "failed", "retry", "stopped"):
             normalized_status = "failed"
         marker += f" status={normalized_status}"
+    if worker_id is not None:
+        marker += f" worker={max(1, int(worker_id))}"
     return marker
 
 
@@ -4570,6 +4593,7 @@ def _make_account_cancel(stop_callback, deadline, timeout_sec):
 
 def run_registration_cli(count, round_offset=0, total_count=None):
     controller = CliStopController()
+    worker_id = get_registration_worker_id()
     success_count = 0
     fail_count = 0
     retry_count_for_slot = 0
@@ -4579,11 +4603,12 @@ def run_registration_cli(count, round_offset=0, total_count=None):
     overall_total = max(
         round_offset + int(count), int(total_count or (round_offset + int(count)))
     )
-    accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+    output_paths = create_worker_output_paths(
+        current_credential_layout(), worker_id=worker_id, pid=os.getpid()
     )
-    cli_log(f"[*] 终端模式启动，目标数量: {count}")
+    accounts_output_file = str(output_paths.sso_file)
+    mail_credentials_file = str(output_paths.mail_file)
+    cli_log(f"[*] 终端模式启动，worker={worker_id}，目标数量: {count}")
     cli_log(f"[*] 单账号硬超时: {round_timeout}s")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
@@ -4601,6 +4626,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                     index=marker_index,
                     total=overall_total,
                     attempt=marker_attempt,
+                    worker_id=worker_id,
                 )
             )
             round_status = None
@@ -4632,9 +4658,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                         cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                         try:
                             with open(
-                                os.path.join(
-                                    os.path.dirname(__file__), "mail_credentials.txt"
-                                ),
+                                mail_credentials_file,
                                 "a",
                                 encoding="utf-8",
                             ) as f:
@@ -4742,6 +4766,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                         total=overall_total,
                         attempt=marker_attempt,
                         status=round_status,
+                        worker_id=worker_id,
                     )
                 )
                 cleanup_active_mailbox(log_callback=cli_log)

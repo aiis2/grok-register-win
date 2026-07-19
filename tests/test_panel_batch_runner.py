@@ -119,6 +119,67 @@ def test_cli_batch_emits_one_start_and_result_pair_per_terminal_round(monkeypatc
     assert "private-sso" not in markers
 
 
+def test_cli_writes_worker_scoped_credentials_and_redacted_markers(
+    tmp_path, monkeypatch
+):
+    logs = []
+    credentials_root = tmp_path / "credential-vault"
+    monkeypatch.setenv("GROK_WORKER_ID", "7")
+    monkeypatch.setitem(main.config, "credentials_dir", str(credentials_root))
+    monkeypatch.setitem(main.config, "enable_nsfw", False)
+    monkeypatch.setattr(main, "cli_log", logs.append)
+    monkeypatch.setattr(main, "get_round_timeout_sec", lambda: 60)
+    monkeypatch.setattr(main, "start_browser", lambda **kwargs: None)
+    monkeypatch.setattr(main, "cleanup_runtime_memory", lambda **kwargs: None)
+    monkeypatch.setattr(main, "cleanup_active_mailbox", lambda **kwargs: True)
+    monkeypatch.setattr(
+        main, "transition_browser_for_next_attempt", lambda *args, **kwargs: "reused"
+    )
+    monkeypatch.setattr(main, "sleep_with_cancel", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "open_signup_page", lambda **kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "fill_email_and_submit",
+        lambda **kwargs: ("private@example.com", "private-jwt"),
+    )
+    monkeypatch.setattr(
+        main, "fill_code_and_submit", lambda *args, **kwargs: "ABC-123"
+    )
+    monkeypatch.setattr(
+        main,
+        "fill_profile_and_submit",
+        lambda **kwargs: {
+            "given_name": "A",
+            "family_name": "B",
+            "password": "private-password",
+        },
+    )
+    monkeypatch.setattr(main, "wait_for_sso_cookie", lambda **kwargs: "private-sso")
+    monkeypatch.setattr(
+        main, "add_token_to_grok2api_pools", lambda *args, **kwargs: None
+    )
+
+    main.run_registration_cli(1, total_count=1)
+
+    sso_files = list((credentials_root / "sso").glob("accounts_*_w7_*.txt"))
+    mail_files = list(
+        (credentials_root / "mail").glob("mail_credentials_*_w7_*.txt")
+    )
+    assert len(sso_files) == 1
+    assert len(mail_files) == 1
+    assert sso_files[0].read_text(encoding="utf-8") == (
+        "private@example.com----private-password----private-sso\n"
+    )
+    assert mail_files[0].read_text(encoding="utf-8") == (
+        "private@example.com\tprivate-jwt\n"
+    )
+    markers = " ".join(line for line in logs if "@@GROK_ROUND_" in line)
+    assert "worker=7" in markers
+    assert "private@example.com" not in markers
+    assert "private-jwt" not in markers
+    assert "private-sso" not in markers
+
+
 def test_marker_state_refreshes_deadline_and_deduplicates_results():
     state = panel_app.new_batch_marker_state(
         start_index=1, batch_count=2, total=2, round_timeout=30, now=10

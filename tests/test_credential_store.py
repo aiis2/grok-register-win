@@ -6,6 +6,7 @@ import pytest
 
 from credential_store import (
     CredentialLayout,
+    create_worker_output_paths,
     ensure_layout,
     normalize_credentials_setting,
 )
@@ -98,3 +99,31 @@ def test_ensure_layout_rejects_existing_file(tmp_path):
 
     with pytest.raises(ValueError, match="不是目录"):
         ensure_layout(layout)
+
+
+def test_worker_output_paths_are_unique_and_stay_in_worker_subdirectories(tmp_path):
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    layout = ensure_layout(CredentialLayout.from_config(app_root, {}))
+
+    first = create_worker_output_paths(
+        layout,
+        worker_id=2,
+        pid=3456,
+        timestamp="20260719_160000",
+        nonce="aaaa1111",
+    )
+    second = create_worker_output_paths(
+        layout,
+        worker_id=3,
+        pid=3456,
+        timestamp="20260719_160000",
+        nonce="bbbb2222",
+    )
+
+    assert first.sso_file.parent == layout.sso_dir
+    assert first.mail_file.parent == layout.mail_dir
+    assert "_w2_3456_aaaa1111" in first.sso_file.name
+    assert "_w2_3456_aaaa1111" in first.mail_file.name
+    assert first.sso_file != second.sso_file
+    assert first.mail_file != second.mail_file

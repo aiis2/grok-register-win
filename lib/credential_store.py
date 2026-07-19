@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import secrets
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
@@ -41,6 +44,12 @@ class CredentialLayout:
         )
 
 
+@dataclass(frozen=True)
+class WorkerOutputPaths:
+    sso_file: Path
+    mail_file: Path
+
+
 def normalize_credentials_setting(app_root: Path, value: str) -> str:
     layout = CredentialLayout.from_config(
         Path(app_root), {"credentials_dir": str(value or "").strip()}
@@ -58,3 +67,23 @@ def ensure_layout(layout: CredentialLayout) -> CredentialLayout:
             raise ValueError(f"凭据路径不是目录: {path}")
         path.mkdir(parents=True, exist_ok=True)
     return layout
+
+
+def create_worker_output_paths(
+    layout: CredentialLayout,
+    worker_id: int,
+    pid: int | None = None,
+    *,
+    timestamp: str | None = None,
+    nonce: str | None = None,
+) -> WorkerOutputPaths:
+    ensured = ensure_layout(layout)
+    safe_worker_id = max(1, int(worker_id))
+    safe_pid = max(1, int(pid or os.getpid()))
+    safe_timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_nonce = str(nonce or secrets.token_hex(4)).strip()
+    suffix = f"{safe_timestamp}_w{safe_worker_id}_{safe_pid}_{safe_nonce}"
+    return WorkerOutputPaths(
+        sso_file=ensured.sso_dir / f"accounts_{suffix}.txt",
+        mail_file=ensured.mail_dir / f"mail_credentials_{suffix}.txt",
+    )
