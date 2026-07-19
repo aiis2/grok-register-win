@@ -204,3 +204,9 @@ def test_connection_probe_does_not_hide_auth_failure(monkeypatch):
 def test_email_test_route_is_registered():
     rules = {rule.rule for rule in panel_app.app.url_map.iter_rules()}
     assert "/api/config/email/test" in rules
+
+
+def test_favicon_probe_does_not_pollute_browser_console():
+    response = panel_app.app.test_client().get("/favicon.ico")
+
+    assert response.status_code == 204

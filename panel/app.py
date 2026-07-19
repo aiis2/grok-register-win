@@ -2424,6 +2424,11 @@ def logout():
     return redirect(url_for("login"))
 
 
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
 @app.get("/")
 def index():
     need = require_login()
