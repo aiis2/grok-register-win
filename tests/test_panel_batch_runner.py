@@ -3,6 +3,8 @@ from __future__ import annotations
 import inspect
 from unittest.mock import mock_open
 
+import pytest
+
 import grok_register_ttk as main
 from panel import app as panel_app
 
@@ -333,6 +335,64 @@ def test_relaunch_environment_contains_only_remaining_count():
     assert env["GROK_ROUND_OFFSET"] == "3"
     assert env["GROK_REGISTER_TOTAL"] == "5"
     assert env["ROUND_TIMEOUT_SEC"] == "90"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(1, 1), ("2", 2), (10, 10), (" 7 ", 7)],
+)
+def test_registration_concurrency_accepts_only_one_through_ten(value, expected):
+    assert panel_app.normalize_registration_concurrency(value) == expected
+
+
+@pytest.mark.parametrize("value", [0, 11, -1, "many", 1.5, True, None])
+def test_registration_concurrency_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="1-10"):
+        panel_app.normalize_registration_concurrency(value)
+
+
+def test_registration_work_is_balanced_into_nonoverlapping_contiguous_ranges():
+    assignments = panel_app.partition_registration_work(total=10, concurrency=3)
+
+    assert [
+        (item.worker_id, item.start_index, item.batch_count, item.round_offset)
+        for item in assignments
+    ] == [
+        (1, 1, 4, 0),
+        (2, 5, 3, 4),
+        (3, 8, 3, 7),
+    ]
+    covered = [
+        index
+        for item in assignments
+        for index in range(item.start_index, item.start_index + item.batch_count)
+    ]
+    assert covered == list(range(1, 11))
+
+
+def test_registration_work_never_creates_empty_workers():
+    assignments = panel_app.partition_registration_work(total=2, concurrency=10)
+
+    assert [(item.worker_id, item.batch_count) for item in assignments] == [
+        (1, 1),
+        (2, 1),
+    ]
+
+
+def test_worker_environment_contains_unique_worker_identity():
+    env = panel_app.build_cli_batch_env(
+        {},
+        batch_count=3,
+        round_offset=4,
+        total=10,
+        engine="chromium",
+        timeout=120,
+        worker_id=2,
+    )
+
+    assert env["GROK_WORKER_ID"] == "2"
+    assert env["GROK_REGISTER_COUNT"] == "3"
+    assert env["GROK_ROUND_OFFSET"] == "4"
 
 
 def test_dead_proxy_probe_remains_boolean(monkeypatch):

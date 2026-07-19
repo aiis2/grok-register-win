@@ -1242,6 +1242,52 @@ def clash_exit_ip() -> str:
 
 
 # --------------- job runner ---------------
+@dataclass(frozen=True)
+class WorkerAssignment:
+    worker_id: int
+    start_index: int
+    batch_count: int
+
+    @property
+    def round_offset(self) -> int:
+        return self.start_index - 1
+
+
+def normalize_registration_concurrency(value: object) -> int:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("注册并发度必须是 1-10 的整数")
+    text = str(value).strip()
+    if not re.fullmatch(r"\d+", text):
+        raise ValueError("注册并发度必须是 1-10 的整数")
+    concurrency = int(text)
+    if not 1 <= concurrency <= 10:
+        raise ValueError("注册并发度必须是 1-10 的整数")
+    return concurrency
+
+
+def partition_registration_work(
+    total: int, concurrency: int
+) -> List[WorkerAssignment]:
+    total_count = int(total)
+    if total_count <= 0:
+        return []
+    effective = min(total_count, normalize_registration_concurrency(concurrency))
+    base_count, remainder = divmod(total_count, effective)
+    assignments: List[WorkerAssignment] = []
+    start_index = 1
+    for worker_id in range(1, effective + 1):
+        batch_count = base_count + (1 if worker_id <= remainder else 0)
+        assignments.append(
+            WorkerAssignment(
+                worker_id=worker_id,
+                start_index=start_index,
+                batch_count=batch_count,
+            )
+        )
+        start_index += batch_count
+    return assignments
+
+
 def _update_stats_from_log(line: str):
     if "注册成功" in line or "[+] 注册成功" in line:
         with _job_lock:
@@ -1352,6 +1398,7 @@ def build_cli_batch_env(
     total: int,
     engine: str,
     timeout: int,
+    worker_id: int = 1,
 ) -> dict:
     env = dict(base_env or {})
     env["PYTHONUNBUFFERED"] = "1"
@@ -1360,6 +1407,7 @@ def build_cli_batch_env(
     env["GROK_REGISTER_COUNT"] = str(int(batch_count))
     env["GROK_ROUND_OFFSET"] = str(int(round_offset))
     env["GROK_REGISTER_TOTAL"] = str(int(total))
+    env["GROK_WORKER_ID"] = str(normalize_registration_concurrency(worker_id))
     return env
 
 
