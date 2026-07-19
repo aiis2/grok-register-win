@@ -131,3 +131,180 @@ def test_cpa_environment_override_remains_explicit_compatibility(
 
     assert paths.directory == override.resolve()
     assert panel_app.cpa_stats()["dir"] == str(override.resolve())
+
+
+def test_credentials_status_reports_paths_and_counts_without_contents(
+    isolated_storage,
+):
+    app_root, _ = isolated_storage
+    _write = lambda path, content: (
+        path.parent.mkdir(parents=True, exist_ok=True),
+        path.write_text(content, encoding="utf-8"),
+    )
+    _write(app_root / "vault" / "sso" / "accounts_one.txt", "private-sso")
+    _write(
+        app_root / "vault" / "mail" / "mail_credentials_one.txt",
+        "private-jwt",
+    )
+    _write(app_root / "vault" / "cpa" / "xai-one.json", "private-cpa")
+
+    response = panel_app.app.test_client().get("/api/config/credentials")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["configured"] == "vault"
+    assert payload["resolved_path"] == str((app_root / "vault").resolve())
+    assert payload["stats"] == {
+        "sso_files": 1,
+        "mail_files": 1,
+        "cpa_files": 1,
+        "total_files": 3,
+        "total_bytes": 33,
+    }
+    serialized = json.dumps(payload)
+    assert "private-sso" not in serialized
+    assert "private-jwt" not in serialized
+    assert "private-cpa" not in serialized
+
+
+def test_save_empty_credentials_directory_updates_config_atomically(
+    isolated_storage,
+):
+    app_root, config_path = isolated_storage
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials", json={"credentials_dir": "empty-vault"}
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["configured"] == "empty-vault"
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["credentials_dir"] == "empty-vault"
+    assert (app_root / "empty-vault" / "sso").is_dir()
+    assert not list(app_root.glob(".*config*.tmp"))
+
+
+def test_save_directory_requires_migration_when_source_has_credentials(
+    isolated_storage,
+):
+    app_root, _ = isolated_storage
+    source = app_root / "vault" / "sso" / "accounts_existing.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("private", encoding="utf-8")
+
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials", json={"credentials_dir": "new-vault"}
+    )
+
+    assert response.status_code == 409
+    assert "迁移" in response.get_json()["error"]
+    assert source.exists()
+
+
+def test_save_rejects_nonempty_target_directory(isolated_storage):
+    app_root, _ = isolated_storage
+    target = app_root / "occupied"
+    target.mkdir()
+    (target / "unrelated.txt").write_text("keep", encoding="utf-8")
+
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials", json={"credentials_dir": "occupied"}
+    )
+
+    assert response.status_code == 400
+    assert "非空" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["/api/config/credentials", "/api/config/credentials/migrate"],
+)
+def test_credentials_changes_are_rejected_while_registration_runs(
+    isolated_storage, monkeypatch, endpoint
+):
+    monkeypatch.setitem(panel_app._job, "running", True)
+
+    response = panel_app.app.test_client().post(
+        endpoint, json={"credentials_dir": "new-vault"}
+    )
+
+    assert response.status_code == 409
+    assert "注册任务运行中" in response.get_json()["error"]
+
+
+def test_credential_migration_is_rejected_while_cpa_conversion_is_pending(
+    isolated_storage, monkeypatch
+):
+    monkeypatch.setitem(panel_app._cpa_state, "pending", 1)
+
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials/migrate",
+        json={"credentials_dir": "new-vault"},
+    )
+
+    assert response.status_code == 409
+    assert "CPA" in response.get_json()["error"]
+
+
+def test_credential_migration_rejects_active_cpa_directory_override(
+    isolated_storage, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CPA_DIR", str(tmp_path / "override"))
+
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials/migrate",
+        json={"credentials_dir": "new-vault"},
+    )
+
+    assert response.status_code == 409
+    assert "CPA_DIR" in response.get_json()["error"]
+
+
+def test_manual_migration_moves_all_legacy_credentials_and_switches_config(
+    isolated_storage,
+):
+    app_root, config_path = isolated_storage
+    (app_root / "accounts_legacy.txt").write_text(
+        "legacy@example.com----pw----private-sso", encoding="utf-8"
+    )
+    (app_root / "mail_credentials.txt").write_text(
+        "legacy@example.com\tprivate-jwt", encoding="utf-8"
+    )
+    legacy_cpa = app_root / "data" / "cpa"
+    legacy_cpa.mkdir(parents=True)
+    (legacy_cpa / "xai-legacy.json").write_text(
+        json.dumps({"email": "legacy@example.com", "sso": "private-sso"}),
+        encoding="utf-8",
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials/migrate",
+        json={"credentials_dir": "migrated-vault"},
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["migration"]["copied"] == 3
+    assert payload["migration"]["removed"] == 3
+    assert payload["migration"]["warnings"] == []
+    assert json.loads(config_path.read_text(encoding="utf-8"))[
+        "credentials_dir"
+    ] == "migrated-vault"
+    assert (app_root / "migrated-vault" / "sso" / "accounts_legacy.txt").is_file()
+    assert (
+        app_root / "migrated-vault" / "mail" / "mail_credentials.txt"
+    ).is_file()
+    assert (app_root / "migrated-vault" / "cpa" / "xai-legacy.json").is_file()
+    assert not (app_root / "accounts_legacy.txt").exists()
+    serialized = json.dumps(payload)
+    assert "private-sso" not in serialized
+    assert "private-jwt" not in serialized
+
+
+def test_credential_routes_are_registered():
+    rules = {rule.rule for rule in panel_app.app.url_map.iter_rules()}
+    assert "/api/config/credentials" in rules
+    assert "/api/config/credentials/migrate" in rules

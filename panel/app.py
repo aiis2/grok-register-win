@@ -19,6 +19,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from collections import deque
 from dataclasses import dataclass
@@ -94,7 +95,13 @@ ENABLE_CLASH_UI = os.environ.get("ENABLE_CLASH_UI", "1").strip() not in (
 for _p in (str(SSO2CPA_PATH), str(BASE_DIR / "lib"), str(Path(__file__).resolve().parent)):
     if _p and _p not in sys.path:
         sys.path.insert(0, _p)
-from credential_store import CredentialLayout, ensure_layout  # type: ignore
+from credential_store import (  # type: ignore
+    CredentialLayout,
+    CredentialMigrationError,
+    ensure_layout,
+    migrate_credentials,
+    normalize_credentials_setting,
+)
 
 try:
     from sso2cpa_core import (  # type: ignore
@@ -169,8 +176,87 @@ def _cpa_read_directories() -> List[Path]:
     return [current] if current == legacy else [current, legacy]
 
 
+def _files_under(directory: Path) -> List[Path]:
+    if not directory.is_dir():
+        return []
+    return [path for path in directory.rglob("*") if path.is_file()]
+
+
+def credential_storage_stats(layout: CredentialLayout) -> dict:
+    sso_files = _files_under(layout.sso_dir)
+    mail_files = _files_under(layout.mail_dir)
+    cpa_files = _files_under(layout.cpa_dir)
+    all_files = [*sso_files, *mail_files, *cpa_files]
+    return {
+        "sso_files": len(sso_files),
+        "mail_files": len(mail_files),
+        "cpa_files": len(cpa_files),
+        "total_files": len(all_files),
+        "total_bytes": sum(path.stat().st_size for path in all_files),
+    }
+
+
+def _legacy_credential_files() -> List[Path]:
+    candidates: List[Path] = []
+    candidates.extend(path for path in BASE_DIR.glob("accounts_*.txt") if path.is_file())
+    candidates.extend(
+        path for path in BASE_DIR.glob("mail_credentials*.txt") if path.is_file()
+    )
+    legacy_cpa = BASE_DIR / "data" / "cpa"
+    for pattern in ("xai-*.json", "index.json", "failed.jsonl"):
+        candidates.extend(path for path in legacy_cpa.glob(pattern) if path.is_file())
+    return candidates
+
+
+def credentials_config_public(cfg: Optional[dict] = None) -> dict:
+    data = cfg if isinstance(cfg, dict) else load_config()
+    layout = current_credential_layout(data)
+    stats = credential_storage_stats(layout)
+    return {
+        "ok": True,
+        "configured": str(data.get("credentials_dir") or "data/credentials"),
+        "resolved_path": str(layout.root),
+        "sso_dir": str(layout.sso_dir),
+        "mail_dir": str(layout.mail_dir),
+        "cpa_dir": str(current_cpa_paths(data).directory),
+        "cpa_env_override": str(os.environ.get(CPA_DIR_ENV) or "").strip(),
+        "writable": os.access(layout.root, os.W_OK),
+        "stats": stats,
+        "legacy_files": len(_legacy_credential_files()),
+        "running": registration_is_running(),
+    }
+
+
+def registration_is_running() -> bool:
+    with _job_lock:
+        return bool(_job.get("running"))
+
+
+def credential_change_blocker() -> str:
+    if registration_is_running():
+        return "注册任务运行中，不能修改或迁移凭据目录"
+    with _cpa_lock:
+        if bool(_cpa_state.get("running")) or int(_cpa_state.get("pending") or 0):
+            return "CPA 转换仍在运行，完成后才能迁移凭据目录"
+    return ""
+
+
+def _active_credential_files(layout: CredentialLayout) -> List[Path]:
+    candidates = [*_files_under(layout.root), *_legacy_credential_files()]
+    cpa_directory = current_cpa_paths().directory
+    try:
+        cpa_directory.relative_to(layout.root)
+    except ValueError:
+        candidates.extend(_files_under(cpa_directory))
+    unique: Dict[Path, Path] = {}
+    for path in candidates:
+        unique[path.resolve()] = path
+    return list(unique.values())
+
+
 # --------------- job state ---------------
 _job_lock = threading.Lock()
+_credential_migration_lock = threading.Lock()
 _job: Dict = {
     "running": False,
     "stop": False,
@@ -1002,10 +1088,26 @@ def resolve_proxy_url() -> str:
     return preferred or "http://127.0.0.1:7890"
 
 
-def save_config(cfg: dict):
-    CONFIG_PATH.write_text(
-        json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+def save_config_atomic(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = CONFIG_PATH.with_name(
+        f".{CONFIG_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, CONFIG_PATH)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def save_config(cfg: dict):
+    save_config_atomic(cfg)
 
 
 # --------------- Clash helpers (optional external controller) ---------------
@@ -3012,6 +3114,118 @@ def api_accounts_delete():
             + (f"，跳过 {len(missing)}" if missing else ""),
         }
     )
+
+
+def _requested_credentials_layout(data: dict) -> Tuple[str, CredentialLayout]:
+    value = str(data.get("credentials_dir") or data.get("path") or "").strip()
+    if not value:
+        raise ValueError("credentials_dir required")
+    setting = normalize_credentials_setting(BASE_DIR, value)
+    return setting, CredentialLayout.from_config(
+        BASE_DIR, {"credentials_dir": setting}
+    )
+
+
+@app.get("/api/config/credentials")
+def api_get_credentials_config():
+    need = require_login()
+    if need:
+        return need
+    try:
+        return jsonify(credentials_config_public())
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.post("/api/config/credentials")
+def api_set_credentials_config():
+    need = require_login()
+    if need:
+        return need
+    blocker = credential_change_blocker()
+    if blocker:
+        return jsonify({"ok": False, "error": blocker}), 409
+    if not _credential_migration_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "凭据迁移正在进行"}), 409
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        cfg = load_config()
+        current = current_credential_layout(cfg)
+        setting, target = _requested_credentials_layout(data)
+        if target.root != current.root:
+            if target.root.exists() and _files_under(target.root):
+                raise ValueError("目标凭据目录非空，请选择空目录或使用迁移")
+            if _active_credential_files(current):
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "error": "当前存在账号凭据，请使用‘迁移并切换’",
+                        }
+                    ),
+                    409,
+                )
+        ensure_layout(target)
+        cfg["credentials_dir"] = setting
+        save_config_atomic(cfg)
+        return jsonify(credentials_config_public(cfg))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    finally:
+        _credential_migration_lock.release()
+
+
+@app.post("/api/config/credentials/migrate")
+def api_migrate_credentials():
+    need = require_login()
+    if need:
+        return need
+    if not _credential_migration_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "凭据迁移正在进行"}), 409
+    try:
+        blocker = credential_change_blocker()
+        if blocker:
+            return jsonify({"ok": False, "error": blocker}), 409
+        if str(os.environ.get(CPA_DIR_ENV) or "").strip():
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "检测到 CPA_DIR 环境覆盖，请先取消后再迁移",
+                    }
+                ),
+                409,
+            )
+        data = request.get_json(force=True, silent=True) or {}
+        cfg = load_config()
+        current = current_credential_layout(cfg)
+        _, target = _requested_credentials_layout(data)
+
+        def switch_config(setting: str) -> None:
+            latest = load_config()
+            latest["credentials_dir"] = setting
+            save_config_atomic(latest)
+
+        result = migrate_credentials(
+            BASE_DIR,
+            current,
+            target,
+            switch_config=switch_config,
+        )
+        load_cpa_index()
+        public = credentials_config_public()
+        public["migration"] = {
+            "copied": result.copied,
+            "skipped": result.skipped,
+            "renamed": result.renamed,
+            "removed": result.removed,
+            "warnings": result.warnings,
+        }
+        return jsonify(public)
+    except (CredentialMigrationError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    finally:
+        _credential_migration_lock.release()
 
 
 @app.get("/api/config/email")
