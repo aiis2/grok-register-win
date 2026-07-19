@@ -12,6 +12,7 @@ accounts_*.txt
 .DS_Store
 Thumbs.db
 _remote_src/
+.worktrees/
 *.bak
 .env
 mail_credentials.txt
