@@ -1080,6 +1080,198 @@ def resolve_round_timeout_sec(cfg: Optional[dict] = None) -> int:
         return DEFAULT_ROUND_TIMEOUT_SEC
 
 
+_ROUND_START_RE = re.compile(
+    r"@@GROK_ROUND_START\s+index=(\d+)\s+total=(\d+)\s+attempt=(\d+)"
+)
+_ROUND_RESULT_RE = re.compile(
+    r"@@GROK_ROUND_RESULT\s+index=(\d+)\s+total=(\d+)\s+attempt=(\d+)\s+status=([a-z]+)"
+)
+
+
+def new_batch_marker_state(
+    start_index: int,
+    batch_count: int,
+    total: int,
+    round_timeout: int,
+    now: Optional[float] = None,
+) -> dict:
+    current_time = time.time() if now is None else float(now)
+    timeout = max(1, int(round_timeout or DEFAULT_ROUND_TIMEOUT_SEC))
+    return {
+        "start_index": int(start_index),
+        "batch_count": max(1, int(batch_count)),
+        "total": max(1, int(total)),
+        "round_timeout": timeout,
+        "current_index": None,
+        "deadline": current_time + timeout,
+        "seen_results": set(),
+        "outcomes": [],
+    }
+
+
+def consume_batch_marker(state: dict, line: str, now: Optional[float] = None):
+    current_time = time.time() if now is None else float(now)
+    text = str(line or "")
+    match = _ROUND_START_RE.search(text)
+    if match:
+        index, total, attempt = (int(value) for value in match.groups())
+        state["current_index"] = index
+        state["deadline"] = current_time + int(state["round_timeout"])
+        return {
+            "kind": "start",
+            "index": index,
+            "total": total,
+            "attempt": attempt,
+            "terminal": False,
+        }
+
+    match = _ROUND_RESULT_RE.search(text)
+    if not match:
+        return None
+    index, total, attempt = (int(value) for value in match.groups()[:3])
+    status = match.group(4).lower()
+    terminal = status in ("success", "failed")
+    duplicate = terminal and index in state["seen_results"]
+    if terminal and not duplicate:
+        state["seen_results"].add(index)
+        state["outcomes"].append((index, status))
+        if state.get("current_index") == index:
+            state["current_index"] = None
+        cleanup_grace = max(5, min(30, int(state["round_timeout"])))
+        state["deadline"] = current_time + cleanup_grace
+    return {
+        "kind": "result",
+        "index": index,
+        "total": total,
+        "attempt": attempt,
+        "status": status,
+        "terminal": terminal,
+        "duplicate": duplicate,
+    }
+
+
+def remaining_batch_count(total: int, outcomes) -> int:
+    completed = {int(index) for index, _ in outcomes}
+    return max(0, int(total) - len(completed))
+
+
+def build_cli_batch_env(
+    base_env: dict,
+    *,
+    batch_count: int,
+    round_offset: int,
+    total: int,
+    engine: str,
+    timeout: int,
+) -> dict:
+    env = dict(base_env or {})
+    env["PYTHONUNBUFFERED"] = "1"
+    env["GROK_BROWSER_ENGINE"] = str(engine or "chromium")
+    env["ROUND_TIMEOUT_SEC"] = str(int(timeout))
+    env["GROK_REGISTER_COUNT"] = str(int(batch_count))
+    env["GROK_ROUND_OFFSET"] = str(int(round_offset))
+    env["GROK_REGISTER_TOTAL"] = str(int(total))
+    return env
+
+
+def supervise_batch_process(
+    proc,
+    state: dict,
+    *,
+    stop_requested,
+    on_result,
+    terminate_proc,
+    now=time.time,
+    log_callback=None,
+) -> dict:
+    """Consume CLI markers while enforcing a fresh deadline for every account."""
+    line_q: "queue.Queue[Optional[str]]" = queue.Queue()
+    reader_done = threading.Event()
+
+    def _stdout_reader() -> None:
+        try:
+            if proc.stdout is not None:
+                for raw in proc.stdout:
+                    line_q.put(raw)
+        except Exception:
+            pass
+        finally:
+            reader_done.set()
+            line_q.put(None)
+
+    reader = threading.Thread(
+        target=_stdout_reader, name="register-batch-stdout", daemon=True
+    )
+    reader.start()
+    stopped = False
+    timed_out = False
+    cleanup_timed_out = False
+    terminated = False
+
+    def terminate_once() -> None:
+        nonlocal terminated
+        if not terminated:
+            terminate_proc(proc)
+            terminated = True
+
+    while True:
+        if stop_requested():
+            stopped = True
+            terminate_once()
+            break
+
+        current_time = float(now())
+        if current_time >= float(state["deadline"]):
+            timed_out = True
+            if len(state["outcomes"]) >= state["batch_count"]:
+                cleanup_timed_out = True
+            else:
+                index = state.get("current_index")
+                if index is None:
+                    index = int(state["start_index"]) + len(state["seen_results"])
+                if index not in state["seen_results"]:
+                    state["seen_results"].add(index)
+                    state["outcomes"].append((index, "failed"))
+                    on_result(index, "failed")
+            terminate_once()
+            break
+
+        try:
+            raw = line_q.get(timeout=0.05)
+        except queue.Empty:
+            if reader_done.is_set() and proc.poll() is not None:
+                break
+            continue
+        if raw is None:
+            break
+
+        line = str(raw).rstrip("\r\n")
+        event = consume_batch_marker(state, line, now=current_time)
+        if event and event.get("kind") == "start":
+            with _job_lock:
+                _job["current_round"] = event["index"]
+                _job["round_deadline"] = state["deadline"]
+        if event and event.get("terminal") and not event.get("duplicate"):
+            on_result(event["index"], event["status"])
+        if log_callback and _is_key_log(line):
+            log_callback(_truncate_line(_strip_inner_timestamp(line)))
+
+    if not stopped and not timed_out and len(state["outcomes"]) < state["batch_count"]:
+        index = int(state["start_index"]) + len(state["seen_results"])
+        if index not in state["seen_results"]:
+            state["seen_results"].add(index)
+            state["outcomes"].append((index, "failed"))
+            on_result(index, "failed")
+
+    return {
+        "outcomes": list(state["outcomes"]),
+        "stopped": stopped,
+        "timed_out": timed_out,
+        "cleanup_timed_out": cleanup_timed_out,
+        "terminated": terminated,
+    }
+
+
 def _terminate_register_proc(proc: Optional[subprocess.Popen]) -> None:
     """Kill register CLI and its browser children (Windows process tree)."""
     if proc is None:
@@ -1118,39 +1310,14 @@ def _terminate_register_proc(proc: Optional[subprocess.Popen]) -> None:
         pass
 
 
-def _cleanup_browser_leftovers() -> None:
-    """Best-effort cleanup of temp browser profiles (Windows/Linux)."""
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/FI", "WINDOWTITLE eq *autoPortData*", "/T"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-        else:
-            subprocess.run(
-                ["pkill", "-f", "chromium.*autoPortData"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-    except Exception:
-        pass
-
-
-def _run_one_round(round_no: int, total: int) -> bool:
-    """Run register_count=1 once. Return True if success detected.
-
-    Enforces round_timeout_sec (default 300s): if the CLI hangs (Turnstile /
-    proxy / browser dead), kill the process tree and let job_worker start the
-    next account instead of blocking forever.
-    """
+def _run_batch(start_index: int, total: int, batch_count: int) -> dict:
+    """Run remaining accounts in one reusable CLI process with per-round deadlines."""
     global _proc
     cfg = load_config()
-    # 面板每轮强制 register_count=1（job_worker 自己控轮数），但不要永久改坏用户配置
+    batch_count = max(1, int(batch_count))
+    # Pass the whole remaining batch through the environment; do not overwrite config.json.
     cfg_run = dict(cfg)
-    cfg_run["register_count"] = 1
+    cfg_run["register_count"] = batch_count
     cfg_run["proxy"] = resolve_proxy_url()
     global PROXY_URL
     PROXY_URL = cfg_run["proxy"]
@@ -1175,14 +1342,14 @@ def _run_one_round(round_no: int, total: int) -> bool:
         cfg = cfg_run
 
     round_timeout = resolve_round_timeout_sec(cfg)
-    # 子进程强制单账号；用环境变量覆盖，避免改坏 config.json 里的 register_count
-    os.environ["GROK_REGISTER_COUNT"] = "1"
-
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["GROK_BROWSER_ENGINE"] = engine
-    env["ROUND_TIMEOUT_SEC"] = str(round_timeout)
-    env["GROK_REGISTER_COUNT"] = "1"
+    env = build_cli_batch_env(
+        os.environ.copy(),
+        batch_count=batch_count,
+        round_offset=start_index - 1,
+        total=total,
+        engine=engine,
+        timeout=round_timeout,
+    )
     # Windows / local: use system Chrome/Edge; allow override (chromium engine only)
     if engine == "chromium":
         if os.name == "nt":
@@ -1200,7 +1367,10 @@ def _run_one_round(round_no: int, total: int) -> bool:
             env["DISPLAY"] = env.get("DISPLAY") or ":0"
             env.setdefault("BROWSER_PATH", env.get("BROWSER_PATH") or "")
 
-    log_line(f"=== 第 {round_no}/{total} 轮开始 · 节点 {_job.get('current_node') or '外部Clash'} ===")
+    log_line(
+        f"=== 批次开始：第 {start_index}-{start_index + batch_count - 1}/{total} 轮"
+        f" · 节点 {_job.get('current_node') or '外部Clash'} ==="
+    )
     engine_label = "Camoufox 无头" if engine == "camoufox" else "Chromium 有头"
     log_line(
         f"[*] proxy={PROXY_URL} engine={engine_label} python={VENV_PYTHON} "
@@ -1210,13 +1380,24 @@ def _run_one_round(round_no: int, total: int) -> bool:
     # 注册前检查邮箱源是否可用（公共 Tempmailer 已移除）
     try:
         mail_cfg = load_config()
-        mail_prov = str(mail_cfg.get("email_provider") or "cfworker").strip().lower()
+        mail_prov = normalize_email_provider(
+            mail_cfg.get("email_provider") or "cfworker"
+        )
         if mail_prov in ("tempmailer", "inboxkitten", "inbox_kitten"):
             log_line("[!] 内置公共临时邮已移除，请在面板下拉选择其它邮箱源")
-            return False
+            return {"outcomes": [], "stopped": False, "timed_out": False, "fatal": True}
         # no-key providers
         free_ok = mail_prov in ("tempmail_lol", "moemail", "gptmail", "duckmail")
-        has_cf = bool(str(mail_cfg.get("cfworker_api_url") or mail_cfg.get("cloudflare_api_base") or "").strip())
+        has_cfworker = bool(str(mail_cfg.get("cfworker_api_url") or "").strip())
+        cloudflare_cfg = normalize_cloudflare_temp_email_config(mail_cfg)
+        has_cloudflare_temp_email = all(
+            cloudflare_cfg[key]
+            for key in (
+                "cloudflare_api_base",
+                "cloudflare_admin_password",
+                "cloudflare_domain",
+            )
+        )
         has_luck = bool(str(mail_cfg.get("luckmail_api_key") or "").strip())
         has_mali = bool(str(mail_cfg.get("maliapi_api_key") or mail_cfg.get("yyds_api_key") or "").strip())
         has_sky = bool(str(mail_cfg.get("skymail_token") or "").strip())
@@ -1225,8 +1406,10 @@ def _run_one_round(round_no: int, total: int) -> bool:
         has_otm = bool(str(mail_cfg.get("opentrashmail_api_url") or "").strip())
         has_lao = bool(str(mail_cfg.get("laoudo_email") or "").strip())
         ok = free_ok
-        if mail_prov in ("cfworker", "cloudflare", "custom"):
-            ok = has_cf
+        if mail_prov == "cfworker":
+            ok = has_cfworker
+        elif mail_prov == "cloudflare_temp_email":
+            ok = has_cloudflare_temp_email
         elif mail_prov == "luckmail":
             ok = has_luck
         elif mail_prov in ("maliapi", "yyds"):
@@ -1243,11 +1426,16 @@ def _run_one_round(round_no: int, total: int) -> bool:
             ok = has_lao
         if not ok:
             log_line(f"[!] 邮箱源 {mail_prov} 尚未配置完整，请到面板「邮箱服务」填写后保存")
-            return False
+            return {
+                "outcomes": [],
+                "stopped": False,
+                "timed_out": False,
+                "fatal": True,
+            }
         log_line(f"[*] 邮箱源: {mail_prov}")
     except Exception as e:
         log_line(f"[!] 检查邮箱配置失败: {e}")
-        return False
+        return {"outcomes": [], "stopped": False, "timed_out": False, "fatal": True}
 
     # Camoufox 首次要下载浏览器二进制，不计入 5 分钟注册超时
     if engine == "camoufox":
@@ -1263,7 +1451,7 @@ def _run_one_round(round_no: int, total: int) -> bool:
         except Exception as e:
             log_line(f"[!] Camoufox 准备失败: {e}")
             log_line("[!] 可改用 Chromium 有头引擎，或手动执行: .venv\\Scripts\\python.exe -m camoufox fetch")
-            return False
+            return {"outcomes": [], "stopped": False, "timed_out": False, "fatal": True}
 
     cmd = [
         VENV_PYTHON,
@@ -1286,7 +1474,7 @@ def _run_one_round(round_no: int, total: int) -> bool:
         )
     except Exception as e:
         log_line(f"[!] 启动失败: {e}")
-        return False
+        return {"outcomes": [], "stopped": False, "timed_out": False, "fatal": True}
 
     with _job_lock:
         _job["pid"] = _proc.pid
@@ -1301,87 +1489,66 @@ def _run_one_round(round_no: int, total: int) -> bool:
     except Exception as e:
         log_line(f"[!] 写入 start 失败: {e}")
 
-    success = False
-    failed = False
-    timed_out = False
-    stopped = False
-    line_q: "queue.Queue[Optional[str]]" = queue.Queue()
+    known_lines = account_line_set()
 
-    def _stdout_reader() -> None:
-        try:
-            assert _proc is not None and _proc.stdout is not None
-            for raw in _proc.stdout:
-                line_q.put(raw)
-        except Exception:
-            pass
-        finally:
-            line_q.put(None)
+    def on_result(index: int, status: str):
+        nonlocal known_lines
+        after_lines = account_line_set()
+        new_line_count = len(after_lines - known_lines)
+        queued = 0
+        if AUTO_CPA and new_line_count:
+            queued = enqueue_new_accounts(known_lines)
+        known_lines = after_lines
+        adjusted = status
+        with _job_lock:
+            _job["current_round"] = index
+            key = "success" if adjusted == "success" else "fail"
+            _job[key] = int(_job.get(key) or 0) + 1
+        if queued:
+            log_line(f"[CPA] 第 {index} 轮新账号入队转换: {queued}")
+        if adjusted == "success":
+            log_line(f"[+] 第 {index} 轮成功（累计成功 {_job['success']}）")
+        else:
+            if new_line_count:
+                log_line(
+                    f"[!] 第 {index} 轮标记为失败，但发现 {new_line_count} 条新账号记录；"
+                    "统计仍以 ROUND_RESULT 为准"
+                )
+            log_line(f"[-] 第 {index} 轮失败（累计失败 {_job['fail']}）")
+        return adjusted
 
-    reader = threading.Thread(target=_stdout_reader, name=f"round-{round_no}-stdout", daemon=True)
-    reader.start()
-
-    deadline = time.time() + round_timeout
-    while True:
-        if _job.get("stop"):
-            stopped = True
-            log_line("[!] 收到停止指令，终止当前轮")
-            _terminate_register_proc(_proc)
-            break
-
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            timed_out = True
-            log_line(
-                f"[!] 第 {round_no} 轮超时（{round_timeout}s），终止进程并进入下一轮"
+    state = new_batch_marker_state(
+        start_index=start_index,
+        batch_count=batch_count,
+        total=total,
+        round_timeout=round_timeout,
+    )
+    summary = supervise_batch_process(
+        _proc,
+        state,
+        stop_requested=lambda: bool(_job.get("stop")),
+        on_result=on_result,
+        terminate_proc=_terminate_register_proc,
+        log_callback=log_line,
+    )
+    if summary["stopped"]:
+        log_line("[!] 收到停止指令，已终止当前批次")
+    if summary.get("cleanup_timed_out"):
+        log_line("[!] 全部轮次已完成，但 CLI 清理超时；已终止所拥有的进程树")
+    elif summary["timed_out"]:
+        timed_out_index = state.get("current_index") or (
+            start_index + len(state["outcomes"]) - 1
+        )
+        log_line(
+            f"[!] 第 {timed_out_index} 轮超时（{round_timeout}s），"
+            "已终止所拥有的进程树，剩余账号将由新批次继续"
+        )
+        with _job_lock:
+            _job["last_error"] = (
+                f"round {timed_out_index} timeout after {round_timeout}s"
             )
-            with _job_lock:
-                _job["last_error"] = f"round {round_no} timeout after {round_timeout}s"
-            _terminate_register_proc(_proc)
-            break
 
-        try:
-            raw = line_q.get(timeout=min(1.0, max(0.05, remaining)))
-        except queue.Empty:
-            if _proc.poll() is not None:
-                # process exited; drain residual lines briefly
-                drain_deadline = time.time() + 1.0
-                while time.time() < drain_deadline:
-                    try:
-                        raw = line_q.get(timeout=0.1)
-                    except queue.Empty:
-                        break
-                    if raw is None:
-                        break
-                    line = raw.rstrip("\n")
-                    if not line:
-                        continue
-                    if _is_key_log(line):
-                        log_line(_truncate_line(_strip_inner_timestamp(line)))
-                    if "注册成功" in line or "[+] 注册成功" in line:
-                        success = True
-                    if "注册失败" in line or "[-] 注册失败" in line:
-                        failed = True
-                break
-            continue
-
-        if raw is None:
-            break
-
-        line = raw.rstrip("\n")
-        if not line:
-            continue
-        # 只有关键日志才写入面板显示，但状态检测仍基于原始内容
-        if _is_key_log(line):
-            log_line(_truncate_line(_strip_inner_timestamp(line)))
-        if "注册成功" in line or "[+] 注册成功" in line:
-            success = True
-        if "注册失败" in line or "[-] 注册失败" in line:
-            failed = True
-        if "任务结束" in line and ("成功" in line or "失败" in line):
-            # final summary line often has both
-            pass
-
-    if _proc is not None and _proc.poll() is None:
+    if _proc is not None and _proc.poll() is None and not summary["terminated"]:
         _terminate_register_proc(_proc)
     try:
         if _proc is not None:
@@ -1393,21 +1560,8 @@ def _run_one_round(round_no: int, total: int) -> bool:
         _job["pid"] = None
         _job.pop("round_deadline", None)
     _proc = None
-    _cleanup_browser_leftovers()
-
-    if stopped:
-        return False
-    # 已打出「注册成功」后若在 NSFW/关浏览器阶段卡住被硬超时杀掉，账号其实已可用
-    if success:
-        if timed_out:
-            log_line(
-                f"[!] 第 {round_no} 轮在成功后超时被终止，仍记为成功（账号文件可能已写入）"
-            )
-        return True
-    if timed_out:
-        log_line(f"[-] 第 {round_no} 轮因超时记为失败")
-        return False
-    return False
+    summary["fatal"] = False
+    return summary
 
 
 def _next_node(nodes: List[str], index: int) -> Tuple[str, int]:
@@ -1448,48 +1602,31 @@ def job_worker(count: int, node: str = "", node_mode: str = "fixed", node_list: 
         log_line(f"[*] 使用外部 Clash 代理: {proxy_now}（节点请在 Clash 客户端选择）")
         log_line(f"[*] 出口探测: {clash_exit_ip()}")
 
-        for i in range(1, count + 1):
+        completed = 0
+        while completed < count:
             if _job.get("stop"):
                 log_line("[!] 用户停止，结束任务")
                 break
-
-            with _job_lock:
-                _job["current_round"] = i
-
-            before_lines = account_line_set()
-            ok = _run_one_round(i, count)
-
-            # 无论本轮判定成功/失败，都扫一遍新账号文件：
-            # 避免「已写入 accounts 但日志未刷出/成功后硬超时」漏掉 CPA 转换
-            queued = 0
-            if AUTO_CPA:
-                time.sleep(0.8)
-                queued = enqueue_new_accounts(before_lines)
-                if queued:
-                    log_line(f"[CPA] 本轮新账号入队转换: {queued}")
-                elif ok:
-                    queued2 = enqueue_missing_accounts(limit=3)
-                    if queued2:
-                        log_line(f"[CPA] 未匹配到新行，补队最近未转换: {queued2}")
-                        queued = queued2
-                    else:
-                        log_line("[CPA] 本轮未发现可转换的新 SSO（可能文件未写出）")
-
-            # 日志没成功但文件里多了账号 → 也算成功
-            if not ok and queued > 0:
-                ok = True
-                log_line(f"[+] 第 {i} 轮日志未显示成功，但检测到 {queued} 个新账号，记为成功")
-
-            if ok:
-                with _job_lock:
-                    _job["success"] = int(_job.get("success") or 0) + 1
-                log_line(f"[+] 第 {i} 轮成功（累计成功 {_job['success']}）")
-            else:
-                with _job_lock:
-                    _job["fail"] = int(_job.get("fail") or 0) + 1
-                log_line(f"[-] 第 {i} 轮失败（累计失败 {_job['fail']}），继续下一轮")
-
-            time.sleep(1)
+            remaining = count - completed
+            summary = _run_batch(
+                start_index=completed + 1,
+                total=count,
+                batch_count=remaining,
+            )
+            finished_now = len(summary.get("outcomes") or [])
+            completed += finished_now
+            if summary.get("stopped") or _job.get("stop"):
+                break
+            if summary.get("fatal"):
+                log_line("[!] 批次无法启动，结束任务")
+                break
+            if finished_now <= 0:
+                log_line("[!] 批次未返回任何轮次结果，为避免空转而结束")
+                break
+            if completed < count:
+                log_line(
+                    f"[*] 重新拉起剩余批次：已完成 {completed}，剩余 {count - completed}"
+                )
 
         log_line(
             f"[*] 全部结束：成功 {_job.get('success')} | 失败 {_job.get('fail')} / 目标 {count}"
@@ -1530,15 +1667,11 @@ def start_job(count: int, node: str = "", node_mode: str = "fixed") -> Tuple[boo
 
 
 def stop_job() -> Tuple[bool, str]:
-    global _proc
     with _job_lock:
         if not _job.get("running"):
             return False, "当前没有运行中的任务"
         _job["stop"] = True
     log_line("[!] 正在停止…")
-    p = _proc
-    _terminate_register_proc(p)
-    _cleanup_browser_leftovers()
     return True, "已发送停止"
 
 

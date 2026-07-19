@@ -4523,6 +4523,30 @@ def cli_log(message):
         print(f"[{timestamp}] {message}".encode("ascii", "replace").decode("ascii"), flush=True)
 
 
+def format_round_marker(
+    kind: str,
+    *,
+    index: int,
+    total: int,
+    attempt: int = 1,
+    status: str = "",
+) -> str:
+    """Build a stable batch marker containing counters only, never account data."""
+    marker_kind = str(kind or "").strip().lower()
+    if marker_kind not in ("start", "result"):
+        raise ValueError(f"unknown round marker kind: {kind}")
+    marker = (
+        f"@@GROK_ROUND_{marker_kind.upper()} "
+        f"index={int(index)} total={int(total)} attempt={int(attempt)}"
+    )
+    if marker_kind == "result":
+        normalized_status = str(status or "failed").strip().lower()
+        if normalized_status not in ("success", "failed", "retry", "stopped"):
+            normalized_status = "failed"
+        marker += f" status={normalized_status}"
+    return marker
+
+
 def _make_account_cancel(stop_callback, deadline, timeout_sec):
     """User stop → RegistrationCancelled; account wall-clock → Exception (skip to next)."""
 
@@ -4536,13 +4560,17 @@ def _make_account_cancel(stop_callback, deadline, timeout_sec):
     return cancel
 
 
-def run_registration_cli(count):
+def run_registration_cli(count, round_offset=0, total_count=None):
     controller = CliStopController()
     success_count = 0
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
     round_timeout = get_round_timeout_sec()
+    round_offset = max(0, int(round_offset or 0))
+    overall_total = max(
+        round_offset + int(count), int(total_count or (round_offset + int(count)))
+    )
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
@@ -4557,6 +4585,17 @@ def run_registration_cli(count):
         while i < count:
             if controller.should_stop():
                 break
+            marker_index = round_offset + i + 1
+            marker_attempt = retry_count_for_slot + 1
+            cli_log(
+                format_round_marker(
+                    "start",
+                    index=marker_index,
+                    total=overall_total,
+                    attempt=marker_attempt,
+                )
+            )
+            round_status = None
             account_deadline = time.time() + round_timeout
             cancel_cb = _make_account_cancel(
                 controller.should_stop, account_deadline, round_timeout
@@ -4653,6 +4692,7 @@ def run_registration_cli(count):
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
+                round_status = "success"
                 cli_log(f"[+] 注册成功: {email}")
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
@@ -4661,11 +4701,13 @@ def run_registration_cli(count):
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
             except RegistrationCancelled:
+                round_status = "stopped"
                 cli_log("[!] 注册被停止")
                 break
             except AccountRetryNeeded as exc:
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
+                    round_status = "retry"
                     cli_log(
                         f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
                     )
@@ -4673,13 +4715,26 @@ def run_registration_cli(count):
                     fail_count += 1
                     retry_count_for_slot = 0
                     i += 1
+                    round_status = "failed"
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
             except Exception as exc:
                 fail_count += 1
                 retry_count_for_slot = 0
                 i += 1
+                round_status = "failed"
                 cli_log(f"[-] 注册失败: {exc}")
             finally:
+                if round_status is None:
+                    round_status = "stopped" if controller.should_stop() else "failed"
+                cli_log(
+                    format_round_marker(
+                        "result",
+                        index=marker_index,
+                        total=overall_total,
+                        attempt=marker_attempt,
+                        status=round_status,
+                    )
+                )
                 if controller.should_stop():
                     break
                 has_more = i < count
@@ -4709,6 +4764,17 @@ def main_cli():
             count = int(config.get("register_count", 1) or 1)
     else:
         count = int(config.get("register_count", 1) or 1)
+    try:
+        round_offset = max(0, int(os.environ.get("GROK_ROUND_OFFSET", "0") or 0))
+    except Exception:
+        round_offset = 0
+    try:
+        total_count = max(
+            round_offset + count,
+            int(os.environ.get("GROK_REGISTER_TOTAL", "0") or 0),
+        )
+    except Exception:
+        total_count = round_offset + count
     cli_log("[*] CLI 已加载配置")
     cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
     cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
@@ -4720,7 +4786,7 @@ def main_cli():
     if command != "start":
         cli_log("[!] 未输入 start，已退出")
         return
-    run_registration_cli(count)
+    run_registration_cli(count, round_offset=round_offset, total_count=total_count)
 
 
 def main():
