@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from unittest.mock import mock_open
 
 import pytest
@@ -21,8 +22,8 @@ class FakeStdin:
 
 
 class FakeProcess:
-    def __init__(self, lines=(), *, stays_alive=False):
-        self.pid = 7654
+    def __init__(self, lines=(), *, stays_alive=False, pid=7654):
+        self.pid = pid
         self.stdin = FakeStdin()
         self._lines = list(lines)
         self._stays_alive = stays_alive
@@ -393,6 +394,163 @@ def test_worker_environment_contains_unique_worker_identity():
     assert env["GROK_WORKER_ID"] == "2"
     assert env["GROK_REGISTER_COUNT"] == "3"
     assert env["GROK_ROUND_OFFSET"] == "4"
+
+
+def test_worker_assignments_run_at_the_same_time_and_keep_all_results():
+    assignments = panel_app.partition_registration_work(total=6, concurrency=3)
+    barrier = threading.Barrier(3)
+    active_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    def run_assignment(assignment):
+        nonlocal active, peak_active
+        with active_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        barrier.wait(timeout=2)
+        with active_lock:
+            active -= 1
+        return {
+            "worker_id": assignment.worker_id,
+            "outcomes": [
+                (index, "success")
+                for index in range(
+                    assignment.start_index,
+                    assignment.start_index + assignment.batch_count,
+                )
+            ],
+        }
+
+    summaries = panel_app.run_worker_assignments(
+        assignments, run_assignment=run_assignment
+    )
+
+    assert peak_active == 3
+    assert sorted(summaries) == [1, 2, 3]
+    assert sorted(
+        index
+        for summary in summaries.values()
+        for index, _status in summary["outcomes"]
+    ) == list(range(1, 7))
+
+
+def test_worker_process_registry_tracks_unique_pids_and_stops_each_once(monkeypatch):
+    monkeypatch.setattr(panel_app, "_procs", {})
+    monkeypatch.setitem(panel_app._job, "workers", {})
+    terminated = []
+    monkeypatch.setattr(
+        panel_app,
+        "_terminate_register_proc",
+        lambda proc: terminated.append(proc.pid),
+    )
+    processes = [FakeProcess(pid=8000 + worker_id) for worker_id in range(1, 4)]
+
+    for worker_id, proc in enumerate(processes, start=1):
+        panel_app.register_worker_process(worker_id, proc)
+
+    assert {worker_id: proc.pid for worker_id, proc in panel_app._procs.items()} == {
+        1: 8001,
+        2: 8002,
+        3: 8003,
+    }
+    assert {
+        int(worker_id): worker["pid"]
+        for worker_id, worker in panel_app._job["workers"].items()
+    } == {1: 8001, 2: 8002, 3: 8003}
+
+    panel_app.terminate_all_worker_processes()
+    panel_app.terminate_all_worker_processes()
+
+    assert sorted(terminated) == [8001, 8002, 8003]
+    assert panel_app._procs == {}
+
+
+def test_unregister_worker_process_cannot_remove_replacement_process(monkeypatch):
+    monkeypatch.setattr(panel_app, "_procs", {})
+    monkeypatch.setitem(panel_app._job, "workers", {})
+    original = FakeProcess(pid=8101)
+    replacement = FakeProcess(pid=8102)
+    panel_app.register_worker_process(1, original)
+    panel_app.register_worker_process(1, replacement)
+
+    panel_app.unregister_worker_process(1, original)
+
+    assert panel_app._procs[1] is replacement
+    assert panel_app._job["workers"]["1"]["pid"] == 8102
+
+
+def test_global_result_aggregation_ignores_duplicate_index(monkeypatch):
+    monkeypatch.setitem(panel_app._job, "success", 0)
+    monkeypatch.setitem(panel_app._job, "fail", 0)
+    monkeypatch.setitem(panel_app._job, "outcomes", {})
+
+    first = panel_app.record_job_result(4, "success", worker_id=1)
+    duplicate = panel_app.record_job_result(4, "failed", worker_id=2)
+    second = panel_app.record_job_result(5, "failed", worker_id=2)
+
+    assert first is True
+    assert duplicate is False
+    assert second is True
+    assert panel_app._job["success"] == 1
+    assert panel_app._job["fail"] == 1
+    assert panel_app._job["outcomes"] == {"4": "success", "5": "failed"}
+
+
+def test_worker_slot_relaunches_only_its_unfinished_slice(monkeypatch):
+    calls = []
+    summaries = iter(
+        [
+            {
+                "outcomes": [(5, "success")],
+                "stopped": False,
+                "fatal": False,
+                "timed_out": True,
+            },
+            {
+                "outcomes": [(6, "success"), (7, "failed")],
+                "stopped": False,
+                "fatal": False,
+                "timed_out": False,
+            },
+        ]
+    )
+
+    def fake_run_batch(*, start_index, total, batch_count, worker_id):
+        calls.append((start_index, total, batch_count, worker_id))
+        return next(summaries)
+
+    monkeypatch.setattr(panel_app, "_run_batch", fake_run_batch)
+    monkeypatch.setitem(panel_app._job, "stop", False)
+
+    summary = panel_app.run_worker_assignment(
+        panel_app.WorkerAssignment(worker_id=2, start_index=5, batch_count=3),
+        total=9,
+    )
+
+    assert calls == [(5, 9, 3, 2), (6, 9, 2, 2)]
+    assert summary["outcomes"] == [
+        (5, "success"),
+        (6, "success"),
+        (7, "failed"),
+    ]
+
+
+def test_one_worker_failure_does_not_cancel_other_workers():
+    assignments = panel_app.partition_registration_work(total=4, concurrency=2)
+
+    def run_assignment(assignment):
+        if assignment.worker_id == 1:
+            raise RuntimeError("worker one crashed")
+        return {"outcomes": [(3, "success"), (4, "success")]}
+
+    summaries = panel_app.run_worker_assignments(
+        assignments, run_assignment=run_assignment
+    )
+
+    assert summaries[1]["fatal"] is True
+    assert "worker one crashed" in summaries[1]["error"]
+    assert summaries[2]["outcomes"] == [(3, "success"), (4, "success")]
 
 
 def test_dead_proxy_probe_remains_boolean(monkeypatch):

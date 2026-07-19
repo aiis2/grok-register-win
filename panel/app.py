@@ -274,9 +274,13 @@ _job: Dict = {
     "log_path": "",
     "last_error": "",
     "status": "idle",
+    "concurrency": 1,
+    "workers": {},
+    "outcomes": {},
 }
 _logs: Deque[str] = deque(maxlen=2000)
-_proc: Optional[subprocess.Popen] = None
+_procs: Dict[int, subprocess.Popen] = {}
+_terminated_processes: Set[int] = set()
 
 # --------------- CPA auto-convert queue ---------------
 _cpa_lock = threading.Lock()
@@ -1288,6 +1292,115 @@ def partition_registration_work(
     return assignments
 
 
+def _worker_state_locked(worker_id: int) -> dict:
+    workers = _job.setdefault("workers", {})
+    key = str(int(worker_id))
+    state = workers.setdefault(
+        key,
+        {
+            "worker_id": int(worker_id),
+            "pid": None,
+            "status": "pending",
+            "start_index": 0,
+            "batch_count": 0,
+            "current_round": None,
+            "success": 0,
+            "fail": 0,
+            "last_error": "",
+        },
+    )
+    return state
+
+
+def _refresh_legacy_pid_locked() -> None:
+    _job["pid"] = next(
+        (
+            getattr(proc, "pid", None)
+            for _worker_id, proc in sorted(_procs.items())
+            if getattr(proc, "pid", None) is not None
+        ),
+        None,
+    )
+
+
+def register_worker_process(worker_id: int, proc: subprocess.Popen) -> bool:
+    """Register exactly one currently owned process tree for a worker slot."""
+    worker = normalize_registration_concurrency(worker_id)
+    with _job_lock:
+        if _job.get("stop"):
+            return False
+        _terminated_processes.discard(id(proc))
+        _procs[worker] = proc
+        state = _worker_state_locked(worker)
+        state["pid"] = getattr(proc, "pid", None)
+        state["status"] = "running"
+        _refresh_legacy_pid_locked()
+    return True
+
+
+def unregister_worker_process(worker_id: int, proc: subprocess.Popen) -> bool:
+    """Remove a process only if it is still the process owned by that worker."""
+    worker = int(worker_id)
+    with _job_lock:
+        if _procs.get(worker) is not proc:
+            return False
+        _procs.pop(worker, None)
+        state = _worker_state_locked(worker)
+        state["pid"] = None
+        if state.get("status") == "running":
+            state["status"] = "finishing"
+        _refresh_legacy_pid_locked()
+    return True
+
+
+def terminate_worker_process(worker_id: int, proc: subprocess.Popen) -> bool:
+    """Terminate an owned process tree once, even if stop and timeout race."""
+    process_key = id(proc)
+    with _job_lock:
+        if process_key in _terminated_processes:
+            return False
+        _terminated_processes.add(process_key)
+        worker = int(worker_id)
+        if _procs.get(worker) is proc:
+            _procs.pop(worker, None)
+            state = _worker_state_locked(worker)
+            state["pid"] = None
+            state["status"] = "stopping"
+            _refresh_legacy_pid_locked()
+    _terminate_register_proc(proc)
+    return True
+
+
+def terminate_all_worker_processes() -> int:
+    """Terminate a stable snapshot of all process trees owned by this job."""
+    with _job_lock:
+        owned = list(_procs.items())
+    terminated = 0
+    for worker_id, proc in owned:
+        if terminate_worker_process(worker_id, proc):
+            terminated += 1
+    return terminated
+
+
+def record_job_result(index: int, status: str, *, worker_id: int) -> bool:
+    """Aggregate a terminal round once by its global registration index."""
+    round_index = int(index)
+    normalized = "success" if str(status).lower() == "success" else "failed"
+    with _job_lock:
+        outcomes = _job.setdefault("outcomes", {})
+        outcome_key = str(round_index)
+        if outcome_key in outcomes:
+            return False
+        outcomes[outcome_key] = normalized
+        aggregate_key = "success" if normalized == "success" else "fail"
+        _job[aggregate_key] = int(_job.get(aggregate_key) or 0) + 1
+        _job["current_round"] = round_index
+        worker = _worker_state_locked(worker_id)
+        worker["current_round"] = round_index
+        worker[aggregate_key] = int(worker.get(aggregate_key) or 0) + 1
+    return True
+
+
 def _update_stats_from_log(line: str):
     if "注册成功" in line or "[+] 注册成功" in line:
         with _job_lock:
@@ -1420,6 +1533,7 @@ def supervise_batch_process(
     terminate_proc,
     now=time.time,
     log_callback=None,
+    worker_id: int = 1,
 ) -> dict:
     """Consume CLI markers while enforcing a fresh deadline for every account."""
     line_q: "queue.Queue[Optional[str]]" = queue.Queue()
@@ -1488,6 +1602,9 @@ def supervise_batch_process(
             with _job_lock:
                 _job["current_round"] = event["index"]
                 _job["round_deadline"] = state["deadline"]
+                worker = _worker_state_locked(worker_id)
+                worker["current_round"] = event["index"]
+                worker["round_deadline"] = state["deadline"]
         if event and event.get("terminal") and not event.get("duplicate"):
             on_result(event["index"], event["status"])
         if log_callback and _is_key_log(line):
@@ -1547,9 +1664,11 @@ def _terminate_register_proc(proc: Optional[subprocess.Popen]) -> None:
         pass
 
 
-def _run_batch(start_index: int, total: int, batch_count: int) -> dict:
+def _run_batch(
+    start_index: int, total: int, batch_count: int, worker_id: int = 1
+) -> dict:
     """Run remaining accounts in one reusable CLI process with per-round deadlines."""
-    global _proc
+    worker_id = normalize_registration_concurrency(worker_id)
     cfg = load_config()
     batch_count = max(1, int(batch_count))
     # Pass the whole remaining batch through the environment; do not overwrite config.json.
@@ -1586,6 +1705,7 @@ def _run_batch(start_index: int, total: int, batch_count: int) -> dict:
         total=total,
         engine=engine,
         timeout=round_timeout,
+        worker_id=worker_id,
     )
     # Windows / local: use system Chrome/Edge; allow override (chromium engine only)
     if engine == "chromium":
@@ -1605,7 +1725,7 @@ def _run_batch(start_index: int, total: int, batch_count: int) -> dict:
             env.setdefault("BROWSER_PATH", env.get("BROWSER_PATH") or "")
 
     log_line(
-        f"=== 批次开始：第 {start_index}-{start_index + batch_count - 1}/{total} 轮"
+        f"=== W{worker_id} 批次开始：第 {start_index}-{start_index + batch_count - 1}/{total} 轮"
         f" · 节点 {_job.get('current_node') or '外部Clash'} ==="
     )
     engine_label = "Camoufox 无头" if engine == "camoufox" else "Chromium 有头"
@@ -1697,7 +1817,7 @@ def _run_batch(start_index: int, total: int, batch_count: int) -> dict:
         "cli",
     ]
     try:
-        _proc = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(BASE_DIR),
             stdin=subprocess.PIPE,
@@ -1710,48 +1830,61 @@ def _run_batch(start_index: int, total: int, batch_count: int) -> dict:
             bufsize=1,
         )
     except Exception as e:
-        log_line(f"[!] 启动失败: {e}")
+        log_line(f"[W{worker_id}] 启动失败: {e}")
         return {"outcomes": [], "stopped": False, "timed_out": False, "fatal": True}
 
+    if not register_worker_process(worker_id, proc):
+        terminate_worker_process(worker_id, proc)
+        return {
+            "outcomes": [],
+            "stopped": True,
+            "timed_out": False,
+            "fatal": False,
+        }
+
     with _job_lock:
-        _job["pid"] = _proc.pid
         _job["round_timeout_sec"] = round_timeout
         _job["round_deadline"] = time.time() + round_timeout
+        worker = _worker_state_locked(worker_id)
+        worker["round_timeout_sec"] = round_timeout
+        worker["round_deadline"] = _job["round_deadline"]
 
     # send start
     try:
-        assert _proc.stdin is not None
-        _proc.stdin.write("start\n")
-        _proc.stdin.flush()
+        assert proc.stdin is not None
+        proc.stdin.write("start\n")
+        proc.stdin.flush()
     except Exception as e:
-        log_line(f"[!] 写入 start 失败: {e}")
+        log_line(f"[W{worker_id}] 写入 start 失败: {e}")
 
     known_lines = account_line_set()
 
     def on_result(index: int, status: str):
         nonlocal known_lines
+        adjusted = "success" if status == "success" else "failed"
+        if not record_job_result(index, adjusted, worker_id=worker_id):
+            return adjusted
         after_lines = account_line_set()
         new_line_count = len(after_lines - known_lines)
         queued = 0
         if AUTO_CPA and new_line_count:
             queued = enqueue_new_accounts(known_lines)
         known_lines = after_lines
-        adjusted = status
-        with _job_lock:
-            _job["current_round"] = index
-            key = "success" if adjusted == "success" else "fail"
-            _job[key] = int(_job.get(key) or 0) + 1
         if queued:
-            log_line(f"[CPA] 第 {index} 轮新账号入队转换: {queued}")
+            log_line(f"[CPA][W{worker_id}] 第 {index} 轮新账号入队转换: {queued}")
         if adjusted == "success":
-            log_line(f"[+] 第 {index} 轮成功（累计成功 {_job['success']}）")
+            log_line(
+                f"[+][W{worker_id}] 第 {index} 轮成功（累计成功 {_job['success']}）"
+            )
         else:
             if new_line_count:
                 log_line(
-                    f"[!] 第 {index} 轮标记为失败，但发现 {new_line_count} 条新账号记录；"
+                    f"[!][W{worker_id}] 第 {index} 轮标记为失败，但发现 {new_line_count} 条新账号记录；"
                     "统计仍以 ROUND_RESULT 为准"
                 )
-            log_line(f"[-] 第 {index} 轮失败（累计失败 {_job['fail']}）")
+            log_line(
+                f"[-][W{worker_id}] 第 {index} 轮失败（累计失败 {_job['fail']}）"
+            )
         return adjusted
 
     state = new_batch_marker_state(
@@ -1761,44 +1894,177 @@ def _run_batch(start_index: int, total: int, batch_count: int) -> dict:
         round_timeout=round_timeout,
     )
     summary = supervise_batch_process(
-        _proc,
+        proc,
         state,
         stop_requested=lambda: bool(_job.get("stop")),
         on_result=on_result,
-        terminate_proc=_terminate_register_proc,
+        terminate_proc=lambda owned: terminate_worker_process(worker_id, owned),
         log_callback=log_line,
+        worker_id=worker_id,
     )
     if summary["stopped"]:
-        log_line("[!] 收到停止指令，已终止当前批次")
+        log_line(f"[W{worker_id}] 收到停止指令，已终止当前批次")
     if summary.get("cleanup_timed_out"):
-        log_line("[!] 全部轮次已完成，但 CLI 清理超时；已终止所拥有的进程树")
+        log_line(
+            f"[W{worker_id}] 全部轮次已完成，但 CLI 清理超时；已终止所拥有的进程树"
+        )
     elif summary["timed_out"]:
         timed_out_index = state.get("current_index") or (
             start_index + len(state["outcomes"]) - 1
         )
         log_line(
-            f"[!] 第 {timed_out_index} 轮超时（{round_timeout}s），"
+            f"[!][W{worker_id}] 第 {timed_out_index} 轮超时（{round_timeout}s），"
             "已终止所拥有的进程树，剩余账号将由新批次继续"
         )
         with _job_lock:
             _job["last_error"] = (
-                f"round {timed_out_index} timeout after {round_timeout}s"
+                f"worker {worker_id} round {timed_out_index} timeout after {round_timeout}s"
             )
+            worker = _worker_state_locked(worker_id)
+            worker["last_error"] = _job["last_error"]
 
-    if _proc is not None and _proc.poll() is None and not summary["terminated"]:
-        _terminate_register_proc(_proc)
+    if proc.poll() is None and not summary["terminated"]:
+        terminate_worker_process(worker_id, proc)
     try:
-        if _proc is not None:
-            _proc.wait(timeout=15)
+        proc.wait(timeout=15)
     except Exception:
-        _terminate_register_proc(_proc)
+        terminate_worker_process(worker_id, proc)
 
+    unregister_worker_process(worker_id, proc)
     with _job_lock:
-        _job["pid"] = None
-        _job.pop("round_deadline", None)
-    _proc = None
+        worker = _worker_state_locked(worker_id)
+        worker.pop("round_deadline", None)
     summary["fatal"] = False
     return summary
+
+
+def run_worker_assignment(assignment: WorkerAssignment, *, total: int) -> dict:
+    """Run one fixed worker slice, relaunching only that slice after a timeout."""
+    worker_id = assignment.worker_id
+    outcomes: List[Tuple[int, str]] = []
+    last_summary: dict = {
+        "outcomes": [],
+        "stopped": False,
+        "timed_out": False,
+        "fatal": False,
+    }
+    with _job_lock:
+        worker = _worker_state_locked(worker_id)
+        worker.update(
+            {
+                "start_index": assignment.start_index,
+                "batch_count": assignment.batch_count,
+                "status": "running",
+            }
+        )
+
+    while len(outcomes) < assignment.batch_count:
+        if _job.get("stop"):
+            last_summary["stopped"] = True
+            break
+        completed = len(outcomes)
+        remaining = assignment.batch_count - completed
+        start_index = assignment.start_index + completed
+        last_summary = _run_batch(
+            start_index=start_index,
+            total=total,
+            batch_count=remaining,
+            worker_id=worker_id,
+        )
+        seen = {index for index, _status in outcomes}
+        new_outcomes = [
+            (int(index), str(status))
+            for index, status in (last_summary.get("outcomes") or [])
+            if int(index) not in seen
+        ]
+        outcomes.extend(new_outcomes)
+        if last_summary.get("stopped") or _job.get("stop"):
+            break
+        if last_summary.get("fatal"):
+            log_line(f"[W{worker_id}] 批次无法启动，结束该并发槽")
+            break
+        if not new_outcomes:
+            log_line(f"[W{worker_id}] 批次未返回轮次结果，为避免空转而结束")
+            last_summary["fatal"] = True
+            break
+        if len(outcomes) < assignment.batch_count:
+            log_line(
+                f"[W{worker_id}] 重新拉起本槽剩余批次："
+                f"已完成 {len(outcomes)}，剩余 {assignment.batch_count - len(outcomes)}"
+            )
+
+    summary = dict(last_summary)
+    summary["worker_id"] = worker_id
+    summary["outcomes"] = outcomes
+    with _job_lock:
+        worker = _worker_state_locked(worker_id)
+        if summary.get("stopped") or _job.get("stop"):
+            worker["status"] = "stopped"
+        elif summary.get("fatal"):
+            worker["status"] = "failed"
+        elif len(outcomes) >= assignment.batch_count:
+            worker["status"] = "completed"
+        else:
+            worker["status"] = "incomplete"
+        worker["pid"] = None
+        worker.pop("round_deadline", None)
+    return summary
+
+
+def run_worker_assignments(
+    assignments: List[WorkerAssignment],
+    *,
+    total: Optional[int] = None,
+    run_assignment=None,
+) -> Dict[int, dict]:
+    """Run all fixed worker slices concurrently and isolate worker failures."""
+    assignment_list = list(assignments)
+    if not assignment_list:
+        return {}
+    total_count = int(total) if total is not None else max(
+        item.start_index + item.batch_count - 1 for item in assignment_list
+    )
+    execute = run_assignment or (
+        lambda item: run_worker_assignment(item, total=total_count)
+    )
+    summaries: Dict[int, dict] = {}
+    summaries_lock = threading.Lock()
+
+    def worker_target(assignment: WorkerAssignment) -> None:
+        try:
+            summary = execute(assignment)
+        except Exception as exc:
+            summary = {
+                "worker_id": assignment.worker_id,
+                "outcomes": [],
+                "stopped": False,
+                "timed_out": False,
+                "fatal": True,
+                "error": str(exc),
+            }
+            log_line(f"[W{assignment.worker_id}] 并发槽异常: {exc}")
+            log_line(traceback.format_exc())
+            with _job_lock:
+                worker = _worker_state_locked(assignment.worker_id)
+                worker["status"] = "failed"
+                worker["last_error"] = str(exc)
+        with summaries_lock:
+            summaries[assignment.worker_id] = summary
+
+    threads = [
+        threading.Thread(
+            target=worker_target,
+            args=(assignment,),
+            name=f"register-worker-{assignment.worker_id}",
+            daemon=True,
+        )
+        for assignment in assignment_list
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return summaries
 
 
 def _next_node(nodes: List[str], index: int) -> Tuple[str, int]:
@@ -1808,18 +2074,30 @@ def _next_node(nodes: List[str], index: int) -> Tuple[str, int]:
     return nodes[index], index
 
 
-def job_worker(count: int, node: str = "", node_mode: str = "fixed", node_list: Optional[List[str]] = None):
+def job_worker(
+    count: int,
+    concurrency: int = 1,
+    node: str = "",
+    node_mode: str = "fixed",
+    node_list: Optional[List[str]] = None,
+):
     """Run register rounds. Node switching is intentionally not managed here —
     user selects nodes in their own Clash client."""
     global _job
     try:
+        concurrency = normalize_registration_concurrency(concurrency)
+        assignments = partition_registration_work(count, concurrency)
         with _job_lock:
+            _procs.clear()
+            _terminated_processes.clear()
             _job["running"] = True
             _job["stop"] = False
             _job["status"] = "running"
             _job["count"] = count
+            _job["concurrency"] = concurrency
             _job["success"] = 0
             _job["fail"] = 0
+            _job["outcomes"] = {}
             _job["current_round"] = 0
             _job["node_mode"] = "external"
             _job["node_list"] = []
@@ -1827,6 +2105,20 @@ def job_worker(count: int, node: str = "", node_mode: str = "fixed", node_list: 
             _job["started_at"] = datetime.now().isoformat(timespec="seconds")
             _job["finished_at"] = None
             _job["last_error"] = ""
+            _job["workers"] = {
+                str(item.worker_id): {
+                    "worker_id": item.worker_id,
+                    "pid": None,
+                    "status": "pending",
+                    "start_index": item.start_index,
+                    "batch_count": item.batch_count,
+                    "current_round": None,
+                    "success": 0,
+                    "fail": 0,
+                    "last_error": "",
+                }
+                for item in assignments
+            }
 
         proxy_now = resolve_proxy_url()
         global PROXY_URL
@@ -1839,30 +2131,21 @@ def job_worker(count: int, node: str = "", node_mode: str = "fixed", node_list: 
         log_line(f"[*] 使用外部 Clash 代理: {proxy_now}（节点请在 Clash 客户端选择）")
         log_line(f"[*] 出口探测: {clash_exit_ip()}")
 
-        completed = 0
-        while completed < count:
-            if _job.get("stop"):
-                log_line("[!] 用户停止，结束任务")
-                break
-            remaining = count - completed
-            summary = _run_batch(
-                start_index=completed + 1,
-                total=count,
-                batch_count=remaining,
-            )
-            finished_now = len(summary.get("outcomes") or [])
-            completed += finished_now
-            if summary.get("stopped") or _job.get("stop"):
-                break
-            if summary.get("fatal"):
-                log_line("[!] 批次无法启动，结束任务")
-                break
-            if finished_now <= 0:
-                log_line("[!] 批次未返回任何轮次结果，为避免空转而结束")
-                break
-            if completed < count:
-                log_line(
-                    f"[*] 重新拉起剩余批次：已完成 {completed}，剩余 {count - completed}"
+        log_line(
+            f"[*] 固定并发槽已分配：请求 {concurrency}，实际 {len(assignments)}；"
+            "每槽独立 CLI 进程、浏览器与 Profile"
+        )
+        summaries = run_worker_assignments(assignments, total=count)
+        fatal_workers = sorted(
+            worker_id
+            for worker_id, summary in summaries.items()
+            if summary.get("fatal")
+        )
+        if fatal_workers:
+            with _job_lock:
+                _job["last_error"] = (
+                    "worker slots failed: "
+                    + ", ".join(str(worker_id) for worker_id in fatal_workers)
                 )
 
         log_line(
@@ -1874,6 +2157,7 @@ def job_worker(count: int, node: str = "", node_mode: str = "fixed", node_list: 
         with _job_lock:
             _job["last_error"] = str(e)
     finally:
+        terminate_all_worker_processes()
         with _job_lock:
             _job["running"] = False
             _job["status"] = "idle"
@@ -1881,22 +2165,34 @@ def job_worker(count: int, node: str = "", node_mode: str = "fixed", node_list: 
             _job["pid"] = None
 
 
-def start_job(count: int, node: str = "", node_mode: str = "fixed") -> Tuple[bool, str]:
+def start_job(
+    count: int,
+    concurrency: int = 1,
+    node: str = "",
+    node_mode: str = "fixed",
+) -> Tuple[bool, str]:
     with _job_lock:
         if _job.get("running"):
             return False, "已有任务在运行"
     if count < 1 or count > 500:
         return False, "轮数范围 1-500"
+    try:
+        concurrency = normalize_registration_concurrency(concurrency)
+    except ValueError as exc:
+        return False, str(exc)
 
     log_path = LOG_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     with _job_lock:
         _job["log_path"] = str(log_path)
     _logs.clear()
-    log_line(f"任务创建：轮数={count} proxy={PROXY_URL}（节点由本机 Clash 管理）")
+    log_line(
+        f"任务创建：轮数={count} 并发={concurrency} proxy={PROXY_URL}"
+        "（节点由本机 Clash 管理）"
+    )
 
     th = threading.Thread(
         target=job_worker,
-        args=(count,),
+        args=(count, concurrency),
         daemon=True,
     )
     th.start()
@@ -1909,6 +2205,7 @@ def stop_job() -> Tuple[bool, str]:
             return False, "当前没有运行中的任务"
         _job["stop"] = True
     log_line("[!] 正在停止…")
+    terminate_all_worker_processes()
     return True, "已发送停止"
 
 
