@@ -2088,10 +2088,11 @@ def job_worker(
         concurrency = normalize_registration_concurrency(concurrency)
         assignments = partition_registration_work(count, concurrency)
         with _job_lock:
+            startup_stop = bool(_job.get("stop"))
             _procs.clear()
             _terminated_processes.clear()
             _job["running"] = True
-            _job["stop"] = False
+            _job["stop"] = startup_stop
             _job["status"] = "running"
             _job["count"] = count
             _job["concurrency"] = concurrency
@@ -2119,6 +2120,10 @@ def job_worker(
                 }
                 for item in assignments
             }
+
+        if startup_stop:
+            log_line("[!] 启动阶段收到停止指令，任务未拉起浏览器")
+            return
 
         proxy_now = resolve_proxy_url()
         global PROXY_URL
@@ -2171,9 +2176,6 @@ def start_job(
     node: str = "",
     node_mode: str = "fixed",
 ) -> Tuple[bool, str]:
-    with _job_lock:
-        if _job.get("running"):
-            return False, "已有任务在运行"
     if count < 1 or count > 500:
         return False, "轮数范围 1-500"
     try:
@@ -2183,6 +2185,21 @@ def start_job(
 
     log_path = LOG_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     with _job_lock:
+        if _job.get("running"):
+            return False, "已有任务在运行"
+        _job["running"] = True
+        _job["stop"] = False
+        _job["status"] = "starting"
+        _job["count"] = count
+        _job["concurrency"] = concurrency
+        _job["success"] = 0
+        _job["fail"] = 0
+        _job["outcomes"] = {}
+        _job["current_round"] = 0
+        _job["workers"] = {}
+        _job["started_at"] = datetime.now().isoformat(timespec="seconds")
+        _job["finished_at"] = None
+        _job["last_error"] = ""
         _job["log_path"] = str(log_path)
     _logs.clear()
     log_line(
@@ -2190,12 +2207,21 @@ def start_job(
         "（节点由本机 Clash 管理）"
     )
 
-    th = threading.Thread(
-        target=job_worker,
-        args=(count, concurrency),
-        daemon=True,
-    )
-    th.start()
+    try:
+        th = threading.Thread(
+            target=job_worker,
+            args=(count, concurrency),
+            daemon=True,
+        )
+        th.start()
+    except Exception as exc:
+        with _job_lock:
+            _job["running"] = False
+            _job["status"] = "idle"
+            _job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            _job["last_error"] = str(exc)
+        log_line(f"[!] 任务线程启动失败: {exc}")
+        return False, f"启动失败: {exc}"
     return True, "已启动"
 
 
@@ -2280,7 +2306,7 @@ INDEX_HTML = r"""
     a.btn.danger,button.btn.danger{background:#2a1717;border-color:#5a2b2b;color:#ffb4b4}
     a.btn.danger:hover,button.btn.danger:hover{background:#381c1c}
     a.btn:disabled,button.btn:disabled,input:disabled,select:disabled{opacity:.48;cursor:not-allowed;transform:none;box-shadow:none}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:16px 0 20px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:16px 0 20px}
     .stat{background:linear-gradient(180deg,var(--card) 0%,var(--card2) 100%);border:1px solid var(--line);border-radius:14px;padding:14px 16px;position:relative;overflow:hidden;transition:border-color .15s}
     .stat:hover{border-color:var(--accent)}
     .stat::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),transparent);opacity:.7}

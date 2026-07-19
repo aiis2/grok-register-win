@@ -155,3 +155,69 @@ def test_poll_disables_storage_migration_while_registration_runs():
     assert "setCredentialActionsDisabled" in html
     assert "st.running" in html
     assert "cpa.pending" in html
+
+
+def test_start_job_reserves_running_state_before_worker_thread_runs(
+    isolated_config, tmp_path, monkeypatch
+):
+    created = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args, daemon):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(panel_app.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(panel_app, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setitem(panel_app._job, "running", False)
+    monkeypatch.setitem(panel_app._job, "stop", False)
+
+    first = panel_app.start_job(5, concurrency=2)
+    second = panel_app.start_job(5, concurrency=2)
+
+    assert first == (True, "已启动")
+    assert second == (False, "已有任务在运行")
+    assert len(created) == 1 and created[0].started is True
+    assert panel_app._job["running"] is True
+    assert panel_app._job["status"] == "starting"
+    assert panel_app._job["count"] == 5
+    assert panel_app._job["concurrency"] == 2
+
+
+def test_stop_requested_during_startup_is_not_lost(
+    isolated_config, tmp_path, monkeypatch
+):
+    created = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args, daemon):
+            self.target = target
+            self.args = args
+            created.append(self)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(panel_app.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(panel_app, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setitem(panel_app._job, "running", False)
+    monkeypatch.setitem(panel_app._job, "stop", False)
+    monkeypatch.setattr(
+        panel_app,
+        "resolve_proxy_url",
+        lambda: (_ for _ in ()).throw(AssertionError("proxy probe should not run")),
+    )
+
+    assert panel_app.start_job(3, concurrency=2)[0] is True
+    assert panel_app.stop_job()[0] is True
+    created[0].target(*created[0].args)
+
+    assert panel_app._job["running"] is False
+    assert panel_app._job["stop"] is True
+    assert panel_app._procs == {}
