@@ -2271,6 +2271,12 @@ browser = None
 page = None
 browser_proxy_bridge = None
 browser_started_with_proxy = False
+_owned_browser = {
+    "pid": None,
+    "address": "",
+    "user_data_path": "",
+    "engine": "",
+}
 
 
 def setup_light_theme(root):
@@ -2374,6 +2380,129 @@ def tk_option_menu(parent, variable, values, width=12):
     return menu
 
 
+def _capture_browser_ownership(instance, engine: str) -> None:
+    """Capture only the Chromium instance created by this process."""
+    global _owned_browser
+    normalized_engine = str(engine or "").strip().lower()
+    if normalized_engine != "chromium":
+        _owned_browser = {
+            "pid": None,
+            "address": "",
+            "user_data_path": "",
+            "engine": normalized_engine,
+        }
+        return
+    pid = getattr(instance, "process_id", None)
+    try:
+        pid = int(pid) if pid not in (None, "") else None
+    except (TypeError, ValueError):
+        pid = None
+    _owned_browser = {
+        "pid": pid,
+        "address": str(getattr(instance, "address", "") or ""),
+        "user_data_path": str(getattr(instance, "user_data_path", "") or ""),
+        "engine": normalized_engine,
+    }
+
+
+def _wait_for_owned_pid_exit(pid: int, timeout: float = 3.0) -> bool:
+    if not pid:
+        return True
+    try:
+        import psutil
+    except Exception:
+        return True
+    deadline = time.time() + max(0.0, float(timeout or 0))
+    while True:
+        if not psutil.pid_exists(int(pid)):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def _terminate_owned_process_tree(pid: int) -> None:
+    """Terminate exactly one captured browser root and its descendants."""
+    if not pid or int(pid) == os.getpid():
+        return
+    try:
+        import psutil
+
+        root = psutil.Process(int(pid))
+        processes = root.children(recursive=True)
+        processes.append(root)
+        for process in reversed(processes):
+            try:
+                process.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _, alive = psutil.wait_procs(processes, timeout=2)
+        for process in alive:
+            try:
+                process.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=2)
+    except Exception:
+        pass
+
+
+def prepare_browser_for_next_account(log_callback=None) -> bool:
+    """Reset a healthy Chromium session for reuse without launching a process."""
+    global browser, page
+    instance = browser
+    if instance is None:
+        return False
+    try:
+        tabs = list(instance.get_tabs() or [])
+        if not tabs:
+            return False
+        survivor = page if page in tabs else tabs[-1]
+        storage_script = """
+try {
+  window.localStorage.clear();
+  window.sessionStorage.clear();
+  if (window.caches && window.caches.keys) {
+    window.caches.keys().then(keys => keys.forEach(key => window.caches.delete(key)));
+  }
+} catch (e) {}
+return true;
+"""
+        for tab in tabs:
+            try:
+                tab.run_js(storage_script)
+            except Exception:
+                pass
+        for tab in tabs:
+            if tab is survivor:
+                continue
+            try:
+                tab.close()
+            except Exception:
+                pass
+        instance.clear_cache(cache=True, cookies=True)
+        survivor.get("about:blank")
+        page = survivor
+        if log_callback:
+            log_callback("[*] 已清理浏览器会话，复用当前 Chromium")
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 当前浏览器不可复用，将按需重启: {exc}")
+        return False
+
+
+def transition_browser_for_next_attempt(has_more: bool, log_callback=None) -> str:
+    """Reuse when healthy, restart once when unhealthy, and do nothing at end."""
+    if not has_more:
+        return "final"
+    if prepare_browser_for_next_account(log_callback=log_callback):
+        return "reused"
+    restart_browser(log_callback=log_callback)
+    return "restarted"
+
+
 def start_browser(log_callback=None, use_proxy=True):
     global browser, page, browser_proxy_bridge, browser_started_with_proxy
     last_exc = None
@@ -2413,6 +2542,7 @@ def start_browser(log_callback=None, use_proxy=True):
             else:
                 browser = Chromium(create_browser_options(browser_proxy=browser_proxy))
                 browser_started_with_proxy = bool(browser_proxy)
+            _capture_browser_ownership(browser, engine)
             browser_proxy_bridge = bridge
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
@@ -2436,28 +2566,50 @@ def start_browser(log_callback=None, use_proxy=True):
                 log_callback(f"[Debug] 浏览器{mode}启动失败(第{attempt}/4次): {exc}")
             try:
                 if browser is not None:
-                    browser.quit(del_data=True)
+                    if engine == "chromium":
+                        browser.quit(force=True, del_data=True)
+                    else:
+                        browser.quit(del_data=True)
             except Exception:
                 pass
+            owned_pid = _owned_browser.get("pid")
+            if owned_pid and not _wait_for_owned_pid_exit(owned_pid, timeout=2):
+                _terminate_owned_process_tree(owned_pid)
             browser = None
             page = None
             browser_proxy_bridge = None
             browser_started_with_proxy = False
+            _capture_browser_ownership(None, "")
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    global browser, page, browser_started_with_proxy
-    if browser is not None:
+    global browser, page, browser_started_with_proxy, _owned_browser
+    instance = browser
+    owned = dict(_owned_browser)
+    if instance is not None:
         try:
-            browser.quit(del_data=True)
+            if owned.get("engine") == "chromium":
+                instance.quit(force=True, del_data=True)
+            else:
+                instance.quit(del_data=True)
         except Exception:
             pass
+    owned_pid = owned.get("pid")
+    if owned_pid and not _wait_for_owned_pid_exit(owned_pid, timeout=3):
+        _terminate_owned_process_tree(owned_pid)
+        _wait_for_owned_pid_exit(owned_pid, timeout=3)
     stop_browser_proxy_bridge()
     browser = None
     page = None
     browser_started_with_proxy = False
+    _owned_browser = {
+        "pid": None,
+        "address": "",
+        "user_data_path": "",
+        "engine": "",
+    }
 
 
 def restart_browser(log_callback=None, use_proxy=True):
@@ -4264,7 +4416,9 @@ class GrokRegisterGUI:
                                     rotate_email_provider(
                                         log_callback=self.log, reason=msg[:120]
                                     )
-                                restart_browser(log_callback=self.log)
+                                transition_browser_for_next_attempt(
+                                    True, log_callback=self.log
+                                )
                                 sleep_with_cancel(1, cancel_cb)
                                 continue
                             raise
@@ -4336,11 +4490,12 @@ class GrokRegisterGUI:
                     self.update_stats()
                     if self.should_stop():
                         break
-                    if browser is None:
-                        start_browser(log_callback=self.log)
-                    else:
-                        restart_browser(log_callback=self.log)
-                    sleep_with_cancel(1, self.should_stop)
+                    has_more = i < count
+                    transition_browser_for_next_attempt(
+                        has_more, log_callback=self.log
+                    )
+                    if has_more:
+                        sleep_with_cancel(1, self.should_stop)
         except Exception as exc:
             self.log(f"[!] 任务异常: {exc}")
         finally:
@@ -4460,7 +4615,9 @@ def run_registration_cli(count):
                                 rotate_email_provider(
                                     log_callback=cli_log, reason=msg[:120]
                                 )
-                            restart_browser(log_callback=cli_log)
+                            transition_browser_for_next_attempt(
+                                True, log_callback=cli_log
+                            )
                             sleep_with_cancel(1, cancel_cb)
                             continue
                         raise
@@ -4525,11 +4682,12 @@ def run_registration_cli(count):
             finally:
                 if controller.should_stop():
                     break
-                if browser is None:
-                    start_browser(log_callback=cli_log)
-                else:
-                    restart_browser(log_callback=cli_log)
-                sleep_with_cancel(1, controller.should_stop)
+                has_more = i < count
+                transition_browser_for_next_attempt(
+                    has_more, log_callback=cli_log
+                )
+                if has_more:
+                    sleep_with_cancel(1, controller.should_stop)
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")
