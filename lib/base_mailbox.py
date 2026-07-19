@@ -4573,24 +4573,96 @@ class FreemailMailbox(BaseMailbox):
         self.domain = str(domain or "").strip().lstrip("@")
         self.proxy = build_requests_proxy_config(proxy)
         self._session = None
+        self._login_payload = None
         self._email = None
         self._domains = None
 
     def _get_session(self):
         import requests
 
+        if self._session is not None:
+            return self._session
         s = requests.Session()
         s.proxies = self.proxy
         if self.admin_token:
             s.headers.update({"Authorization": f"Bearer {self.admin_token}"})
+            self._login_payload = {"success": True, "can_send": 1}
         elif self.username and self.password:
-            s.post(
+            response = s.post(
                 f"{self.api}/api/login",
                 json={"username": self.username, "password": self.password},
                 timeout=15,
             )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not payload.get("success"):
+                raise RuntimeError("Freemail 登录失败")
+            self._login_payload = payload
         self._session = s
         return s
+
+    def probe_send_capability(self) -> dict:
+        """Report whether this authenticated Freemail account may send mail."""
+        self._get_session()
+        payload = self._login_payload or {}
+        if bool(payload.get("can_send")):
+            return {"available": True, "reason": ""}
+        if not (self.admin_token or (self.username and self.password)):
+            reason = "Freemail 未配置管理员认证，无法使用原生发件"
+        else:
+            reason = "Freemail 当前账号未启用发件权限"
+        return {"available": False, "reason": reason}
+
+    def send_test_message(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        subject: str,
+        text: str,
+    ) -> dict:
+        """Send one message through Freemail's documented native endpoint."""
+        capability = self.probe_send_capability()
+        if not capability["available"]:
+            raise RuntimeError(capability["reason"])
+        response = self._get_session().post(
+            f"{self.api}/api/send",
+            json={
+                "from": str(sender).strip(),
+                "fromName": "Grok Register Mail Test",
+                "to": str(recipient).strip(),
+                "subject": str(subject),
+                "text": str(text),
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not payload.get("success"):
+            raise RuntimeError("Freemail 发件接口返回失败")
+        return {
+            "success": True,
+            "id": str(payload.get("id") or ""),
+            "provider": str(payload.get("provider") or "freemail"),
+        }
+
+    def delete_email(self, account: MailboxAccount) -> bool:
+        """Delete a generated test mailbox and its messages."""
+        address = str(getattr(account, "email", "") or "").strip()
+        if not address:
+            raise RuntimeError("Freemail 测试邮箱地址缺失")
+        response = self._get_session().delete(
+            f"{self.api}/api/mailboxes",
+            params={"address": address},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("success")
+            and payload.get("deleted", True)
+        )
 
     def get_email(self) -> MailboxAccount:
         if not self._session:
@@ -4609,6 +4681,7 @@ class FreemailMailbox(BaseMailbox):
 
         params = {"domainIndex": domain_index} if target_domain else {}
         r = self._session.get(f"{self.api}/api/generate", params=params, timeout=15)
+        r.raise_for_status()
         data = r.json()
         email = str(data.get("email", "") or "")
         if target_domain and email and "@" in email:
@@ -4630,6 +4703,7 @@ class FreemailMailbox(BaseMailbox):
             self._get_session()
         try:
             r = self._session.get(f"{self.api}/api/domains", timeout=15)
+            r.raise_for_status()
             payload = r.json()
             normalized = []
             def _append_domain(value):
@@ -4670,6 +4744,7 @@ class FreemailMailbox(BaseMailbox):
                 params={"mailbox": account.email, "limit": 50},
                 timeout=10,
             )
+            r.raise_for_status()
             return {str(m["id"]) for m in r.json() if "id" in m}
         except Exception:
             return set()
@@ -4697,6 +4772,7 @@ class FreemailMailbox(BaseMailbox):
                     params={"mailbox": account.email, "limit": 20},
                     timeout=10,
                 )
+                r.raise_for_status()
                 for msg in r.json():
                     mid = str(msg.get("id", ""))
                     if not mid or mid in seen:
