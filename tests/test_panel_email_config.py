@@ -36,6 +36,25 @@ def test_public_config_normalizes_legacy_cloudflare_and_exposes_canonical_fields
     assert public["cloudflare_site_password"] == "legacy-site"
 
 
+def test_empty_canonical_config_still_falls_back_to_nonempty_legacy_values():
+    public = panel_app.email_config_public(
+        {
+            "email_provider": "cloudflare",
+            "cloudflare_api_base": "https://mail.example.com",
+            "cloudflare_admin_password": "",
+            "cloudflare_api_key": "legacy-admin",
+            "cloudflare_domain": "",
+            "defaultDomains": "example.com",
+            "cloudflare_site_password": "",
+            "cfworker_custom_auth": "legacy-site",
+        }
+    )
+
+    assert public["cloudflare_admin_password"] == "legacy-admin"
+    assert public["cloudflare_domain"] == "example.com"
+    assert public["cloudflare_site_password"] == "legacy-site"
+
+
 @pytest.mark.parametrize(
     "missing",
     ["cloudflare_api_base", "cloudflare_admin_password", "cloudflare_domain"],

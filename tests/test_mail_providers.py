@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from base_mailbox import CFWorkerMailbox, CloudflareTempEmailMailbox
+import mail_providers
 from mail_providers import (
     MAIL_PROVIDER_CHOICES,
     extra_from_config,
@@ -102,3 +103,45 @@ def test_provider_choices_expose_only_canonical_cloudflare_id():
 
     assert "cloudflare_temp_email" in ids
     assert "cloudflare" not in ids
+
+
+def test_cleanup_active_cloudflare_address_and_reset_state(monkeypatch):
+    calls = []
+
+    class FakeBox:
+        def delete_email(self, account):
+            calls.append(account)
+            return True
+
+    account = object()
+    monkeypatch.setattr(mail_providers, "_ACTIVE_BOX", FakeBox())
+    monkeypatch.setattr(mail_providers, "_ACTIVE_ACCT", account)
+    monkeypatch.setattr(
+        mail_providers, "_ACTIVE_PROVIDER", "cloudflare_temp_email", raising=False
+    )
+
+    assert mail_providers.cleanup_active_mailbox() is True
+    assert calls == [account]
+    assert mail_providers._ACTIVE_BOX is None
+    assert mail_providers._ACTIVE_ACCT is None
+    assert mail_providers._ACTIVE_PROVIDER == ""
+
+
+def test_cleanup_error_is_redacted_and_state_is_still_reset(monkeypatch):
+    logs = []
+
+    class FakeBox:
+        def delete_email(self, account):
+            raise RuntimeError("private-address-jwt")
+
+    monkeypatch.setattr(mail_providers, "_ACTIVE_BOX", FakeBox())
+    monkeypatch.setattr(mail_providers, "_ACTIVE_ACCT", object())
+    monkeypatch.setattr(
+        mail_providers, "_ACTIVE_PROVIDER", "cloudflare_temp_email", raising=False
+    )
+
+    assert mail_providers.cleanup_active_mailbox(log_callback=logs.append) is False
+    assert "private-address-jwt" not in " ".join(logs)
+    assert mail_providers._ACTIVE_BOX is None
+    assert mail_providers._ACTIVE_ACCT is None
+    assert mail_providers._ACTIVE_PROVIDER == ""

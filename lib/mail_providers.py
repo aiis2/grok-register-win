@@ -52,6 +52,7 @@ MAIL_PROVIDER_CHOICES = [
 # active mailbox for wait_for_code
 _ACTIVE_BOX = None
 _ACTIVE_ACCT = None
+_ACTIVE_PROVIDER = ""
 
 
 def import_ok() -> bool:
@@ -207,7 +208,7 @@ def get_email_and_token(
     proxy: str = "",
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, str]:
-    global _ACTIVE_BOX, _ACTIVE_ACCT
+    global _ACTIVE_BOX, _ACTIVE_ACCT, _ACTIVE_PROVIDER
     box, prov = make_mailbox(config, provider, proxy=proxy, log_callback=log_callback)
     acct = box.get_email()
     email = str(getattr(acct, "email", "") or "").strip()
@@ -222,9 +223,38 @@ def get_email_and_token(
         raise RuntimeError(f"{prov} 返回空邮箱")
     _ACTIVE_BOX = box
     _ACTIVE_ACCT = acct
+    _ACTIVE_PROVIDER = prov
     if log_callback:
         log_callback(f"[*] 已申请邮箱: {email}（源={prov}）")
     return email, token
+
+
+def cleanup_active_mailbox(log_callback=None) -> bool:
+    """Delete a dedicated Cloudflare address and always forget active state."""
+    global _ACTIVE_BOX, _ACTIVE_ACCT, _ACTIVE_PROVIDER
+    box = _ACTIVE_BOX
+    account = _ACTIVE_ACCT
+    provider = _ACTIVE_PROVIDER
+    _ACTIVE_BOX = None
+    _ACTIVE_ACCT = None
+    _ACTIVE_PROVIDER = ""
+    if provider != "cloudflare_temp_email" or box is None or account is None:
+        return True
+    delete_email = getattr(box, "delete_email", None)
+    if not callable(delete_email):
+        return True
+    try:
+        deleted = bool(delete_email(account))
+        if log_callback:
+            if deleted:
+                log_callback("[*] Cloudflare Temp Email 临时地址已清理")
+            else:
+                log_callback("[!] Cloudflare Temp Email 临时地址未能清理（已忽略）")
+        return deleted
+    except Exception:
+        if log_callback:
+            log_callback("[!] Cloudflare Temp Email 临时地址清理失败（已忽略）")
+        return False
 
 
 def snapshot_ids(log_callback=None):

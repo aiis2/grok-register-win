@@ -643,14 +643,27 @@ def normalize_cloudflare_temp_email_config(
 
     def pick(key: str, *legacy_keys: str) -> str:
         if key in source:
-            return str(source.get(key) or "").strip()
-        if key in old:
-            return str(old.get(key) or "").strip()
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+            for legacy in legacy_keys:
+                legacy_value = str(source.get(legacy) or "").strip()
+                if legacy_value:
+                    return legacy_value
+            # An explicit empty form field must not resurrect a saved fallback.
+            return ""
         for legacy in legacy_keys:
             if legacy in source:
-                return str(source.get(legacy) or "").strip()
-            if legacy in old:
-                return str(old.get(legacy) or "").strip()
+                value = str(source.get(legacy) or "").strip()
+                if value:
+                    return value
+        value = str(old.get(key) or "").strip()
+        if value:
+            return value
+        for legacy in legacy_keys:
+            value = str(old.get(legacy) or "").strip()
+            if value:
+                return value
         return ""
 
     api_base = pick("cloudflare_api_base").rstrip("/")

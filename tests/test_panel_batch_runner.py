@@ -59,10 +59,23 @@ def test_cli_markers_are_stable_and_never_contain_account_secrets():
 
 def test_cli_batch_emits_one_start_and_result_pair_per_terminal_round(monkeypatch):
     logs = []
-    monkeypatch.setattr(main, "cli_log", logs.append)
+    cleanups = []
+    events = []
+
+    def capture_log(message):
+        logs.append(message)
+        events.append(("log", message))
+
+    monkeypatch.setattr(main, "cli_log", capture_log)
     monkeypatch.setattr(main, "get_round_timeout_sec", lambda: 60)
     monkeypatch.setattr(main, "start_browser", lambda **kwargs: None)
     monkeypatch.setattr(main, "cleanup_runtime_memory", lambda **kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "cleanup_active_mailbox",
+        lambda **kwargs: cleanups.append(kwargs) or events.append(("cleanup", "")) or True,
+        raising=False,
+    )
     monkeypatch.setattr(main, "transition_browser_for_next_attempt", lambda *args, **kwargs: "reused")
     monkeypatch.setattr(main, "sleep_with_cancel", lambda *args, **kwargs: None)
     monkeypatch.setattr(main, "open_signup_page", lambda **kwargs: None)
@@ -90,6 +103,16 @@ def test_cli_batch_emits_one_start_and_result_pair_per_terminal_round(monkeypatc
     assert "index=5" in starts[1]
     assert len(results) == 2
     assert all("status=success" in line for line in results)
+    assert len(cleanups) == 2
+    result_positions = [
+        index
+        for index, event in enumerate(events)
+        if event[0] == "log" and "@@GROK_ROUND_RESULT" in event[1]
+    ]
+    cleanup_positions = [
+        index for index, event in enumerate(events) if event[0] == "cleanup"
+    ]
+    assert all(result < cleanup for result, cleanup in zip(result_positions, cleanup_positions))
     markers = " ".join(starts + results).lower()
     assert "private@example.com" not in markers
     assert "private-jwt" not in markers

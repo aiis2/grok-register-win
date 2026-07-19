@@ -1542,6 +1542,12 @@ def is_mail_related_error(exc) -> bool:
     return any(k.lower() in msg for k in keys)
 
 
+def cleanup_active_mailbox(log_callback=None) -> bool:
+    if mail_providers is None or not mail_providers.import_ok():
+        return True
+    return mail_providers.cleanup_active_mailbox(log_callback=log_callback)
+
+
 def _get_email_and_token_once(provider, api_key=None, log_callback=None):
     provider = (provider or "").strip().lower()
     if mail_providers is not None:
@@ -4412,6 +4418,7 @@ class GrokRegisterGUI:
                                 self.log(
                                     f"[!] 邮箱/验证码失败，自动切换备用源并换邮箱重试: {msg}"
                                 )
+                                cleanup_active_mailbox(log_callback=self.log)
                                 if config.get("email_failover", True):
                                     rotate_email_provider(
                                         log_callback=self.log, reason=msg[:120]
@@ -4488,6 +4495,7 @@ class GrokRegisterGUI:
                     self.log(f"[-] 注册失败: {exc}")
                 finally:
                     self.update_stats()
+                    cleanup_active_mailbox(log_callback=self.log)
                     if self.should_stop():
                         break
                     has_more = i < count
@@ -4650,6 +4658,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                             cli_log(
                                 f"[!] 邮箱/验证码失败，自动切换备用源并换邮箱重试: {msg}"
                             )
+                            cleanup_active_mailbox(log_callback=cli_log)
                             if config.get("email_failover", True):
                                 rotate_email_provider(
                                     log_callback=cli_log, reason=msg[:120]
@@ -4735,6 +4744,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                         status=round_status,
                     )
                 )
+                cleanup_active_mailbox(log_callback=cli_log)
                 if controller.should_stop():
                     break
                 has_more = i < count
