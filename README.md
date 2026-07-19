@@ -2,429 +2,282 @@
 
 # Grok Register Win
 
-![Banner](docs/banner.png)
+![Grok Register Win](docs/banner.png)
 
-### Windows 下双击即用的 Grok（xAI）账号自动注册面板
+### Windows 本地运行的 Grok 账号注册与凭据导出面板
 
-[![Version](https://img.shields.io/badge/version-v1.3.0-blue?style=for-the-badge)](https://github.com/aiis2/grok-register-win/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey?style=for-the-badge)](#环境要求)
-[![Python](https://img.shields.io/badge/python-3.10+-yellow?style=for-the-badge)](https://www.python.org/downloads/)
-[![Stars](https://img.shields.io/github/stars/aiis2/grok-register-win?style=for-the-badge&label=stars)](https://github.com/aiis2/grok-register-win/stargazers)
-[![Downloads](https://img.shields.io/github/downloads/aiis2/grok-register-win/total?style=for-the-badge&label=downloads)](https://github.com/aiis2/grok-register-win/releases)
-[![Forks](https://img.shields.io/github/forks/aiis2/grok-register-win?style=for-the-badge&label=forks)](https://github.com/aiis2/grok-register-win/network/members)
-[![Issues](https://img.shields.io/github/issues/aiis2/grok-register-win?style=for-the-badge&label=issues)](https://github.com/aiis2/grok-register-win/issues)
-[![Last Commit](https://img.shields.io/github/last-commit/aiis2/grok-register-win?style=for-the-badge&label=last%20commit)](https://github.com/aiis2/grok-register-win/commits)
-[![Contributors](https://img.shields.io/github/contributors/aiis2/grok-register-win?style=for-the-badge&label=contributors)](https://github.com/aiis2/grok-register-win/graphs/contributors)
+[![Tests](https://github.com/aiis2/grok-register-win/actions/workflows/tests.yml/badge.svg)](https://github.com/aiis2/grok-register-win/actions/workflows/tests.yml)
+[![Version](https://img.shields.io/badge/version-v1.3.0-111827)](https://github.com/aiis2/grok-register-win/commits/master/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows)](#运行要求)
+[![License](https://img.shields.io/badge/License-MIT-16A34A)](LICENSE)
 
-<br>
+有头 Chromium / 无头 Camoufox · 多邮箱服务 · Cloudflare Temp Email · SSO / CPA / Sub2 导出
 
-**代理复用 · 浏览器自动化 · 多邮箱源 · SSO→CPA 转换 · NSFW 自动开启 · 多格式导出**
-
-<br>
-
-基于浏览器自动化完成 Grok 账号注册，自动换取 CPA OAuth 凭证，并开启 NSFW 偏好。支持 Chromium 有头 / Camoufox 无头双引擎切换。
-
-<br>
-
-[📥 快速开始](#快速开始) ·
-[✨ 功能特性](#功能) ·
-[⚙️ 配置说明](#配置) ·
-[📖 目录结构](#目录结构) ·
-[❓ 常见问题](#常见问题) ·
-[📝 更新日志](#更新日志)
+[快速开始](#快速开始) · [邮箱配置](#邮箱服务) · [配置参考](#配置参考) · [故障排查](#故障排查) · [开发与测试](#开发与测试)
 
 </div>
 
----
+> [!CAUTION]
+> 本项目仅用于学习、研究和你有权操作的测试环境。自动化注册可能违反目标平台的服务条款，也可能触发风控。使用者应自行确认合法性、授权范围与账号安全，并承担相关责任。
 
-## ⚠️ 免责声明
+## 项目简介
 
-> 本项目仅供学习研究。自动化注册可能违反平台条款，风险自负。
+Grok Register Win 把代理检查、浏览器注册、临时邮箱收码、账号保存和凭据转换整合到一个本地 Web 面板中。应用默认仅监听 `127.0.0.1:8787`，适合在 Windows 10/11 上通过 `start.bat` 启动。
 
----
+当前稳定能力：
 
-## 📋 目录
+- 使用系统 Chrome/Edge 的 Chromium 有头注册，或切换到 Camoufox 无头反检测引擎；
+- 原生接入 `cloudflare_temp_email`，并兼容多种自建或第三方邮箱服务；
+- 在一批账号中复用同一个有头浏览器，账号间清理 Cookie、缓存和站点存储；
+- 为每个账号设置独立硬超时，异常时仅结束本任务拥有的进程树；
+- 保存 SSO 账号文件，自动转换 CPA OAuth JSON，并生成 Sub2API 导入包；
+- 在面板内预览、下载和删除账号文件。
 
-- [功能特性](#功能)
-- [环境要求](#环境要求)
-- [快速开始](#快速开始)
-- [配置](#配置)
-- [目录结构](#目录结构)
-- [常见问题](#常见问题)
-- [更新日志](#更新日志)
-- [反馈与支持](#反馈与支持)
-- [贡献](#贡献)
-- [许可证](#license)
+```mermaid
+flowchart LR
+    A["Clash / 代理"] --> B["Chromium 或 Camoufox"]
+    B --> C["临时邮箱与验证码"]
+    C --> D["Grok 注册"]
+    D --> E["SSO 账号文件"]
+    E --> F["CPA OAuth JSON"]
+    F --> G["Sub2API 导入包"]
+```
 
----
+## 运行要求
 
-## ✨ 功能
+| 项目 | 要求 |
+| --- | --- |
+| 操作系统 | Windows 10 或 Windows 11 |
+| Python | 3.10 或更高版本，安装时勾选 **Add Python to PATH** |
+| 代理 | 推荐本机 Clash Verge、Clash for Windows 或 mihomo |
+| 有头浏览器 | 已安装 Chrome 或 Edge |
+| Camoufox | 可选，首次使用时会下载浏览器与相关数据 |
 
-- **🌐 代理**：复用本机 Clash，自动探测端口（Clash Verge 默认 `7897`）
-- **🤖 注册引擎**：Chromium 有头 / Camoufox 无头反检测，面板下拉切换；有头批次复用同一浏览器进程
-- **📧 邮箱**：原生支持 `cloudflare_temp_email`，另有 CF Worker / MoeMail / TempMail.lol / DuckMail / GPTMail / LuckMail / MaliAPI 等；公共 Tempmailer 已移除
-- **🔄 SSO → CPA**：注册成功后自动把 web SSO 换成 CLIProxyAPI 可用的 OAuth JSON
-- **🔞 NSFW 自动开启**：注册成功后自动设置 ToS、生日、NSFW 偏好
-- **📦 产物下载**（同一批账号，三种格式，不重复注册/换票）：
-  - SSO TXT：`email----password----sso`
-  - CPA ZIP：`xai-*.json`（`auth_kind=oauth`，CLIProxyAPI）
-  - Sub2 ZIP：`sub2api-data` 官方导入包（单账号 `grok-*.json` + 合集 `all.json`，可一键导入）
-- **🗂️ 账号管理**：面板内勾选删除，避免重复下载
+## 快速开始
 
----
+1. 从 [GitHub 仓库](https://github.com/aiis2/grok-register-win) 下载 ZIP 并解压。
+2. 启动本机 Clash，确认所选节点可用。
+3. 双击 `start.bat`。
+4. 首次启动会创建 `.venv` 并安装依赖，请保留命令窗口。
+5. 浏览器会打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。
+6. 在“邮箱服务”中选择服务商、填写配置并保存。
+7. 选择 Chromium 或 Camoufox，填写注册数量后启动任务。
+8. 注册完成后下载 SSO、CPA 或 Sub2 产物。
 
-## 📋 环境要求
+如果窗口一闪而过，请在 PowerShell 中运行：
 
-| 项 | 说明 |
-| :--- | :--- |
-| **系统** | Windows 10 / 11 |
-| **Python** | 3.10+（安装时勾选 *Add python.exe to PATH*） |
-| **代理** | 本机 Clash（Clash Verge / CFW / mihomo 均可），订阅与节点在 Clash 内管理 |
-| **浏览器** | Chrome 或 Edge（Chromium 有头引擎默认调用） |
-| **Camoufox** | 可选；首次切换会自动下载 Firefox 二进制 |
+```powershell
+./start.bat
+```
 
----
+启动日志位于 `data/logs/start.log`。
 
-## 🚀 快速开始
+## 功能说明
 
-1. **下载仓库** ZIP 并解压
-2. **打开 Clash**，选一个可用节点
-3. **双击 `start.bat`**
-   - 首次启动自动创建 `.venv` 并安装依赖，窗口请勿关闭
-   - 失败日志见 `data\logs\start.log`
-4. **浏览器自动打开** http://127.0.0.1:8787（免密直进）
-5. **配置邮箱**：在「邮箱服务」下拉选择邮箱源并填写对应配置，保存
-6. **开始注册**：点 **开始注册**
-7. **下载产物**：完成后下载 SSO / CPA / Sub2，不需要的账号可勾选删除
-   - Sub2：点「下载 Sub2」→ 解压后用 `all.json`（或单个 `grok-*.json`）在 Sub2API「导入数据」上传
+### 浏览器引擎
 
-> 💡 双击窗口一闪即关：请使用 `start.bat`，并确认 Python 3.10+ 已加入 PATH。
+| 引擎 | 模式 | 说明 |
+| --- | --- | --- |
+| Chromium | 有头 | 默认使用系统 Chrome/Edge；同一批账号复用一个浏览器进程 |
+| Camoufox | 无头 | 可选反检测 Firefox 方案；首次使用需要下载运行组件 |
 
----
+Chromium 批次会在账号之间关闭多余标签页并清理会话数据。浏览器断连、代理模式变化、计划内存回收或单账号硬超时时才会重启。任务停止和超时只清理启动时记录的 CLI/浏览器 PID 树，不会按进程名或窗口标题扫描并关闭用户自己的浏览器。
 
-## ⚙️ 配置
+### 邮箱服务
 
-首次运行从 `config.example.json` 生成 `config.json`。
+面板支持以下邮箱适配器；实际可用性由服务部署、额度和目标平台收信策略决定。
+
+| 标识 | 服务 | 配置特点 |
+| --- | --- | --- |
+| `cloudflare_temp_email` | Cloudflare Temp Email | 管理员创建地址，地址 JWT 拉信与删除 |
+| `cfworker` | CF Worker / 自建 API | API URL、管理 Token、域名 |
+| `moemail` | MoeMail | API URL，可选 Key |
+| `tempmail_lol` | TempMail.lol | 公共临时邮箱，可能被目标平台拒收 |
+| `duckmail` | DuckMail | API、Bearer 或 Key |
+| `gptmail` | GPTMail | API 地址与 Key |
+| `maliapi` | MaliAPI / YYDS | API Key 与可选域名 |
+| `luckmail` | LuckMail | API Key、项目代码与可选域名 |
+| `skymail` / `cloudmail` | SkyMail / CloudMail | Token 或管理账号配置 |
+| `freemail` / `opentrashmail` | 自建邮箱 API | 服务地址、域名与管理凭据 |
+| `laoudo` | Laoudo | 固定邮箱配置 |
+
+公共邮箱可能拒收 xAI 验证码。长期使用建议部署自己的 `cloudflare_temp_email` 或 CF Worker 域名。
+
+#### Cloudflare Temp Email
+
+项目原生对接 [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)。在面板选择 **Cloudflare Temp Email / 自建域名** 后填写：
+
+| 面板字段 | 配置键 | 必填 | 用途 |
+| --- | --- | :---: | --- |
+| API 根地址 | `cloudflare_api_base` | 是 | 服务地址，例如 `https://mail.example.com` |
+| 管理员密码 | `cloudflare_admin_password` | 是 | `/admin/new_address` 的 `x-admin-auth` |
+| 邮箱域名 | `cloudflare_domain` | 是 | 创建临时地址时使用的域名 |
+| 站点访问密码 | `cloudflare_site_password` | 否 | 服务启用访问密码时发送 `x-custom-auth` |
+
+“测试连接”只读取 `/open_api/settings`，仅在端点不存在时回退 `/api/settings`，不会创建邮箱。注册期间使用地址 JWT 读取 `/api/parsed_mails`；结束或换邮箱时会清理临时地址。
+
+旧配置仍可迁移：`cloudflare` 会映射为 `cloudflare_temp_email`，旧 `cloudflare_api_key`、`defaultDomains` 与 `cfworker_custom_auth` 分别作为管理员密码、域名与站点密码的兼容来源。
+
+### 账号与凭据产物
+
+| 产物 | 用途 | 当前存放位置 |
+| --- | --- | --- |
+| `accounts_*.txt` | `email----password----sso` | 项目根目录 |
+| `mail_credentials.txt` | 临时邮箱地址与服务凭据 | 项目根目录 |
+| `xai-*.json` | CLIProxyAPI 可用的 CPA OAuth 凭据 | `data/cpa/` |
+| CPA ZIP | 全部 CPA JSON 与失败记录 | 面板实时生成 |
+| Sub2 ZIP / JSON | Sub2API 官方导入结构 | 面板实时生成 |
+
+这些文件包含敏感凭据。不要上传到 Issue、日志网站、网盘或公开仓库。仓库的 `.gitignore` 已排除常见本地产物，但提交前仍应检查 `git status`。
+
+## 配置参考
+
+首次启动会从 `config.example.json` 生成本地 `config.json`。后者可能包含密码或 Token，禁止提交。
+
+最小示例：
 
 ```json
 {
   "proxy": "http://127.0.0.1:7897",
   "allow_proxy_fallback": false,
   "browser_engine": "chromium",
+  "register_count": 1,
+  "round_timeout_sec": 300,
   "email_provider": "cloudflare_temp_email",
   "email_failover": true,
   "cloudflare_api_base": "https://mail.example.com",
   "cloudflare_admin_password": "your-admin-password",
   "cloudflare_domain": "mail.example.com",
-  "cloudflare_site_password": "",
-  "register_count": 1,
-  "round_timeout_sec": 300
+  "cloudflare_site_password": ""
 }
 ```
 
-| 字段 | 说明 |
-| :--- | :--- |
-| `proxy` | Clash 代理地址；端口不通时启动会自动探测并写回 |
-| `allow_proxy_fallback` | 代理失败是否回退直连，默认 `false` |
-| `browser_engine` | `chromium`（有头，默认）或 `camoufox`（无头反检测） |
-| `email_provider` | 邮箱源 id（如 `cloudflare_temp_email` / `cfworker` / `moemail` / `luckmail`） |
-| `cloudflare_api_base` | `cloudflare_temp_email` 服务根地址 |
-| `cloudflare_admin_password` | 管理员密码，对应 `x-admin-auth` |
-| `cloudflare_domain` | 创建临时地址时使用的域名 |
-| `cloudflare_site_password` | 可选站点访问密码，对应 `x-custom-auth` |
-| `cfworker_api_url` | CF Worker / 自建 API 根地址（选 cfworker 时） |
-| `cfworker_admin_token` | 管理 Token |
-| `cfworker_domain` | 邮箱域名 |
-| `email_failover` | 邮箱失败时是否切换备用源 |
-| `register_count` | 单次任务注册数量 |
-| `round_timeout_sec` | 单账号整轮硬超时（秒），默认 `300`；超时杀进程并进入下一轮 |
+| 字段 | 默认/示例 | 说明 |
+| --- | --- | --- |
+| `proxy` | `http://127.0.0.1:7897` | Clash HTTP 代理地址 |
+| `allow_proxy_fallback` | `false` | 代理不可用时是否允许直连 |
+| `browser_engine` | `chromium` | `chromium` 或 `camoufox` |
+| `register_count` | `1` | 本次任务目标账号数 |
+| `round_timeout_sec` | `300` | 单账号整轮硬超时，单位秒 |
+| `email_provider` | `cfworker` | 当前邮箱适配器 ID |
+| `email_providers` | 数组 | 邮箱失败时的候选顺序 |
+| `email_failover` | `true` | 邮箱失败时是否切换备用源 |
+| `enable_nsfw` | `true` | 注册后尝试设置相关偏好 |
 
-完整字段见 `config.example.json`（含 MoeMail / DuckMail / LuckMail / GPTMail 等）。
+完整邮箱、CPA 和第三方同步字段请查看 [`config.example.json`](config.example.json)。
 
-### 📧 邮箱（重要）
+### 环境变量
 
-> **内置公共 Tempmailer 已移除。**
-> 因大规模滥用，公共临时邮可能拒收 xAI 验证码（提示类似：
-> `Due to recent large-scale abuse, emails from xAI are temporarily not accepted.`）
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PANEL_HOST` | `127.0.0.1` | 面板监听地址 |
+| `PANEL_PORT` | `8787` | 面板端口 |
+| `PANEL_AUTH` | `0` | 设为 `1` 开启面板登录 |
+| `PANEL_PASSWORD` | `admin` | 开启登录后的密码，请务必修改 |
+| `GROK_PROXY` | 配置文件值 | 临时覆盖代理地址 |
+| `ROUND_TIMEOUT_SEC` | `300` | 临时覆盖单账号硬超时 |
+| `CPA_DIR` | `data/cpa` | 覆盖 CPA 输出目录 |
 
-面板「邮箱服务」下拉可选（对齐 any-auto-register 接码体系）：
-
-| 标识 | 名称 | 说明 |
-| :--- | :--- | :--- |
-| `cfworker` | CF Worker / 自建域名 | **推荐**，需 API URL + Admin Token |
-| `cloudflare_temp_email` | Cloudflare Temp Email | 原生协议：管理员创建地址、地址 JWT 收信与删除 |
-| `moemail` | MoeMail | 临时邮 API（sall.cc 等） |
-| `tempmail_lol` | TempMail.lol | 免 key 自动生成（可能被 xAI 拒） |
-| `duckmail` | DuckMail | 临时邮 |
-| `gptmail` | GPTMail | 第三方 API |
-| `maliapi` | YYDS / MaliAPI | 接码/邮箱 API |
-| `luckmail` | LuckMail | 接码/买邮平台 |
-| `skymail` / `cloudmail` | SkyMail / CloudMail | API + Token/账号 |
-| `freemail` | Freemail | 自建 |
-| `opentrashmail` | OpenTrashMail | 自建/开源 |
-| `laoudo` | Laoudo | 固定邮箱 |
-
-收码流程：申请邮箱 → 快照旧信 `before_ids` → 轮询收信 → 提取 Grok 验证码（`ABC-DEF`）。
-
-**建议优先自建（cfworker / cloudflare_temp_email）**；公共源仅作备选，不保证能收 xAI 信。
-
-#### Cloudflare Temp Email 配置
-
-面板选择 **Cloudflare Temp Email / 自建域名** 后填写四项：
-
-| 面板字段 | 配置键 | 必填 | 用途 |
-| :--- | :--- | :---: | :--- |
-| API 根地址 | `cloudflare_api_base` | 是 | 服务部署地址，例如 `https://mail.example.com` |
-| 管理员密码 | `cloudflare_admin_password` | 是 | 调用 `/admin/new_address` 的 `x-admin-auth` |
-| 域名 | `cloudflare_domain` | 是 | 创建临时地址的域名 |
-| 站点访问密码 | `cloudflare_site_password` | 否 | 服务开启访问密码时发送 `x-custom-auth` |
-
-“测试连接”只读取 `/open_api/settings`（兼容回退 `/api/settings`），不会创建临时地址。运行时通过地址 JWT 读取 `/api/parsed_mails`，仅在端点不存在时回退 `/api/mails`，结束后优先用地址 JWT 删除地址。
-
-旧配置会自动迁移：provider `cloudflare` 映射为 `cloudflare_temp_email`，`cloudflare_api_key`、`defaultDomains`、`cfworker_custom_auth` 分别作为管理员密码、域名、站点密码的兼容回退。新字段优先，通用 `cfworker` 适配器继续使用自己的独立配置。
-
-### 🌐 有头浏览器复用与进程回收
-
-Chromium 有头模式现在以一个 CLI 进程处理整批账号：每轮结束关闭多余标签页，清理 Cookie、缓存和站点存储，再让同一浏览器进入下一轮。以下情况才会重启：
-
-- 浏览器断连或健康重置失败；
-- 代理模式发生切换；
-- 每五个成功账号执行计划内存回收；
-- 单账号达到 `round_timeout_sec` 硬超时。
-
-最后一轮不会再启动一个无用浏览器。正常关闭使用启动时记录的 Chromium 根 PID 和资料目录；超时时面板只终止自己启动的 CLI 进程树，不再按浏览器名称、窗口标题或全局 `pkill` 清理，因此不会误伤用户自己的 Chrome/Edge。
-
-### 🌍 环境变量（高级）
-
-| 变量 | 含义 | 默认 |
-| :--- | :--- | :--- |
-| `PANEL_AUTH` | 是否开启登录（`1` 开启） | `0`（免密） |
-| `PANEL_PASSWORD` | 登录密码（仅 `PANEL_AUTH=1` 生效） | `admin` |
-| `PANEL_PORT` | 面板端口 | `8787` |
-| `GROK_PROXY` | 覆盖 `config.json` 代理 | — |
-| `ROUND_TIMEOUT_SEC` | 覆盖 `round_timeout_sec`（单轮硬超时秒数） | `300` |
-
-面板默认仅监听 `127.0.0.1` 且免密。需加密码时：
+需要开启本机登录保护时：
 
 ```powershell
-$env:PANEL_AUTH="1"
-$env:PANEL_PASSWORD="你的密码"
-.\start.bat
+$env:PANEL_AUTH = "1"
+$env:PANEL_PASSWORD = "请替换为强密码"
+./start.bat
 ```
 
----
+## 目录结构
 
-## 📂 目录结构
-
-```
+```text
 grok-register-win/
-├── start.bat                 # 双击启动
-├── launcher.py               # 启动器（代理探测、Playwright 修补）
-├── grok_register_ttk.py      # 注册主程序
+├── start.bat
+├── launcher.py
+├── grok_register_ttk.py
 ├── config.example.json
-├── panel/app.py              # Web 面板
+├── panel/
+│   └── app.py
 ├── lib/
-│   ├── sso2cpa_core.py       # SSO → CPA 转换核心
-│   ├── mailbox_core.py       # 统一收码 / Grok 提码
-│   ├── mail_providers.py     # 多邮箱源适配与下拉
-│   ├── base_mailbox.py       # any-auto-register 邮箱实现
-│   ├── luckmail/             # LuckMail SDK
-│   ├── camoufox_backend.py   # Camoufox 无头适配层
-│   └── patch_playwright.py   # Playwright 驱动崩溃自动修补
+│   ├── base_mailbox.py
+│   ├── mail_providers.py
+│   ├── mailbox_core.py
+│   ├── camoufox_backend.py
+│   ├── patch_playwright.py
+│   └── sso2cpa_core.py
 ├── data/
-│   ├── logs/                 # 运行日志
-│   └── cpa/                  # 已转换 CPA JSON
-├── docs/                     # 截图与文档
-└── accounts_*.txt            # 注册产出
+│   ├── logs/
+│   └── cpa/
+├── tests/
+└── docs/
 ```
 
----
-
-## ❓ 常见问题
+## 故障排查
 
 <details>
-<summary><b>🔧 代理端口不通 / WinError 10061</b></summary>
-<br>
+<summary><strong>代理连接失败或出现 WinError 10061</strong></summary>
 
-- 确认 Clash 已启动
-- Clash Verge 默认端口 `7897`
-- 修改 `config.json` 的 `proxy` 后重启 `start.bat`（启动会自动探测）
+1. 确认 Clash 正在运行；
+2. 检查 `config.json` 中的代理端口；
+3. Clash Verge 常见 HTTP 端口为 `7897`，其他客户端可能使用 `7890`；
+4. 在浏览器中测试节点是否能稳定访问目标站点。
+
 </details>
 
 <details>
-<summary><b>⚠️ 注册大量失败 / 验证码或页面异常</b></summary>
-<br>
+<summary><strong>一直收不到验证码</strong></summary>
 
-- **绝大多数失败来自网络环境**，不是脚本本身
-- 实测机场节点里 **日本** 更稳；新加坡 / 美国 / 德国成功率偏低
-- 失败时先在 Clash 换日本节点，再点「开始注册」
-- 面板「启动注册」卡片下也有同样提示
+公共临时邮箱可能拒收 xAI 邮件。优先使用自建 `cloudflare_temp_email` 或 CF Worker 域名，并在面板先执行连接测试。网络节点也会影响注册邮件触发。
+
 </details>
 
 <details>
-<summary><b>🍪 卡在 Cookie / 拿不到 SSO</b></summary>
-<br>
+<summary><strong>卡在 Cookie、提交按钮或 SSO</strong></summary>
 
-- 已自动点击「接受所有 Cookie」
-- 仍失败请换节点重试（优先日本）
+先更换网络节点，再查看 `data/logs/` 中对应任务日志。单账号超过 `round_timeout_sec` 后会被终止并进入下一轮，不需要手工关闭系统中的全部 Chrome。
+
 </details>
 
 <details>
-<summary><b>📧 邮箱设置保存失败</b></summary>
-<br>
+<summary><strong>首次依赖安装失败</strong></summary>
 
-- 请使用 **v1.3.0+**，并强制刷新面板（Ctrl+F5）
-- 旧版若残留重复 `saveEmailConfig` 会把所有源保存成 custom 导致失败
-- 选 CF Worker / LuckMail 等需填写对应 API/Key；TempMail.lol / MoeMail 可先空 Key 保存
-</details>
-
-<details>
-<summary><b>🔏 验证码收不到 / xAI 拒信</b></summary>
-<br>
-
-- 公共临时邮可能直接拒收 xAI 邮件
-- 换 **CF Worker 自建域名** 或其它可用源后重试
-- 节点优先日本
-</details>
-
-<details>
-<summary><b>📦 依赖安装失败</b></summary>
-<br>
-
-```bat
-.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```powershell
+.venv/Scripts/python.exe -m pip install --upgrade pip
+.venv/Scripts/python.exe -m pip install -r requirements.txt
 ```
+
 </details>
-
----
-
-## 📝 更新日志
 
 <details>
-<summary><b>查看完整更新日志</b></summary>
+<summary><strong>面板显示旧内容</strong></summary>
 
-### v1.3.0（2026-07-19）
-- 原生集成 `dreamhunter2333/cloudflare_temp_email` 创建、解析收信、限流重试与地址清理协议
-- 面板增加四字段专用配置、旧配置迁移和只读连接测试
-- Chromium 有头批次复用同一浏览器，健康失败时才重启
-- 面板改为一个 CLI 处理整批账号，以结构化轮次标记实施逐账号超时监督
-- 删除窗口标题 / 进程名全局清理，仅终止本任务记录的 PID 树
-- 新增 Windows CI 与邮箱、面板、浏览器生命周期、批处理监督单元测试
-
-### v1.2.0（2026-07-18）
-- **多邮箱源下拉（重大更新）**：接入 any-auto-register 邮箱/接码体系
-  - CF Worker、cloudflare_temp_email、MoeMail、TempMail.lol、DuckMail、GPTMail
-  - MaliAPI(YYDS)、LuckMail、SkyMail、CloudMail、Freemail、OpenTrashMail、Laoudo
-- **移除内置 Tempmailer**：公共源滥用后拒收 xAI 验证码，面板展示说明
-- **收码流程对齐 any-auto-register**：`before_ids` 忽略旧信、`otp_sent_at` 过滤发码前邮件、统一提取 Grok `ABC-DEF` 验证码
-- 新增 `lib/base_mailbox.py` / `lib/mail_providers.py` / `lib/mailbox_core.py` / `lib/luckmail/`
-- 修复面板「保存邮箱设置」失败：删除重复旧版 `saveEmailConfig` 覆盖问题
-- 未配置完整邮箱源时，注册启动前明确提示并失败，避免空跑
-
-### v1.1.0（2026-07-16）
-- 修复 SSO→CPA 失败：`curl_cffi` 固定 `chrome131` 指纹被 Cloudflare 403 拦截，导致 `authorize 未进入 consent 页`
-- 启动时自动选择可用 TLS impersonate（优先 `chrome136`，并回退其它配置文件）
-- 识别 Cloudflare 拦截时输出明确错误（HTTP 状态 + impersonate），便于排查
-
-### v1.0.10（2026-07-16）
-- 修 Playwright/Camoufox 提交后崩溃：补全 `pageError.location` 补丁（1.60 有多处未覆盖）
-- Cookie 弹窗 `page_eval` 超时改为短超时软失败，不再卡死 60 秒
-- 修正 GeoIP 模块名（`camoufox.locales`），优先使用较新的 Camoufox 152 二进制
-
-### v1.0.9（2026-07-16）
-- 修复面板日志把 Camoufox 业务日志误过滤，导致"像卡住没输出"
-- Camoufox 首次下载浏览器**不计入** 5 分钟注册超时；下载进度会显示在日志
-- 启动注册前先检查/准备 Camoufox，失败时给出明确提示
-
-### v1.0.8（2026-07-16）
-- 单账号整轮硬超时默认 **5 分钟**（`round_timeout_sec` / `ROUND_TIMEOUT_SEC`）：卡住自动杀进程并进入下一轮
-- 已注册成功后若在后续步骤超时，仍记为成功（避免白注册）
-- 每轮结束扫描新账号文件并入队 CPA，降低漏转换
-- 面板不再把 `config.json` 的 `register_count` 强行改成 1（用环境变量控制单轮）
-
-### v1.0.7（2026-07-16）
-- 新增「下载 Sub2」：从已转换 CPA 现场映射为 Sub2API 官方导入包（`type=sub2api-data` / `version=1`）
-- 主页三种产物并列：SSO TXT、CPA ZIP、Sub2 ZIP（不重跑注册/换票）
-- Sub2 ZIP 对齐 CPA：`README.txt` + 单账号 `grok-*.json` + 合集 `all.json`
-- 映射字段：`expired`→`credentials.expires_at`，`platform=grok`，`type=oauth`，`proxies=[]`
-- Sub2 按钮样式与 SSO/CPA 同为渐变实心按钮
-- 启动注册区增加网络提示（日本节点更稳）；邮箱区空 hint 自动隐藏；README FAQ 补充节点建议
-- 仓库横幅更新：卖点改为「SSO / CPA / Sub2 多格式导出」
-
-### v1.0.6（2026-07-16）
-- 修复 CPA 转换在中文路径下失败：curl_cffi 无法处理非 ASCII CA 证书路径，启动时自动复制到 `%TEMP%`
-- 面板 UI 美化：Grok 风格 logo（黑底白字）、卡片渐变指示条、按钮/表格悬停效果
-- 运行日志过滤：去重复时间戳、过滤 Cloudflare 轮询刷屏、去重信息行、超长截断
-- 免密模式启动不再显示误导性密码提示
-
-### v1.0.5（2026-07-16）
-- 修复 CPA 转换 404：consent 提交改为标准 HTML 表单 POST，从 302 重定向提取 OAuth code
-- 修复 Windows GBK 编码崩溃：入口文件强制 UTF-8 输出
-- 修复 Playwright 驱动崩溃：新增 `lib/patch_playwright.py` 启动时自动修补
-- 扩展注册提交按钮检测（`<a>` 标签 + 更多文本模式）
-- Camoufox 浏览器崩溃快速失败，避免反复超时
-
-### v1.0.4（2026-07-16）
-- 新增 Camoufox 无头引擎（基于 Firefox 反检测，GeoIP 自动对齐时区/语言）
-- 面板下拉切换 Chromium 有头 / Camoufox 无头
-- 首次使用自动下载 Firefox 二进制与 GeoLite2 数据库
+按 `Ctrl+F5` 强制刷新。若仍未更新，确认启动窗口对应的是当前解压目录，并检查 `PANEL_PORT` 是否与浏览器地址一致。
 
 </details>
 
----
+## 开发与测试
 
-## 💬 反馈与支持
+```powershell
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+.venv/Scripts/python.exe -m pytest -q
+.venv/Scripts/python.exe -m compileall -q grok_register_ttk.py launcher.py panel lib tests
+```
 
-| 类型 | 途径 |
-| :--- | :--- |
-| 🐛 **Bug 反馈** | 提交 [Issue](https://github.com/aiis2/grok-register-win/issues/new?template=bug_report.yml) |
-| 💡 **功能建议** | 提交 [Issue](https://github.com/aiis2/grok-register-win/issues/new?template=feature_request.yml) |
-| ❓ **使用提问** | 在 [Discussions](https://github.com/aiis2/grok-register-win/discussions) 中讨论 |
+GitHub Actions 会在 Windows runner 上执行相同的 pytest 与编译检查。提交前请确认：
 
----
+```powershell
+git status --short
+git diff --check
+```
 
-## 🤝 贡献
+欢迎通过 [Issues](https://github.com/aiis2/grok-register-win/issues) 报告可复现问题。提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。请勿在 Issue 中粘贴 SSO、邮箱 JWT、管理员密码、完整 `config.json` 或账号文件。
 
-欢迎各种形式的贡献！
+## 上游与许可证
 
-- 🐛 提交 Bug 反馈
-- 💡 提出功能建议
-- 📝 改进文档
-- 🔧 提交代码 PR
+本仓库保留原始 Git 历史和 MIT 版权声明，并感谢：
 
-请在参与前阅读 [贡献指南](CONTRIBUTING.md) 和 [行为准则](CODE_OF_CONDUCT.md)。
+- [lingxiaoyiyu-hub/grok-register-win](https://github.com/lingxiaoyiyu-hub/grok-register-win)：原始 Windows 项目；
+- [huslx/grokzhuce](https://github.com/huslx/grokzhuce)：Cloudflare 临时邮箱接入参考；
+- [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)：临时邮箱服务协议与实现。
 
----
-
-## License
-
-本项目基于 [MIT License](LICENSE) 发布。若上游组件另有协议，以对应文件为准。
-
-本仓库保留原始提交历史和 MIT 版权声明，并感谢以下项目：
-
-- [lingxiaoyiyu-hub/grok-register-win](https://github.com/lingxiaoyiyu-hub/grok-register-win)：本 Windows 面板的上游项目；
-- [huslx/grokzhuce](https://github.com/huslx/grokzhuce)：邮箱接入与注册流程的对照实现；
-- [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)：本次原生适配的临时邮箱服务及 API 协议来源。
-
----
-
-<div align="center">
-
-**如果这个项目对你有帮助，欢迎 Star ⭐ 支持一下**
-
-<br>
-
-<a href="https://github.com/aiis2/grok-register-win/stargazers">
-  <img src="https://img.shields.io/github/stars/aiis2/grok-register-win?style=social" alt="Stars">
-</a>
-&nbsp;
-<a href="https://github.com/aiis2/grok-register-win/network/members">
-  <img src="https://img.shields.io/github/forks/aiis2/grok-register-win?style=social" alt="Forks">
-</a>
-&nbsp;
-<a href="https://github.com/aiis2/grok-register-win/watchers">
-  <img src="https://img.shields.io/github/watchers/aiis2/grok-register-win?style=social" alt="Watchers">
-</a>
-
-</div>
+项目按 [MIT License](LICENSE) 发布；第三方依赖和服务遵循各自许可证及服务条款。
