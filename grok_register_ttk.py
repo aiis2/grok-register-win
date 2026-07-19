@@ -23,6 +23,7 @@ import json
 import base64
 import select
 import socket
+import tempfile
 from pathlib import Path
 
 # Ensure stdout/stderr use UTF-8 on Windows (default is GBK/CP936)
@@ -237,7 +238,7 @@ def save_config():
 
 def get_registration_worker_id() -> int:
     try:
-        return max(1, int(os.environ.get("GROK_WORKER_ID", "1") or 1))
+        return min(10, max(1, int(os.environ.get("GROK_WORKER_ID", "1") or 1)))
     except (TypeError, ValueError):
         return 1
 
@@ -872,9 +873,33 @@ def apply_browser_proxy_option(options, proxy):
         options.set_argument("--proxy-server", proxy)
 
 
+def browser_auto_port_scope(worker_id: int) -> tuple[int, int]:
+    """Give every registration worker a disjoint Chromium debugging range."""
+    worker = int(worker_id)
+    if not 1 <= worker <= 10:
+        raise ValueError("worker_id must be between 1 and 10")
+    start = 9600 + ((worker - 1) * 1000)
+    return start, start + 999
+
+
+def browser_runtime_tmp_path(
+    worker_id: int | None = None, process_id: int | None = None
+) -> Path:
+    worker = get_registration_worker_id() if worker_id is None else int(worker_id)
+    pid = os.getpid() if process_id is None else int(process_id)
+    return (
+        Path(tempfile.gettempdir())
+        / "grok-register-win"
+        / "browser"
+        / f"w{worker}-p{pid}"
+    )
+
+
 def create_browser_options(browser_proxy=""):
+    worker_id = get_registration_worker_id()
     options = ChromiumOptions()
-    options.auto_port()
+    options.set_tmp_path(str(browser_runtime_tmp_path(worker_id)))
+    options.auto_port(scope=browser_auto_port_scope(worker_id))
     options.set_timeouts(base=1)
     # Server-friendly browser path / flags
     for _browser_path in (
@@ -4354,10 +4379,13 @@ class GrokRegisterGUI:
         self.success_count = 0
         self.fail_count = 0
         self.results = []
-        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
+        output_paths = create_worker_output_paths(
+            current_credential_layout(),
+            worker_id=get_registration_worker_id(),
+            pid=os.getpid(),
         )
+        self.accounts_output_file = str(output_paths.sso_file)
+        self.mail_credentials_file = str(output_paths.mail_file)
         self.update_stats()
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
@@ -4412,9 +4440,7 @@ class GrokRegisterGUI:
                             self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                             try:
                                 with open(
-                                    os.path.join(
-                                        os.path.dirname(__file__), "mail_credentials.txt"
-                                    ),
+                                    self.mail_credentials_file,
                                     "a",
                                     encoding="utf-8",
                                 ) as f:

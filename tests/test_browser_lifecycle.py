@@ -200,3 +200,46 @@ def test_final_round_transition_does_not_touch_browser(monkeypatch):
     assert main.transition_browser_for_next_attempt(False) == "final"
     assert resets == []
     assert restarts == []
+
+
+def test_worker_browser_port_scopes_are_disjoint():
+    scopes = [main.browser_auto_port_scope(worker_id) for worker_id in range(1, 11)]
+
+    assert scopes[0] == (9600, 10599)
+    assert scopes[-1] == (18600, 19599)
+    for previous, current in zip(scopes, scopes[1:]):
+        assert previous[1] < current[0]
+
+
+def test_browser_options_isolate_profile_root_by_worker_and_process(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GROK_WORKER_ID", "3")
+    monkeypatch.setattr(main.os, "getpid", lambda: 2468)
+    monkeypatch.setattr(main.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    options = main.create_browser_options()
+
+    assert options.is_auto_port == (11600, 12599)
+    assert options.tmp_path == str(
+        tmp_path / "grok-register-win" / "browser" / "w3-p2468"
+    )
+
+
+def test_repeated_account_transitions_never_restart_a_healthy_browser(monkeypatch):
+    prepare_calls = []
+    restart_calls = []
+    monkeypatch.setattr(
+        main,
+        "prepare_browser_for_next_account",
+        lambda **kwargs: prepare_calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        main, "restart_browser", lambda **kwargs: restart_calls.append(kwargs)
+    )
+
+    results = [main.transition_browser_for_next_attempt(True) for _ in range(20)]
+
+    assert results == ["reused"] * 20
+    assert len(prepare_calls) == 20
+    assert restart_calls == []

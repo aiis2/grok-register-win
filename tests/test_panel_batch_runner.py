@@ -64,6 +64,7 @@ def test_cli_batch_emits_one_start_and_result_pair_per_terminal_round(monkeypatc
     logs = []
     cleanups = []
     events = []
+    browser_starts = []
 
     def capture_log(message):
         logs.append(message)
@@ -71,7 +72,9 @@ def test_cli_batch_emits_one_start_and_result_pair_per_terminal_round(monkeypatc
 
     monkeypatch.setattr(main, "cli_log", capture_log)
     monkeypatch.setattr(main, "get_round_timeout_sec", lambda: 60)
-    monkeypatch.setattr(main, "start_browser", lambda **kwargs: None)
+    monkeypatch.setattr(
+        main, "start_browser", lambda **kwargs: browser_starts.append(kwargs)
+    )
     monkeypatch.setattr(main, "cleanup_runtime_memory", lambda **kwargs: None)
     monkeypatch.setattr(
         main,
@@ -106,6 +109,7 @@ def test_cli_batch_emits_one_start_and_result_pair_per_terminal_round(monkeypatc
     assert "index=5" in starts[1]
     assert len(results) == 2
     assert all("status=success" in line for line in results)
+    assert len(browser_starts) == 1
     assert len(cleanups) == 2
     result_positions = [
         index
@@ -565,3 +569,13 @@ def test_dead_proxy_probe_remains_boolean(monkeypatch):
 def test_panel_has_no_global_browser_leftover_cleanup():
     assert not hasattr(panel_app, "_cleanup_browser_leftovers")
     assert "_run_one_round" not in inspect.getsource(panel_app.job_worker)
+
+
+def test_legacy_tk_gui_routes_all_credentials_through_configured_store():
+    start_source = inspect.getsource(main.GrokRegisterGUI.start_registration)
+    run_source = inspect.getsource(main.GrokRegisterGUI.run_registration)
+
+    assert "create_worker_output_paths" in start_source
+    assert "os.path.dirname(__file__)" not in start_source
+    assert '"mail_credentials.txt"' not in run_source
+    assert "self.mail_credentials_file" in run_source
