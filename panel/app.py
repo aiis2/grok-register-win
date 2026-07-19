@@ -112,6 +112,7 @@ from email_receive_test import (  # type: ignore
 from email_test_senders import sender_capabilities  # type: ignore
 from mail_providers import (  # type: ignore
     make_mailbox,
+    normalize_freemail_api_url,
     normalize_provider as normalize_mail_provider,
     provider_ready,
     resolved_provider_config,
@@ -1071,6 +1072,21 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
     resolved = resolved_provider_config(c)
     provider = normalize_email_provider(c.get("email_provider") or "cfworker")
     cloudflare = normalize_cloudflare_temp_email_config(c)
+    stored_freemail_token = bool(str(c.get("freemail_admin_token") or "").strip())
+    stored_freemail_username = bool(str(c.get("freemail_username") or "").strip())
+    stored_freemail_password = bool(str(c.get("freemail_password") or "").strip())
+    environment_freemail_login = bool(
+        os.environ.get("ADMIN_NAME", "").strip()
+        and os.environ.get("ADMIN_PASSWORD", "").strip()
+    )
+    if stored_freemail_token:
+        freemail_auth_source = "saved_token"
+    elif stored_freemail_username and stored_freemail_password:
+        freemail_auth_source = "saved_login"
+    elif environment_freemail_login:
+        freemail_auth_source = "environment"
+    else:
+        freemail_auth_source = "none"
 
     choices = [
         {"id": "cfworker", "label": "CF Worker / 自建域名"},
@@ -1135,9 +1151,11 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
         "cloudmail_admin_password": str(c.get("cloudmail_admin_password") or "").strip(),
         "cloudmail_domain": str(c.get("cloudmail_domain") or "").strip(),
         "freemail_api_url": str(resolved.get("freemail_api_url") or "").strip(),
-        "freemail_admin_token": str(c.get("freemail_admin_token") or "").strip(),
+        "freemail_admin_token_configured": stored_freemail_token,
         "freemail_username": str(resolved.get("freemail_username") or "").strip(),
-        "freemail_password_configured": bool(str(c.get("freemail_password") or "").strip()),
+        "freemail_password_configured": stored_freemail_password,
+        "freemail_auth_source": freemail_auth_source,
+        "freemail_env_fallback_available": environment_freemail_login,
         "freemail_env_url_available": bool(os.environ.get("MAIL_WEB_URL", "").strip()),
         "freemail_env_username_available": bool(os.environ.get("ADMIN_NAME", "").strip()),
         "freemail_env_password_available": bool(os.environ.get("ADMIN_PASSWORD", "").strip()),
@@ -1216,15 +1234,50 @@ def apply_email_config_from_ui(data: dict) -> dict:
         "luckmail_base_url", "luckmail_api_key", "luckmail_project_code", "luckmail_domain",
         "skymail_api_base", "skymail_token", "skymail_domain",
         "cloudmail_api_base", "cloudmail_admin_email", "cloudmail_admin_password", "cloudmail_domain",
-        "freemail_api_url", "freemail_admin_token", "freemail_username", "freemail_domain",
+        "freemail_api_url", "freemail_username", "freemail_domain",
         "opentrashmail_api_url", "opentrashmail_domain", "opentrashmail_password",
         "laoudo_auth", "laoudo_email", "laoudo_account_id",
     ):
         if key in data or key in cfg:
             cfg[key] = g(key, cfg.get(key, ""))
 
+    secret("freemail_admin_token")
     secret("freemail_password")
     secret("mail_test_smtp_password")
+
+    use_freemail_environment = as_bool(data.get("freemail_use_environment"))
+    if use_freemail_environment:
+        required_environment = {
+            "MAIL_WEB_URL": os.environ.get("MAIL_WEB_URL", "").strip(),
+            "ADMIN_NAME": os.environ.get("ADMIN_NAME", "").strip(),
+            "ADMIN_PASSWORD": os.environ.get("ADMIN_PASSWORD", "").strip(),
+        }
+        missing_environment = [
+            key for key, value in required_environment.items() if not value
+        ]
+        if missing_environment:
+            raise ValueError(
+                "使用环境变量需要配置: " + ", ".join(missing_environment)
+            )
+        for key in (
+            "freemail_api_url",
+            "freemail_admin_token",
+            "freemail_username",
+            "freemail_password",
+        ):
+            cfg[key] = ""
+    else:
+        cfg["freemail_api_url"] = normalize_freemail_api_url(
+            cfg.get("freemail_api_url")
+        )
+
+    normalized_freemail_url = normalize_freemail_api_url(
+        resolved_provider_config(cfg).get("freemail_api_url")
+    )
+    if normalized_freemail_url:
+        parsed_freemail_url = urllib.parse.urlparse(normalized_freemail_url)
+        if parsed_freemail_url.scheme not in ("http", "https") or not parsed_freemail_url.netloc:
+            raise ValueError("Freemail API URL 必须是有效的 http/https 站点根地址")
 
     sender_mode = g("mail_test_sender_mode", "auto").lower()
     if sender_mode not in ("auto", "native", "smtp", "direct_mx"):
@@ -1347,6 +1400,7 @@ _EMAIL_TEST_OVERRIDE_FIELDS = (
     "mail_test_direct_mx_enabled",
 )
 _EMAIL_TEST_SECRET_FIELDS = {
+    "freemail_admin_token",
     "freemail_password",
     "mail_test_smtp_password",
 }
@@ -1368,6 +1422,19 @@ def merge_email_test_config(data: dict, base: Optional[dict] = None) -> dict:
         if key in _EMAIL_TEST_SECRET_FIELDS and not str(value or "").strip():
             continue
         cfg[key] = value.strip() if isinstance(value, str) else value
+    if str(payload.get("freemail_use_environment") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ) or payload.get("freemail_use_environment") is True:
+        for key in (
+            "freemail_api_url",
+            "freemail_admin_token",
+            "freemail_username",
+            "freemail_password",
+        ):
+            cfg[key] = ""
 
     aliases = {"provider_native": "native", "smtp_relay": "smtp"}
     sender_mode = aliases.get(
@@ -2563,8 +2630,8 @@ def start_job(
     node: str = "",
     node_mode: str = "fixed",
 ) -> Tuple[bool, str]:
-    if count < 1 or count > 500:
-        return False, "轮数范围 1-500"
+    if count < 1 or count > 10_000:
+        return False, "轮数范围 1-10000"
     try:
         concurrency = normalize_registration_concurrency(concurrency)
     except ValueError as exc:
@@ -2812,7 +2879,7 @@ INDEX_HTML = r"""
     <h2>启动注册</h2>
     <div class="row">
       <label>轮数
-        <input type="number" id="count" min="1" max="500" value="1"/>
+        <input type="number" id="count" min="1" max="10000" value="1"/>
       </label>
       <label>注册并发度
         <input type="number" id="register_concurrency" min="1" max="10" value="{{ register_concurrency }}"/>
@@ -3058,7 +3125,7 @@ INDEX_HTML = r"""
       </div>
       <div class="row">
         <label style="flex:2">API URL
-          <input type="text" id="freemail_api_url"/>
+          <input type="text" id="freemail_api_url" placeholder="https://mail.example.com（不要包含 /api）"/>
         </label>
         <label>Admin Token
           <input type="password" id="freemail_admin_token"/>
@@ -3073,6 +3140,10 @@ INDEX_HTML = r"""
           <input type="text" id="freemail_domain"/>
         </label>
       </div>
+      <label class="check" style="margin-top:8px">
+        <input type="checkbox" id="freemail_use_environment"/>
+        使用 Windows 环境变量（保存时清除页面 URL、Token、用户名和密码）
+      </label>
     </div>
 
     <div id="box_opentrashmail" class="mail-box" style="display:none;margin-top:10px">
@@ -3416,6 +3487,7 @@ async function loadEmailConfig(){
     _set('freemail_username', e.freemail_username);
     _set('freemail_password', '');
     _set('freemail_domain', e.freemail_domain);
+    _check('freemail_use_environment', false);
     _set('mail_test_sender_mode', e.mail_test_sender_mode||'auto');
     _set('mail_test_timeout_sec', e.mail_test_timeout_sec||90);
     _set('mail_test_smtp_host', e.mail_test_smtp_host);
@@ -3429,6 +3501,10 @@ async function loadEmailConfig(){
     if(freemailPassword){
       freemailPassword.placeholder=e.freemail_password_configured?'已保存；留空不修改':(e.freemail_env_password_available?'使用 ADMIN_PASSWORD 环境变量':'留空表示未配置');
     }
+    const freemailToken=document.getElementById('freemail_admin_token');
+    if(freemailToken){
+      freemailToken.placeholder=e.freemail_admin_token_configured?'已保存；留空不修改':'可选；也可使用账号密码';
+    }
     const smtpPassword=document.getElementById('mail_test_smtp_password');
     if(smtpPassword) smtpPassword.placeholder=e.mail_test_smtp_password_configured?'已保存；留空不修改':'留空表示不使用 SMTP 认证';
     const freemailHint=document.getElementById('freemail_source_hint');
@@ -3437,7 +3513,8 @@ async function loadEmailConfig(){
       if(e.freemail_env_url_available) env.push('MAIL_WEB_URL');
       if(e.freemail_env_username_available) env.push('ADMIN_NAME');
       if(e.freemail_env_password_available) env.push('ADMIN_PASSWORD');
-      freemailHint.textContent=env.length?('当前可用环境变量：'+env.join('、')+'；页面显式配置优先，密钥不会回显。'):'可使用页面配置，或 Windows 环境变量 MAIL_WEB_URL、ADMIN_NAME、ADMIN_PASSWORD。';
+      const source={saved_token:'页面 Admin Token',saved_login:'页面账号密码',environment:'Windows 环境变量',none:'未配置'}[e.freemail_auth_source]||'未知';
+      freemailHint.textContent=(env.length?('当前可用环境变量：'+env.join('、')+'。 '):'')+'当前首选认证：'+source+'；失效页面凭据会回退到有效环境变量。API URL 填站点根地址，不要包含 /api。';
     }
     _set('opentrashmail_api_url', e.opentrashmail_api_url);
     _set('opentrashmail_domain', e.opentrashmail_domain);
@@ -3493,6 +3570,7 @@ function emailConfigPayload(){
     freemail_username: _val('freemail_username'),
     freemail_password: _val('freemail_password'),
     freemail_domain: _val('freemail_domain'),
+    freemail_use_environment: !!document.getElementById('freemail_use_environment').checked,
     mail_test_sender_mode: _val('mail_test_sender_mode'),
     mail_test_timeout_sec: _val('mail_test_timeout_sec'),
     mail_test_smtp_host: _val('mail_test_smtp_host'),
@@ -3551,6 +3629,7 @@ let emailReceiveTestId=sessionStorage.getItem('emailReceiveTestId')||'';
 let emailReceivePollTimer=null;
 let emailReceiveRunning=!!emailReceiveTestId;
 let emailReceiveRegistrationRunning=false;
+let registrationStartPending=false;
 let emailReceiveMustAcknowledge=false;
 let emailReceiveCapabilityReady=false;
 
@@ -3587,10 +3666,10 @@ function setEmailReceiveMessage(text,kind){
 function syncEmailReceiveControls(state){
   const running=state?!!state.running:emailReceiveRunning;
   emailReceiveRunning=running;
-  const fieldIds=['email_provider','btn_email_save','btn_email_test','mail_test_sender_mode','mail_test_timeout_sec','mail_test_smtp_host','mail_test_smtp_port','mail_test_smtp_security','mail_test_smtp_username','mail_test_smtp_password','mail_test_smtp_from','mail_test_direct_mx_enabled','freemail_api_url','freemail_admin_token','freemail_username','freemail_password','freemail_domain'];
+  const fieldIds=['email_provider','btn_email_save','btn_email_test','mail_test_sender_mode','mail_test_timeout_sec','mail_test_smtp_host','mail_test_smtp_port','mail_test_smtp_security','mail_test_smtp_username','mail_test_smtp_password','mail_test_smtp_from','mail_test_direct_mx_enabled','freemail_api_url','freemail_admin_token','freemail_username','freemail_password','freemail_domain','freemail_use_environment'];
   fieldIds.forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=running;});
   const registerButton=document.getElementById('btn_start');
-  if(registerButton) registerButton.disabled=emailReceiveRegistrationRunning||running;
+  if(registerButton) registerButton.disabled=registrationStartPending||emailReceiveRegistrationRunning||running;
   const receiveButton=document.getElementById('btn_email_receive_test');
   if(receiveButton){
     receiveButton.disabled=emailReceiveRegistrationRunning;
@@ -3795,6 +3874,10 @@ async function startJob(){
     toast('注册并发度必须是 1–10 的整数');
     return;
   }
+  if(registrationStartPending) return;
+  registrationStartPending=true;
+  const startButton=document.getElementById('btn_start');
+  if(startButton) startButton.disabled=true;
   try{
     // auto-save email settings before start
     try{ await saveEmailConfig(); }catch(e){}
@@ -3802,8 +3885,11 @@ async function startJob(){
     const j=await api('/api/job/start',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({count, concurrency, browser_engine: document.getElementById('browser_engine').value})});
     toast(j.message||'已启动');
-    poll();
   }catch(e){toast('启动失败: '+e.message)}
+  finally{
+    registrationStartPending=false;
+    await poll();
+  }
 }
 async function stopJob(){
   try{
@@ -3828,7 +3914,7 @@ async function poll(){
     document.getElementById('st_status').textContent=st.status||'idle';
     document.getElementById('st_dot').className='dot'+(st.running?' run':'');
     document.getElementById('st_sf').textContent=`${st.success||0} / ${st.fail||0}`;
-    document.getElementById('btn_start').disabled=!!st.running||emailReceiveRunning;
+    document.getElementById('btn_start').disabled=registrationStartPending||!!st.running||emailReceiveRunning;
     document.getElementById('btn_stop').disabled=!st.running;
     document.getElementById('register_concurrency').disabled=!!st.running;
     document.getElementById('browser_engine').disabled=!!st.running;

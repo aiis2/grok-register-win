@@ -58,6 +58,64 @@ def test_login_http_error_is_raised(monkeypatch):
         mailbox.probe_send_capability()
 
 
+def test_invalid_saved_credentials_fall_back_to_environment_login(monkeypatch):
+    session = FakeSession(
+        [
+            FakeResponse(status_code=401),
+            FakeResponse(status_code=401),
+            FakeResponse({"success": True, "can_send": 1}),
+            FakeResponse({"email": "generated@example.com", "expires": 1}),
+        ]
+    )
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    mailbox = FreemailMailbox(
+        "https://mail.example.com/api",
+        admin_token="stale-token",
+        username="admin",
+        password="stale-password",
+        fallback_username="admin",
+        fallback_password="environment-password",
+    )
+
+    account = mailbox.get_email()
+
+    assert account.email == "generated@example.com"
+    assert [call[:2] for call in session.calls] == [
+        ("GET", "https://mail.example.com/api/session"),
+        ("POST", "https://mail.example.com/api/login"),
+        ("POST", "https://mail.example.com/api/login"),
+        ("GET", "https://mail.example.com/api/generate"),
+    ]
+    assert session.calls[1][2]["json"] == {
+        "username": "admin",
+        "password": "stale-password",
+    }
+    assert session.calls[2][2]["json"] == {
+        "username": "admin",
+        "password": "environment-password",
+    }
+    assert "Authorization" not in session.headers
+
+
+def test_all_configured_freemail_credentials_rejected_has_clear_error(monkeypatch):
+    session = FakeSession(
+        [
+            FakeResponse(status_code=401),
+            FakeResponse(status_code=401),
+        ]
+    )
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    mailbox = FreemailMailbox(
+        "https://mail.example.com",
+        admin_token="stale-token",
+        username="admin",
+        password="stale-password",
+    )
+
+    with pytest.raises(RuntimeError, match="认证失败"):
+        mailbox.get_email()
+
+
 def test_probe_reports_login_send_capability_and_reuses_session(monkeypatch):
     mailbox, session = _mailbox(
         monkeypatch,

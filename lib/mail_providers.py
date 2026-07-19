@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 from typing import Any, Callable, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -51,8 +52,6 @@ MAIL_PROVIDER_CHOICES = [
 
 ENV_FALLBACKS = {
     "freemail_api_url": "MAIL_WEB_URL",
-    "freemail_username": "ADMIN_NAME",
-    "freemail_password": "ADMIN_PASSWORD",
 }
 
 # active mailbox for wait_for_code
@@ -87,6 +86,20 @@ def normalize_provider(name: str) -> str:
     return aliases.get(p, p or "cfworker")
 
 
+def normalize_freemail_api_url(value: Any) -> str:
+    """Return the Freemail site root, never an endpoint-level ``/api`` URL."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlsplit(raw)
+    path = parsed.path.rstrip("/")
+    while path.lower().endswith("/api"):
+        path = path[:-4].rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+
+
 def resolved_provider_config(config: dict, environ=None) -> dict:
     """Return a copy with supported environment fallbacks applied.
 
@@ -102,14 +115,35 @@ def resolved_provider_config(config: dict, environ=None) -> dict:
             if value:
                 resolved[config_key] = value
 
-    api_url = str(resolved.get("freemail_api_url") or "").strip()
-    if api_url:
-        if "://" not in api_url:
-            api_url = f"https://{api_url}"
-        resolved["freemail_api_url"] = api_url.rstrip("/")
-    for key in ("freemail_username", "freemail_password"):
-        if key in resolved:
-            resolved[key] = str(resolved.get(key) or "").strip()
+    resolved["freemail_api_url"] = normalize_freemail_api_url(
+        resolved.get("freemail_api_url")
+    )
+
+    configured_username = str(resolved.get("freemail_username") or "").strip()
+    configured_password = str(resolved.get("freemail_password") or "").strip()
+    environment_username = str(env.get("ADMIN_NAME") or "").strip()
+    environment_password = str(env.get("ADMIN_PASSWORD") or "").strip()
+    if configured_username and configured_password:
+        primary_username, primary_password = configured_username, configured_password
+    elif environment_username and environment_password:
+        primary_username, primary_password = environment_username, environment_password
+    else:
+        primary_username, primary_password = configured_username, configured_password
+    resolved["freemail_username"] = primary_username
+    resolved["freemail_password"] = primary_password
+
+    has_distinct_environment_login = bool(
+        environment_username
+        and environment_password
+        and (environment_username, environment_password)
+        != (primary_username, primary_password)
+    )
+    resolved["freemail_fallback_username"] = (
+        environment_username if has_distinct_environment_login else ""
+    )
+    resolved["freemail_fallback_password"] = (
+        environment_password if has_distinct_environment_login else ""
+    )
     return resolved
 
 
@@ -151,6 +185,12 @@ def extra_from_config(config: dict) -> dict:
         "freemail_admin_token": str(c.get("freemail_admin_token") or "").strip(),
         "freemail_username": str(c.get("freemail_username") or "").strip(),
         "freemail_password": str(c.get("freemail_password") or "").strip(),
+        "freemail_fallback_username": str(
+            c.get("freemail_fallback_username") or ""
+        ).strip(),
+        "freemail_fallback_password": str(
+            c.get("freemail_fallback_password") or ""
+        ).strip(),
         "freemail_domain": str(c.get("freemail_domain") or "").strip(),
         "maliapi_base_url": str(c.get("maliapi_base_url") or "https://maliapi.215.im/v1").strip(),
         "maliapi_api_key": str(c.get("maliapi_api_key") or c.get("yyds_api_key") or "").strip(),

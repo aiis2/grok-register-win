@@ -238,18 +238,90 @@ def test_public_config_masks_new_sender_secrets_and_reports_sources(monkeypatch)
 
     public = panel_app.email_config_public(
         {
+            "freemail_admin_token": "stored-admin-token",
             "freemail_password": "stored-freemail-password",
             "mail_test_smtp_password": "stored-smtp-password",
         }
     )
 
     assert "freemail_password" not in public
+    assert "freemail_admin_token" not in public
     assert "mail_test_smtp_password" not in public
+    assert public["freemail_admin_token_configured"] is True
     assert public["freemail_password_configured"] is True
     assert public["mail_test_smtp_password_configured"] is True
     assert public["freemail_env_url_available"] is True
     assert public["freemail_env_username_available"] is True
     assert public["freemail_env_password_available"] is True
+
+
+def test_freemail_url_is_normalized_before_persisting(isolated_config):
+    public = panel_app.apply_email_config_from_ui(
+        {
+            "provider": "freemail",
+            "freemail_api_url": "https://mail.example.com/api/",
+        }
+    )
+    saved = json.loads(isolated_config.read_text(encoding="utf-8"))
+
+    assert saved["freemail_api_url"] == "https://mail.example.com"
+    assert public["freemail_api_url"] == "https://mail.example.com"
+
+
+def test_freemail_use_environment_clears_saved_credentials(
+    isolated_config, monkeypatch
+):
+    monkeypatch.setenv("MAIL_WEB_URL", "https://environment.example.com/api")
+    monkeypatch.setenv("ADMIN_NAME", "environment-user")
+    monkeypatch.setenv("ADMIN_PASSWORD", "environment-password")
+    _write_config(
+        isolated_config,
+        {
+            "email_provider": "freemail",
+            "freemail_api_url": "https://configured.example.com/api",
+            "freemail_admin_token": "stale-token",
+            "freemail_username": "configured-user",
+            "freemail_password": "stale-password",
+        },
+    )
+
+    public = panel_app.apply_email_config_from_ui(
+        {
+            "provider": "freemail",
+            "freemail_use_environment": True,
+        }
+    )
+    saved = json.loads(isolated_config.read_text(encoding="utf-8"))
+
+    assert saved["freemail_api_url"] == ""
+    assert saved["freemail_admin_token"] == ""
+    assert saved["freemail_username"] == ""
+    assert saved["freemail_password"] == ""
+    assert public["freemail_api_url"] == "https://environment.example.com"
+    assert public["freemail_auth_source"] == "environment"
+
+
+def test_freemail_panel_exposes_environment_switch_and_url_guidance():
+    html = panel_app.INDEX_HTML
+
+    assert 'id="freemail_use_environment"' in html
+    assert "不要包含 /api" in html
+
+
+def test_blank_mail_test_admin_token_preserves_saved_secret():
+    merged = panel_app.merge_email_test_config(
+        {
+            "provider": "freemail",
+            "freemail_admin_token": "",
+        },
+        base={
+            "email_provider": "freemail",
+            "freemail_api_url": "https://mail.example.com",
+            "freemail_admin_token": "stored-admin-token",
+        },
+    )
+
+    assert merged["freemail_admin_token"] == "stored-admin-token"
 
 
 def test_blank_new_sender_passwords_preserve_existing_values(isolated_config):

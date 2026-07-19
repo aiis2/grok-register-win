@@ -267,6 +267,8 @@ def create_mailbox(
             admin_token=extra.get("freemail_admin_token", ""),
             username=extra.get("freemail_username", ""),
             password=extra.get("freemail_password", ""),
+            fallback_username=extra.get("freemail_fallback_username", ""),
+            fallback_password=extra.get("freemail_fallback_password", ""),
             domain=extra.get("freemail_domain", ""),
             proxy=proxy,
         )
@@ -4563,13 +4565,19 @@ class FreemailMailbox(BaseMailbox):
         admin_token: str = "",
         username: str = "",
         password: str = "",
+        fallback_username: str = "",
+        fallback_password: str = "",
         domain: str = "",
         proxy: str = None,
     ):
-        self.api = api_url.rstrip("/")
+        self.api = str(api_url or "").strip().rstrip("/")
+        while self.api.lower().endswith("/api"):
+            self.api = self.api[:-4].rstrip("/")
         self.admin_token = admin_token
         self.username = username
         self.password = password
+        self.fallback_username = fallback_username
+        self.fallback_password = fallback_password
         self.domain = str(domain or "").strip().lstrip("@")
         self.proxy = build_requests_proxy_config(proxy)
         self._session = None
@@ -4584,20 +4592,57 @@ class FreemailMailbox(BaseMailbox):
             return self._session
         s = requests.Session()
         s.proxies = self.proxy
+        attempted_auth = False
         if self.admin_token:
+            attempted_auth = True
             s.headers.update({"Authorization": f"Bearer {self.admin_token}"})
-            self._login_payload = {"success": True, "can_send": 1}
-        elif self.username and self.password:
+            response = s.get(f"{self.api}/api/session", timeout=15)
+            if response.status_code in (404, 405):
+                self._login_payload = {"success": True, "can_send": 1}
+                self._session = s
+                return s
+            if response.status_code not in (401, 403):
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, dict) and (
+                    payload.get("authenticated") or payload.get("success")
+                ):
+                    self._login_payload = {"success": True, "can_send": 1}
+                    self._session = s
+                    return s
+            s.headers.pop("Authorization", None)
+
+        login_candidates = []
+        for candidate in (
+            (self.username, self.password),
+            (self.fallback_username, self.fallback_password),
+        ):
+            normalized = tuple(str(value or "").strip() for value in candidate)
+            if all(normalized) and normalized not in login_candidates:
+                login_candidates.append(normalized)
+
+        for username, password in login_candidates:
+            attempted_auth = True
             response = s.post(
                 f"{self.api}/api/login",
-                json={"username": self.username, "password": self.password},
+                json={"username": username, "password": password},
                 timeout=15,
             )
+            if response.status_code in (401, 403):
+                if not self.admin_token and len(login_candidates) == 1:
+                    response.raise_for_status()
+                continue
             response.raise_for_status()
             payload = response.json()
-            if not isinstance(payload, dict) or not payload.get("success"):
-                raise RuntimeError("Freemail 登录失败")
-            self._login_payload = payload
+            if isinstance(payload, dict) and payload.get("success"):
+                self._login_payload = payload
+                self._session = s
+                return s
+        if attempted_auth:
+            raise RuntimeError(
+                "Freemail 认证失败：已保存的 Admin Token/账号密码无效，"
+                "请更新凭据或在页面选择使用环境变量"
+            )
         self._session = s
         return s
 

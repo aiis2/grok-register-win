@@ -31,6 +31,8 @@ def isolated_config(tmp_path, monkeypatch):
 def test_panel_contains_concurrency_worker_and_credential_controls():
     html = panel_app.INDEX_HTML
 
+    assert 'id="count"' in html
+    assert 'max="10000"' in html
     assert 'id="register_concurrency"' in html
     assert 'min="1"' in html and 'max="10"' in html
     assert 'id="worker_grid"' in html
@@ -155,6 +157,59 @@ def test_poll_disables_storage_migration_while_registration_runs():
     assert "setCredentialActionsDisabled" in html
     assert "st.running" in html
     assert "cpa.pending" in html
+
+
+def test_start_button_stays_locked_while_start_request_is_in_flight():
+    html = panel_app.INDEX_HTML
+    start_source = html.split("async function startJob(){", 1)[1].split(
+        "async function stopJob(){", 1
+    )[0]
+
+    assert "let registrationStartPending=false;" in html
+    assert "if(registrationStartPending) return;" in start_source
+    assert (
+        start_source.index("registrationStartPending=true;")
+        < start_source.index("await ")
+    )
+    assert "finally{" in start_source
+    assert "registrationStartPending=false;" in start_source
+    assert (
+        "registerButton.disabled=registrationStartPending||"
+        "emailReceiveRegistrationRunning||running;"
+    ) in html
+    assert (
+        "document.getElementById('btn_start').disabled="
+        "registrationStartPending||!!st.running||emailReceiveRunning;"
+    ) in html
+
+
+def test_start_job_accepts_ten_thousand_rounds(tmp_path, monkeypatch):
+    created = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args, daemon):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+            created.append(self)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(panel_app.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(panel_app, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setitem(panel_app._job, "running", False)
+    monkeypatch.setitem(panel_app._job, "stop", False)
+
+    result = panel_app.start_job(10_000, concurrency=10)
+
+    assert result == (True, "已启动")
+    assert len(created) == 1
+    assert panel_app._job["count"] == 10_000
+
+
+def test_start_job_rejects_more_than_ten_thousand_rounds():
+    assert panel_app.start_job(10_001) == (False, "轮数范围 1-10000")
 
 
 def test_start_job_reserves_running_state_before_worker_thread_runs(

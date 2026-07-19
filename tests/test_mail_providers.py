@@ -140,6 +140,35 @@ def test_explicit_freemail_configuration_wins_over_environment():
     assert resolved["freemail_password"] == "configured-password"
 
 
+def test_freemail_api_url_removes_trailing_api_segments():
+    resolved = resolved_provider_config(
+        {"freemail_api_url": " https://mail.example.com/api/api/ "},
+        environ={},
+    )
+
+    assert resolved["freemail_api_url"] == "https://mail.example.com"
+
+
+def test_freemail_keeps_environment_login_as_runtime_fallback(monkeypatch):
+    monkeypatch.setenv("ADMIN_NAME", "environment-user")
+    monkeypatch.setenv("ADMIN_PASSWORD", "environment-password")
+
+    box, provider = make_mailbox(
+        {
+            "freemail_api_url": "https://mail.example.com/api",
+            "freemail_admin_token": "stale-token",
+            "freemail_username": "configured-user",
+            "freemail_password": "stale-password",
+        },
+        "freemail",
+    )
+
+    assert provider == "freemail"
+    assert box.api == "https://mail.example.com"
+    assert box.fallback_username == "environment-user"
+    assert box.fallback_password == "environment-password"
+
+
 def test_freemail_environment_makes_provider_ready(monkeypatch):
     monkeypatch.setenv("MAIL_WEB_URL", "mail.example.com")
 
