@@ -25,7 +25,7 @@ jobs:
               body: `👋 感谢你提交 Pull Request！欢迎成为 Grok Register Win 的贡献者。
 
             我们会尽快审阅。请确保：
-            - ✅ 已阅读 [贡献指南](https://github.com/${{ github.repository }}/blob/main/CONTRIBUTING.md)
+            - ✅ 已阅读 [贡献指南](https://github.com/${{ github.repository }}/blob/${context.payload.repository.default_branch}/CONTRIBUTING.md)
             - ✅ PR 描述完整
             - ✅ 代码符合 PEP 8 规范
 

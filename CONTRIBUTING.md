@@ -19,7 +19,7 @@
 
 ## 🐛 提交 Bug 反馈
 
-通过 [Issues](https://github.com/lingxiaoyiyu-hub/grok-register-win/issues/new?template=bug_report.yml) 提交，请提供：
+通过 [Issues](https://github.com/aiis2/grok-register-win/issues/new?template=bug_report.yml) 提交，请提供：
 
 - 软件版本号
 - 操作系统信息
@@ -27,7 +27,9 @@
 - 邮箱源
 - 清晰的问题描述
 - 复现步骤
-- 日志（注意隐藏敏感信息）
+- 日志（必须隐藏 API Key、邮箱 JWT、SSO/Cookie、代理密码和真实邮箱）
+
+请勿上传 `config.json`、`accounts_*.txt`、`mail_credentials.txt` 或完整的 `data/logs/`。建议只粘贴经过删减和脱敏的相关日志片段。
 
 ---
 
@@ -44,13 +46,13 @@
    ```bash
    python -m venv .venv
    .venv\Scripts\activate
-   pip install -r requirements.txt
+   pip install -r requirements-dev.txt
    ```
 
 ### 提交 PR
 
 1. **创建分支**：`git checkout -b feature/your-feature-name`
-2. **做出修改**并测试
+2. **做出修改**并运行 `python -m pytest -q` 与 `python -m compileall -q grok_register_ttk.py launcher.py panel lib tests`
 3. **提交**：`git commit -m 'feat: 添加 xxx 功能'`
 4. **推送**：`git push origin feature/your-feature-name`
 5. **提交 Pull Request**
@@ -81,6 +83,6 @@
 
 ## ❓ 有问题？
 
-欢迎在 [Discussions](https://github.com/lingxiaoyiyu-hub/grok-register-win/discussions) 中提问。
+欢迎在 [Discussions](https://github.com/aiis2/grok-register-win/discussions) 中提问。
 
 感谢你的贡献！💖

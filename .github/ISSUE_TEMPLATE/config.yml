@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: 使用讨论 / 提问
-    url: https://github.com/lingxiaoyiyu-hub/grok-register-win/discussions
+    url: https://github.com/aiis2/grok-register-win/discussions
     about: 非 bug 或功能建议的讨论，欢迎到 Discussions 区交流
   - name: 安全漏洞报告
-    url: https://github.com/lingxiaoyiyu-hub/grok-register-win/security
+    url: https://github.com/aiis2/grok-register-win/security/advisories/new
     about: 安全相关问题请按 SECURITY.md 流程私下报告，不要在 Issue 公开讨论

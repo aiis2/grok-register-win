@@ -6,8 +6,10 @@
 
 ### 报告方式
 
-1. **GitHub 安全公告**（推荐）：前往仓库页面，点击 **Security** → **Report a vulnerability** 提交
-2. **邮箱**：将漏洞详情发送至仓库维护者
+1. **GitHub 安全公告**（推荐）：通过 [私密漏洞报告](https://github.com/aiis2/grok-register-win/security/advisories/new) 提交
+2. 若私密报告不可用，请先在仓库主页联系维护者；不要在公开 Issue / Discussion 中披露细节
+
+报告前请删除 API Key、管理员密码、邮箱地址 JWT、Grok SSO/Cookie、代理凭据和真实邮箱。不要附上原始 `config.json`、账号导出文件或未脱敏日志。
 
 ### 报告内容
 

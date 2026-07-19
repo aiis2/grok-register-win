@@ -6,16 +6,16 @@
 
 ### Windows 下双击即用的 Grok（xAI）账号自动注册面板
 
-[![Version](https://img.shields.io/badge/version-v1.2.0-blue?style=for-the-badge)](https://github.com/lingxiaoyiyu-hub/grok-register-win/releases)
+[![Version](https://img.shields.io/badge/version-v1.3.0-blue?style=for-the-badge)](https://github.com/aiis2/grok-register-win/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey?style=for-the-badge)](#环境要求)
 [![Python](https://img.shields.io/badge/python-3.10+-yellow?style=for-the-badge)](https://www.python.org/downloads/)
-[![Stars](https://img.shields.io/github/stars/lingxiaoyiyu-hub/grok-register-win?style=for-the-badge&label=stars)](https://github.com/lingxiaoyiyu-hub/grok-register-win/stargazers)
-[![Downloads](https://img.shields.io/github/downloads/lingxiaoyiyu-hub/grok-register-win/total?style=for-the-badge&label=downloads)](https://github.com/lingxiaoyiyu-hub/grok-register-win/releases)
-[![Forks](https://img.shields.io/github/forks/lingxiaoyiyu-hub/grok-register-win?style=for-the-badge&label=forks)](https://github.com/lingxiaoyiyu-hub/grok-register-win/network/members)
-[![Issues](https://img.shields.io/github/issues/lingxiaoyiyu-hub/grok-register-win?style=for-the-badge&label=issues)](https://github.com/lingxiaoyiyu-hub/grok-register-win/issues)
-[![Last Commit](https://img.shields.io/github/last-commit/lingxiaoyiyu-hub/grok-register-win?style=for-the-badge&label=last%20commit)](https://github.com/lingxiaoyiyu-hub/grok-register-win/commits)
-[![Contributors](https://img.shields.io/github/contributors/lingxiaoyiyu-hub/grok-register-win?style=for-the-badge&label=contributors)](https://github.com/lingxiaoyiyu-hub/grok-register-win/graphs/contributors)
+[![Stars](https://img.shields.io/github/stars/aiis2/grok-register-win?style=for-the-badge&label=stars)](https://github.com/aiis2/grok-register-win/stargazers)
+[![Downloads](https://img.shields.io/github/downloads/aiis2/grok-register-win/total?style=for-the-badge&label=downloads)](https://github.com/aiis2/grok-register-win/releases)
+[![Forks](https://img.shields.io/github/forks/aiis2/grok-register-win?style=for-the-badge&label=forks)](https://github.com/aiis2/grok-register-win/network/members)
+[![Issues](https://img.shields.io/github/issues/aiis2/grok-register-win?style=for-the-badge&label=issues)](https://github.com/aiis2/grok-register-win/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/aiis2/grok-register-win?style=for-the-badge&label=last%20commit)](https://github.com/aiis2/grok-register-win/commits)
+[![Contributors](https://img.shields.io/github/contributors/aiis2/grok-register-win?style=for-the-badge&label=contributors)](https://github.com/aiis2/grok-register-win/graphs/contributors)
 
 <br>
 
@@ -62,8 +62,8 @@
 ## ✨ 功能
 
 - **🌐 代理**：复用本机 Clash，自动探测端口（Clash Verge 默认 `7897`）
-- **🤖 注册引擎**：Chromium 有头 / Camoufox 无头反检测，面板下拉切换
-- **📧 邮箱**：面板下拉多邮箱源（CF Worker / MoeMail / TempMail.lol / DuckMail / GPTMail / LuckMail / MaliAPI 等）；公共 Tempmailer 已移除
+- **🤖 注册引擎**：Chromium 有头 / Camoufox 无头反检测，面板下拉切换；有头批次复用同一浏览器进程
+- **📧 邮箱**：原生支持 `cloudflare_temp_email`，另有 CF Worker / MoeMail / TempMail.lol / DuckMail / GPTMail / LuckMail / MaliAPI 等；公共 Tempmailer 已移除
 - **🔄 SSO → CPA**：注册成功后自动把 web SSO 换成 CLIProxyAPI 可用的 OAuth JSON
 - **🔞 NSFW 自动开启**：注册成功后自动设置 ToS、生日、NSFW 偏好
 - **📦 产物下载**（同一批账号，三种格式，不重复注册/换票）：
@@ -112,11 +112,12 @@
   "proxy": "http://127.0.0.1:7897",
   "allow_proxy_fallback": false,
   "browser_engine": "chromium",
-  "email_provider": "cfworker",
+  "email_provider": "cloudflare_temp_email",
   "email_failover": true,
-  "cfworker_api_url": "https://apimail.example.com",
-  "cfworker_admin_token": "your-admin-token",
-  "cfworker_domain": "mail.example.com",
+  "cloudflare_api_base": "https://mail.example.com",
+  "cloudflare_admin_password": "your-admin-password",
+  "cloudflare_domain": "mail.example.com",
+  "cloudflare_site_password": "",
   "register_count": 1,
   "round_timeout_sec": 300
 }
@@ -127,7 +128,11 @@
 | `proxy` | Clash 代理地址；端口不通时启动会自动探测并写回 |
 | `allow_proxy_fallback` | 代理失败是否回退直连，默认 `false` |
 | `browser_engine` | `chromium`（有头，默认）或 `camoufox`（无头反检测） |
-| `email_provider` | 邮箱源 id（如 `cfworker` / `moemail` / `tempmail_lol` / `luckmail`） |
+| `email_provider` | 邮箱源 id（如 `cloudflare_temp_email` / `cfworker` / `moemail` / `luckmail`） |
+| `cloudflare_api_base` | `cloudflare_temp_email` 服务根地址 |
+| `cloudflare_admin_password` | 管理员密码，对应 `x-admin-auth` |
+| `cloudflare_domain` | 创建临时地址时使用的域名 |
+| `cloudflare_site_password` | 可选站点访问密码，对应 `x-custom-auth` |
 | `cfworker_api_url` | CF Worker / 自建 API 根地址（选 cfworker 时） |
 | `cfworker_admin_token` | 管理 Token |
 | `cfworker_domain` | 邮箱域名 |
@@ -148,7 +153,7 @@
 | 标识 | 名称 | 说明 |
 | :--- | :--- | :--- |
 | `cfworker` | CF Worker / 自建域名 | **推荐**，需 API URL + Admin Token |
-| `cloudflare` | cloudflare_temp_email | 自建兼容接口（路径可配） |
+| `cloudflare_temp_email` | Cloudflare Temp Email | 原生协议：管理员创建地址、地址 JWT 收信与删除 |
 | `moemail` | MoeMail | 临时邮 API（sall.cc 等） |
 | `tempmail_lol` | TempMail.lol | 免 key 自动生成（可能被 xAI 拒） |
 | `duckmail` | DuckMail | 临时邮 |
@@ -163,6 +168,32 @@
 收码流程：申请邮箱 → 快照旧信 `before_ids` → 轮询收信 → 提取 Grok 验证码（`ABC-DEF`）。
 
 **建议优先自建（cfworker / cloudflare_temp_email）**；公共源仅作备选，不保证能收 xAI 信。
+
+#### Cloudflare Temp Email 配置
+
+面板选择 **Cloudflare Temp Email / 自建域名** 后填写四项：
+
+| 面板字段 | 配置键 | 必填 | 用途 |
+| :--- | :--- | :---: | :--- |
+| API 根地址 | `cloudflare_api_base` | 是 | 服务部署地址，例如 `https://mail.example.com` |
+| 管理员密码 | `cloudflare_admin_password` | 是 | 调用 `/admin/new_address` 的 `x-admin-auth` |
+| 域名 | `cloudflare_domain` | 是 | 创建临时地址的域名 |
+| 站点访问密码 | `cloudflare_site_password` | 否 | 服务开启访问密码时发送 `x-custom-auth` |
+
+“测试连接”只读取 `/open_api/settings`（兼容回退 `/api/settings`），不会创建临时地址。运行时通过地址 JWT 读取 `/api/parsed_mails`，仅在端点不存在时回退 `/api/mails`，结束后优先用地址 JWT 删除地址。
+
+旧配置会自动迁移：provider `cloudflare` 映射为 `cloudflare_temp_email`，`cloudflare_api_key`、`defaultDomains`、`cfworker_custom_auth` 分别作为管理员密码、域名、站点密码的兼容回退。新字段优先，通用 `cfworker` 适配器继续使用自己的独立配置。
+
+### 🌐 有头浏览器复用与进程回收
+
+Chromium 有头模式现在以一个 CLI 进程处理整批账号：每轮结束关闭多余标签页，清理 Cookie、缓存和站点存储，再让同一浏览器进入下一轮。以下情况才会重启：
+
+- 浏览器断连或健康重置失败；
+- 代理模式发生切换；
+- 每五个成功账号执行计划内存回收；
+- 单账号达到 `round_timeout_sec` 硬超时。
+
+最后一轮不会再启动一个无用浏览器。正常关闭使用启动时记录的 Chromium 根 PID 和资料目录；超时时面板只终止自己启动的 CLI 进程树，不再按浏览器名称、窗口标题或全局 `pkill` 清理，因此不会误伤用户自己的 Chrome/Edge。
 
 ### 🌍 环境变量（高级）
 
@@ -243,7 +274,7 @@ grok-register-win/
 <summary><b>📧 邮箱设置保存失败</b></summary>
 <br>
 
-- 请使用 **v1.2.0+**，并强制刷新面板（Ctrl+F5）
+- 请使用 **v1.3.0+**，并强制刷新面板（Ctrl+F5）
 - 旧版若残留重复 `saveEmailConfig` 会把所有源保存成 custom 导致失败
 - 选 CF Worker / LuckMail 等需填写对应 API/Key；TempMail.lol / MoeMail 可先空 Key 保存
 </details>
@@ -272,6 +303,14 @@ grok-register-win/
 
 <details>
 <summary><b>查看完整更新日志</b></summary>
+
+### v1.3.0（2026-07-19）
+- 原生集成 `dreamhunter2333/cloudflare_temp_email` 创建、解析收信、限流重试与地址清理协议
+- 面板增加四字段专用配置、旧配置迁移和只读连接测试
+- Chromium 有头批次复用同一浏览器，健康失败时才重启
+- 面板改为一个 CLI 处理整批账号，以结构化轮次标记实施逐账号超时监督
+- 删除窗口标题 / 进程名全局清理，仅终止本任务记录的 PID 树
+- 新增 Windows CI 与邮箱、面板、浏览器生命周期、批处理监督单元测试
 
 ### v1.2.0（2026-07-18）
 - **多邮箱源下拉（重大更新）**：接入 any-auto-register 邮箱/接码体系
@@ -339,9 +378,9 @@ grok-register-win/
 
 | 类型 | 途径 |
 | :--- | :--- |
-| 🐛 **Bug 反馈** | 提交 [Issue](https://github.com/lingxiaoyiyu-hub/grok-register-win/issues/new?template=bug_report.yml) |
-| 💡 **功能建议** | 提交 [Issue](https://github.com/lingxiaoyiyu-hub/grok-register-win/issues/new?template=feature_request.yml) |
-| ❓ **使用提问** | 在 [Discussions](https://github.com/lingxiaoyiyu-hub/grok-register-win/discussions) 中讨论 |
+| 🐛 **Bug 反馈** | 提交 [Issue](https://github.com/aiis2/grok-register-win/issues/new?template=bug_report.yml) |
+| 💡 **功能建议** | 提交 [Issue](https://github.com/aiis2/grok-register-win/issues/new?template=feature_request.yml) |
+| ❓ **使用提问** | 在 [Discussions](https://github.com/aiis2/grok-register-win/discussions) 中讨论 |
 
 ---
 
@@ -362,6 +401,12 @@ grok-register-win/
 
 本项目基于 [MIT License](LICENSE) 发布。若上游组件另有协议，以对应文件为准。
 
+本仓库保留原始提交历史和 MIT 版权声明，并感谢以下项目：
+
+- [lingxiaoyiyu-hub/grok-register-win](https://github.com/lingxiaoyiyu-hub/grok-register-win)：本 Windows 面板的上游项目；
+- [huslx/grokzhuce](https://github.com/huslx/grokzhuce)：邮箱接入与注册流程的对照实现；
+- [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)：本次原生适配的临时邮箱服务及 API 协议来源。
+
 ---
 
 <div align="center">
@@ -370,16 +415,16 @@ grok-register-win/
 
 <br>
 
-<a href="https://github.com/lingxiaoyiyu-hub/grok-register-win/stargazers">
-  <img src="https://img.shields.io/github/stars/lingxiaoyiyu-hub/grok-register-win?style=social" alt="Stars">
+<a href="https://github.com/aiis2/grok-register-win/stargazers">
+  <img src="https://img.shields.io/github/stars/aiis2/grok-register-win?style=social" alt="Stars">
 </a>
 &nbsp;
-<a href="https://github.com/lingxiaoyiyu-hub/grok-register-win/network/members">
-  <img src="https://img.shields.io/github/forks/lingxiaoyiyu-hub/grok-register-win?style=social" alt="Forks">
+<a href="https://github.com/aiis2/grok-register-win/network/members">
+  <img src="https://img.shields.io/github/forks/aiis2/grok-register-win?style=social" alt="Forks">
 </a>
 &nbsp;
-<a href="https://github.com/lingxiaoyiyu-hub/grok-register-win/watchers">
-  <img src="https://img.shields.io/github/watchers/lingxiaoyiyu-hub/grok-register-win?style=social" alt="Watchers">
+<a href="https://github.com/aiis2/grok-register-win/watchers">
+  <img src="https://img.shields.io/github/watchers/aiis2/grok-register-win?style=social" alt="Watchers">
 </a>
 
 </div>
