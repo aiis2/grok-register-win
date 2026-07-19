@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from base_mailbox import CloudflareTempEmailMailbox
+from base_mailbox import CloudflareTempEmailMailbox, MailboxAccount
 
 
 @dataclass
@@ -133,3 +133,215 @@ def test_create_address_error_does_not_leak_configured_secrets(monkeypatch):
     assert "top-secret-admin" not in message
     assert "top-secret-site" not in message
     assert "HTTP 403" in message
+
+
+def test_poll_parsed_mails_uses_address_jwt_and_skips_existing_ids(monkeypatch):
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(
+            200,
+            {
+                "results": [
+                    {"id": 1, "subject": "OLD-111 xAI confirmation code"},
+                    {
+                        "id": 2,
+                        "subject": "UTF-6PW xAI confirmation code",
+                        "text": "Use this confirmation code.",
+                    },
+                ]
+            },
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin-secret",
+        domain="example.com",
+        site_password="site-secret",
+    )
+    account = MailboxAccount(
+        email="alice@example.com",
+        account_id="address-jwt",
+        extra={"jwt": "address-jwt"},
+    )
+
+    code = box.wait_for_code(
+        account,
+        timeout=1,
+        before_ids={"1"},
+        code_pattern=r"[A-Z0-9]{3}-[A-Z0-9]{3}",
+    )
+
+    assert code == "UTF-6PW"
+    assert len(calls) == 1
+    method, url, kwargs = calls[0]
+    assert (method, url) == (
+        "GET",
+        "https://mail.example.com/api/parsed_mails",
+    )
+    assert kwargs["params"] == {"limit": 10, "offset": 0}
+    assert kwargs["headers"]["Authorization"] == "Bearer address-jwt"
+    assert kwargs["headers"]["x-custom-auth"] == "site-secret"
+    assert "x-admin-auth" not in kwargs["headers"]
+
+
+def test_poll_parsed_mails_ignores_mail_before_otp_timestamp(monkeypatch):
+    def fake_request(method, url, **kwargs):
+        return FakeResponse(
+            200,
+            {
+                "results": [
+                    {
+                        "id": 1,
+                        "created_at": "2026-07-19T00:00:00+00:00",
+                        "subject": "OLD-111 xAI confirmation code",
+                    },
+                    {
+                        "id": 2,
+                        "created_at": "2026-07-19T00:01:00+00:00",
+                        "subject": "NEW-222 xAI confirmation code",
+                    },
+                ]
+            },
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin",
+        domain="example.com",
+    )
+    account = MailboxAccount("alice@example.com", "address-jwt")
+
+    code = box.wait_for_code(
+        account,
+        timeout=1,
+        code_pattern=r"[A-Z0-9]{3}-[A-Z0-9]{3}",
+        otp_sent_at=1784419230.0,
+    )
+
+    assert code == "NEW-222"
+
+
+def test_poll_falls_back_to_raw_mails_only_when_parsed_endpoint_missing(monkeypatch):
+    calls = []
+    responses = iter(
+        [
+            FakeResponse(404, {"error": "not found"}, "not found"),
+            FakeResponse(
+                200,
+                {
+                    "results": [
+                        {
+                            "id": 9,
+                            "raw": (
+                                "Subject: xAI confirmation\r\n"
+                                "Content-Type: text/plain\r\n\r\n"
+                                "Your verification code is RAW-123"
+                            ),
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin",
+        domain="example.com",
+    )
+
+    code = box.wait_for_code(
+        MailboxAccount("alice@example.com", "address-jwt"),
+        timeout=1,
+        code_pattern=r"[A-Z0-9]{3}-[A-Z0-9]{3}",
+    )
+
+    assert code == "RAW-123"
+    assert [call[1] for call in calls] == [
+        "https://mail.example.com/api/parsed_mails",
+        "https://mail.example.com/api/mails",
+    ]
+
+
+def test_poll_retries_rate_limit_without_falling_back(monkeypatch):
+    calls = []
+    responses = iter(
+        [
+            FakeResponse(429, {"error": "rate limited"}, "rate limited"),
+            FakeResponse(
+                200,
+                {"results": [{"id": 4, "subject": "TRY-789 xAI confirmation code"}]},
+            ),
+        ]
+    )
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin",
+        domain="example.com",
+    )
+    monkeypatch.setattr(box, "_sleep_with_checkpoint", lambda seconds: None)
+
+    code = box.wait_for_code(
+        MailboxAccount("alice@example.com", "address-jwt"),
+        timeout=1,
+        code_pattern=r"[A-Z0-9]{3}-[A-Z0-9]{3}",
+    )
+
+    assert code == "TRY-789"
+    assert len(calls) == 2
+    assert all(call[1].endswith("/api/parsed_mails") for call in calls)
+
+
+def test_get_current_ids_uses_parsed_mailbox(monkeypatch):
+    def fake_request(method, url, **kwargs):
+        return FakeResponse(200, {"results": [{"id": 12}, {"id": "13"}]})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin",
+        domain="example.com",
+    )
+
+    ids = box.get_current_ids(MailboxAccount("alice@example.com", "address-jwt"))
+
+    assert ids == {"12", "13"}
+
+
+def test_poll_does_not_fallback_on_server_error(monkeypatch):
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(500, {"error": "broken"}, "broken")
+
+    monkeypatch.setattr("requests.request", fake_request)
+    box = CloudflareTempEmailMailbox(
+        api_base="https://mail.example.com",
+        admin_password="admin-secret",
+        domain="example.com",
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        box.wait_for_code(
+            MailboxAccount("alice@example.com", "address-jwt"),
+            timeout=1,
+            code_pattern=r"[A-Z0-9]{3}-[A-Z0-9]{3}",
+        )
+
+    assert len(calls) == 1

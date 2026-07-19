@@ -2273,6 +2273,291 @@ class OpenTrashMailMailbox(BaseMailbox):
         )
 
 
+class CloudflareTempEmailRequestError(RuntimeError):
+    def __init__(self, path: str, status_code: int):
+        self.path = path
+        self.status_code = int(status_code)
+        super().__init__(
+            f"Cloudflare Temp Email {path} 请求失败: HTTP {self.status_code}"
+        )
+
+
+class CloudflareTempEmailMailbox(BaseMailbox):
+    """dreamhunter2333/cloudflare_temp_email protocol adapter."""
+
+    def __init__(
+        self,
+        api_base: str,
+        admin_password: str,
+        domain: str,
+        site_password: str = "",
+        proxy: str = None,
+    ):
+        base = str(api_base or "").strip().rstrip("/")
+        if base and not base.lower().startswith(("http://", "https://")):
+            base = f"https://{base}"
+        self.api_base = base
+        self.admin_password = str(admin_password or "").strip()
+        self.domain = self._normalize_domain(domain)
+        self.site_password = str(site_password or "").strip()
+        self.proxy = build_requests_proxy_config(proxy)
+
+    @staticmethod
+    def _normalize_domain(value: Any) -> str:
+        return str(value or "").strip().lower().lstrip("@")
+
+    @staticmethod
+    def _random_name(length: int = 12) -> str:
+        import string
+
+        alphabet = string.ascii_lowercase + string.digits
+        return "".join(random.choices(alphabet, k=length))
+
+    def _validate_config(self) -> None:
+        if not self.api_base:
+            raise RuntimeError("Cloudflare Temp Email API Base 未配置")
+        if not self.admin_password:
+            raise RuntimeError("Cloudflare Temp Email Admin 密码未配置")
+        if not self.domain:
+            raise RuntimeError("Cloudflare Temp Email domain 未配置")
+
+    def _admin_headers(self) -> dict:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-admin-auth": self.admin_password,
+            "x-lang": "zh",
+        }
+        if self.site_password:
+            headers["x-custom-auth"] = self.site_password
+        return headers
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: Optional[dict] = None,
+        params: Optional[dict] = None,
+        payload: Optional[dict] = None,
+        timeout: int = 15,
+    ):
+        import requests
+
+        response = requests.request(
+            method,
+            f"{self.api_base}{path}",
+            headers=headers or {},
+            params=params,
+            json=payload,
+            proxies=self.proxy,
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            raise CloudflareTempEmailRequestError(path, response.status_code)
+        try:
+            return response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cloudflare Temp Email {path} 返回非 JSON 响应"
+            ) from exc
+
+    def get_email(self) -> MailboxAccount:
+        self._validate_config()
+        data = self._request_json(
+            "POST",
+            "/admin/new_address",
+            headers=self._admin_headers(),
+            payload={
+                "name": self._random_name(),
+                "domain": self.domain,
+                "enablePrefix": False,
+            },
+            timeout=15,
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError("Cloudflare Temp Email 创建地址返回格式无效")
+        address = str(data.get("address") or "").strip()
+        jwt = str(data.get("jwt") or "").strip()
+        if not address or not jwt:
+            raise RuntimeError(
+                "Cloudflare Temp Email 创建地址响应缺少 address/jwt"
+            )
+        self._log(f"[Cloudflare Temp Email] 已创建地址: {address}")
+        return MailboxAccount(
+            email=address,
+            account_id=jwt,
+            extra={"address_id": data.get("address_id"), "jwt": jwt},
+        )
+
+    def _address_headers(self, jwt: str) -> dict:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {jwt}",
+            "x-lang": "zh",
+        }
+        if self.site_password:
+            headers["x-custom-auth"] = self.site_password
+        return headers
+
+    @staticmethod
+    def _address_jwt(account: MailboxAccount) -> str:
+        extra = account.extra if isinstance(account.extra, dict) else {}
+        return str(extra.get("jwt") or account.account_id or "").strip()
+
+    @staticmethod
+    def _mail_results(data: Any) -> list:
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return []
+        for key in ("results", "messages", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
+    def _fetch_mails(self, account: MailboxAccount) -> tuple[list, bool]:
+        jwt = self._address_jwt(account)
+        if not jwt:
+            raise RuntimeError("Cloudflare Temp Email 地址 JWT 缺失")
+        headers = self._address_headers(jwt)
+        params = {"limit": 10, "offset": 0}
+        try:
+            data = self._request_json(
+                "GET",
+                "/api/parsed_mails",
+                headers=headers,
+                params=params,
+                timeout=15,
+            )
+            return self._mail_results(data), True
+        except CloudflareTempEmailRequestError as exc:
+            if exc.status_code not in (404, 405):
+                raise
+        data = self._request_json(
+            "GET",
+            "/api/mails",
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+        return self._mail_results(data), False
+
+    @staticmethod
+    def _message_id(mail: dict) -> str:
+        for key in ("id", "message_id", "mail_id"):
+            value = mail.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _message_timestamp(mail: dict) -> Optional[float]:
+        from datetime import datetime, timezone
+
+        for key in ("created_at", "createdAt", "received_at", "date"):
+            value = mail.get(key)
+            if value in (None, ""):
+                continue
+            if isinstance(value, (int, float)):
+                raw = float(value)
+                return raw / 1000 if raw > 10_000_000_000 else raw
+            text = str(value).strip()
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        return None
+
+    def _message_text(self, mail: dict, parsed: bool) -> str:
+        fields = [
+            str(mail.get("subject") or ""),
+            str(mail.get("text") or ""),
+            str(mail.get("html") or ""),
+        ]
+        if not parsed:
+            raw = str(mail.get("raw") or mail.get("source") or "")
+            fields.append(self._decode_raw_content(raw))
+        return "\n".join(value for value in fields if value).strip()
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        mails, _ = self._fetch_mails(account)
+        return {
+            message_id
+            for mail in mails
+            if isinstance(mail, dict)
+            for message_id in (self._message_id(mail),)
+            if message_id
+        }
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        seen = {str(value) for value in (before_ids or set()) if value is not None}
+        exclude_codes = {
+            str(value) for value in (kwargs.get("exclude_codes") or set()) if value
+        }
+        otp_sent_at = kwargs.get("otp_sent_at")
+        otp_cutoff = float(otp_sent_at) - 2 if otp_sent_at else None
+        poll_interval = 2.0
+
+        def poll_once() -> Optional[str]:
+            try:
+                mails, parsed = self._fetch_mails(account)
+            except CloudflareTempEmailRequestError as exc:
+                if exc.status_code == 429:
+                    self._log(
+                        "[Cloudflare Temp Email] 收信接口限流，稍后重试"
+                    )
+                    return None
+                raise
+
+            for mail in mails:
+                if not isinstance(mail, dict):
+                    continue
+                message_id = self._message_id(mail)
+                if message_id and message_id in seen:
+                    continue
+                timestamp = self._message_timestamp(mail)
+                if otp_cutoff is not None and timestamp is not None:
+                    if timestamp < otp_cutoff:
+                        if message_id:
+                            seen.add(message_id)
+                        continue
+                if message_id:
+                    seen.add(message_id)
+                text = self._message_text(mail, parsed)
+                if keyword and keyword.lower() not in text.lower():
+                    continue
+                code = self._safe_extract(text, code_pattern)
+                if code and code not in exclude_codes:
+                    self._log(
+                        f"[Cloudflare Temp Email] 收到验证码: {code}"
+                    )
+                    return code
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=poll_interval,
+            poll_once=poll_once,
+            timeout_message=f"等待 Cloudflare Temp Email 验证码超时 ({timeout}s)",
+        )
+
+
 class CFWorkerMailbox(BaseMailbox):
     """Cloudflare Worker 自建临时邮箱服务"""
 
