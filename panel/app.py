@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -102,7 +103,19 @@ from credential_store import (  # type: ignore
     migrate_credentials,
     normalize_credentials_setting,
 )
-from mail_providers import resolved_provider_config  # type: ignore
+from email_receive_test import (  # type: ignore
+    ReceiveTestCancelled,
+    ReceiveTestError,
+    run_email_receive_test,
+    sanitize_receive_test_error,
+)
+from email_test_senders import sender_capabilities  # type: ignore
+from mail_providers import (  # type: ignore
+    make_mailbox,
+    normalize_provider as normalize_mail_provider,
+    provider_ready,
+    resolved_provider_config,
+)
 
 try:
     from sso2cpa_core import (  # type: ignore
@@ -257,6 +270,7 @@ def _active_credential_files(layout: CredentialLayout) -> List[Path]:
 
 # --------------- job state ---------------
 _job_lock = threading.Lock()
+_activity_lock = threading.Lock()
 _credential_migration_lock = threading.Lock()
 _job: Dict = {
     "running": False,
@@ -282,6 +296,197 @@ _job: Dict = {
 _logs: Deque[str] = deque(maxlen=2000)
 _procs: Dict[int, subprocess.Popen] = {}
 _terminated_processes: Set[int] = set()
+
+# --------------- mailbox receive test state ---------------
+EMAIL_RECEIVE_TEST_TTL_SEC = 600
+_email_receive_test_lock = threading.Lock()
+_email_receive_tests: Dict[str, Dict] = {}
+_email_receive_cancel_events: Dict[str, threading.Event] = {}
+_email_receive_active_id: Optional[str] = None
+
+
+def _prune_email_receive_tests_locked(now: Optional[float] = None) -> None:
+    global _email_receive_active_id
+    current = time.time() if now is None else float(now)
+    expired = [
+        test_id
+        for test_id, state in _email_receive_tests.items()
+        if not state.get("running")
+        and state.get("finished_epoch") is not None
+        and current - float(state["finished_epoch"]) > EMAIL_RECEIVE_TEST_TTL_SEC
+    ]
+    for test_id in expired:
+        _email_receive_tests.pop(test_id, None)
+        _email_receive_cancel_events.pop(test_id, None)
+        if _email_receive_active_id == test_id:
+            _email_receive_active_id = None
+
+
+def email_receive_test_is_running() -> bool:
+    with _email_receive_test_lock:
+        _prune_email_receive_tests_locked()
+        if not _email_receive_active_id:
+            return False
+        state = _email_receive_tests.get(_email_receive_active_id) or {}
+        return bool(state.get("running"))
+
+
+def email_receive_test_snapshot(test_id: str) -> Optional[dict]:
+    with _email_receive_test_lock:
+        _prune_email_receive_tests_locked()
+        state = _email_receive_tests.get(str(test_id or ""))
+        return copy.deepcopy(state) if state is not None else None
+
+
+def _update_email_receive_stage(test_id: str, stage: str, detail: dict) -> None:
+    allowed = {
+        "provider",
+        "sender_mode",
+        "email",
+        "error",
+        "error_stage",
+        "cleanup",
+        "warnings",
+        "total_sec",
+        "receive_sec",
+    }
+    with _email_receive_test_lock:
+        state = _email_receive_tests.get(test_id)
+        if state is None:
+            return
+        state["status"] = str(stage)
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        for key in allowed:
+            if key in (detail or {}):
+                state[key] = copy.deepcopy(detail[key])
+        if stage in ("succeeded", "failed", "cancelled"):
+            state["running"] = False
+            state["cancelable"] = False
+
+
+def _email_receive_test_worker(test_id: str, private_config: dict) -> None:
+    global _email_receive_active_id
+    event = _email_receive_cancel_events.get(test_id) or threading.Event()
+    try:
+        result = run_email_receive_test(
+            private_config,
+            on_stage=lambda stage, detail: _update_email_receive_stage(
+                test_id, stage, detail
+            ),
+            cancelled=event.is_set,
+        )
+        _update_email_receive_stage(test_id, "succeeded", result)
+    except ReceiveTestCancelled as exc:
+        _update_email_receive_stage(
+            test_id,
+            "cancelled",
+            {"error": str(exc), "error_stage": exc.stage},
+        )
+    except ReceiveTestError as exc:
+        _update_email_receive_stage(
+            test_id,
+            "failed",
+            {"error": str(exc), "error_stage": exc.stage},
+        )
+    except Exception as exc:  # defensive boundary for the background thread
+        _update_email_receive_stage(
+            test_id,
+            "failed",
+            {
+                "error": sanitize_receive_test_error(exc, config=private_config),
+                "error_stage": "checking",
+            },
+        )
+    finally:
+        with _email_receive_test_lock:
+            state = _email_receive_tests.get(test_id)
+            if state is not None:
+                state["running"] = False
+                state["cancelable"] = False
+                state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                state["finished_epoch"] = time.time()
+                state["updated_at"] = state["finished_at"]
+            if _email_receive_active_id == test_id:
+                _email_receive_active_id = None
+
+
+def start_email_receive_test(private_config: dict) -> Tuple[bool, dict]:
+    global _email_receive_active_id
+    test_id = uuid.uuid4().hex
+    event = threading.Event()
+    state = {
+        "test_id": test_id,
+        "status": "checking",
+        "running": True,
+        "cancelable": True,
+        "cancel_requested": False,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "finished_at": None,
+        "finished_epoch": None,
+        "provider": normalize_mail_provider(
+            (private_config or {}).get("email_provider") or "cfworker"
+        ),
+        "sender_mode": "",
+        "email": "",
+        "error": "",
+        "error_stage": "",
+        "cleanup": "not_needed",
+        "warnings": [],
+        "total_sec": None,
+        "receive_sec": None,
+    }
+    with _activity_lock:
+        with _job_lock:
+            if _job.get("running"):
+                return False, {"error": "注册任务运行中，不能启动邮箱收件测试"}
+        with _email_receive_test_lock:
+            _prune_email_receive_tests_locked()
+            if _email_receive_active_id:
+                active = _email_receive_tests.get(_email_receive_active_id) or {}
+                if active.get("running"):
+                    return False, {"error": "已有邮箱收件测试在运行"}
+            _email_receive_tests[test_id] = state
+            _email_receive_cancel_events[test_id] = event
+            _email_receive_active_id = test_id
+        try:
+            thread = threading.Thread(
+                target=_email_receive_test_worker,
+                args=(test_id, copy.deepcopy(private_config or {})),
+                daemon=True,
+            )
+            thread.start()
+        except Exception as exc:
+            with _email_receive_test_lock:
+                _email_receive_tests.pop(test_id, None)
+                _email_receive_cancel_events.pop(test_id, None)
+                if _email_receive_active_id == test_id:
+                    _email_receive_active_id = None
+            return False, {
+                "error": "邮箱收件测试线程启动失败: "
+                + sanitize_receive_test_error(exc, config=private_config)
+            }
+    return True, email_receive_test_snapshot(test_id) or copy.deepcopy(state)
+
+
+def cancel_email_receive_test(test_id: str) -> Tuple[bool, dict]:
+    with _email_receive_test_lock:
+        _prune_email_receive_tests_locked()
+        state = _email_receive_tests.get(str(test_id or ""))
+        if state is None:
+            return False, {"error": "邮箱收件测试不存在或已过期", "missing": True}
+        if not state.get("running"):
+            return False, {
+                "error": "邮箱收件测试已结束",
+                "test": copy.deepcopy(state),
+            }
+        event = _email_receive_cancel_events.get(test_id)
+        if event is not None:
+            event.set()
+        state["cancel_requested"] = True
+        state["cancelable"] = False
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        return True, copy.deepcopy(state)
 
 # --------------- CPA auto-convert queue ---------------
 _cpa_lock = threading.Lock()
@@ -1084,6 +1289,123 @@ def apply_email_config_from_ui(data: dict) -> dict:
     cfg.pop("tempmailer_domains", None)
     save_config(cfg)
     return email_config_public(cfg)
+
+
+_EMAIL_TEST_OVERRIDE_FIELDS = (
+    "cfworker_api_url",
+    "cfworker_admin_token",
+    "cfworker_domain",
+    "cfworker_custom_auth",
+    "cfworker_subdomain",
+    "cloudflare_api_base",
+    "cloudflare_admin_password",
+    "cloudflare_domain",
+    "cloudflare_site_password",
+    "moemail_api_url",
+    "moemail_api_key",
+    "gptmail_base_url",
+    "gptmail_api_key",
+    "gptmail_domain",
+    "duckmail_api_url",
+    "duckmail_provider_url",
+    "duckmail_bearer",
+    "duckmail_domain",
+    "duckmail_api_key",
+    "maliapi_base_url",
+    "maliapi_api_key",
+    "maliapi_domain",
+    "luckmail_base_url",
+    "luckmail_api_key",
+    "luckmail_project_code",
+    "luckmail_domain",
+    "skymail_api_base",
+    "skymail_token",
+    "skymail_domain",
+    "cloudmail_api_base",
+    "cloudmail_admin_email",
+    "cloudmail_admin_password",
+    "cloudmail_domain",
+    "freemail_api_url",
+    "freemail_admin_token",
+    "freemail_username",
+    "freemail_password",
+    "freemail_domain",
+    "opentrashmail_api_url",
+    "opentrashmail_domain",
+    "opentrashmail_password",
+    "laoudo_auth",
+    "laoudo_email",
+    "laoudo_account_id",
+    "mail_test_sender_mode",
+    "mail_test_timeout_sec",
+    "mail_test_smtp_host",
+    "mail_test_smtp_port",
+    "mail_test_smtp_security",
+    "mail_test_smtp_username",
+    "mail_test_smtp_password",
+    "mail_test_smtp_from",
+    "mail_test_direct_mx_enabled",
+)
+_EMAIL_TEST_SECRET_FIELDS = {
+    "freemail_password",
+    "mail_test_smtp_password",
+}
+
+
+def merge_email_test_config(data: dict, base: Optional[dict] = None) -> dict:
+    """Build a private, non-persisted configuration for probe/test routes."""
+    cfg = dict(base if isinstance(base, dict) else load_config())
+    payload = data if isinstance(data, dict) else {}
+    provider = normalize_email_provider(
+        payload.get("provider") or payload.get("email_provider") or cfg.get("email_provider")
+    )
+    cfg["email_provider"] = provider
+    cfg["email_providers"] = [provider]
+    for key in _EMAIL_TEST_OVERRIDE_FIELDS:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if key in _EMAIL_TEST_SECRET_FIELDS and not str(value or "").strip():
+            continue
+        cfg[key] = value.strip() if isinstance(value, str) else value
+
+    aliases = {"provider_native": "native", "smtp_relay": "smtp"}
+    sender_mode = aliases.get(
+        str(cfg.get("mail_test_sender_mode") or "auto").strip().lower(),
+        str(cfg.get("mail_test_sender_mode") or "auto").strip().lower(),
+    )
+    if sender_mode not in ("auto", "native", "smtp", "direct_mx"):
+        raise ValueError("mail_test_sender_mode 必须是 auto/native/smtp/direct_mx")
+    security = str(cfg.get("mail_test_smtp_security") or "starttls").strip().lower()
+    if security not in ("ssl", "starttls", "plain"):
+        raise ValueError("mail_test_smtp_security 必须是 ssl/starttls/plain")
+    try:
+        timeout_sec = int(cfg.get("mail_test_timeout_sec") or 90)
+        smtp_port = int(cfg.get("mail_test_smtp_port") or 587)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("邮箱测试超时和 SMTP 端口必须是整数") from exc
+    if not 15 <= timeout_sec <= 300:
+        raise ValueError("mail_test_timeout_sec 必须在 15~300 秒之间")
+    if not 1 <= smtp_port <= 65535:
+        raise ValueError("mail_test_smtp_port 必须在 1~65535 之间")
+    direct_value = cfg.get("mail_test_direct_mx_enabled", False)
+    if not isinstance(direct_value, bool):
+        direct_value = str(direct_value or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    cfg.update(
+        {
+            "mail_test_sender_mode": sender_mode,
+            "mail_test_timeout_sec": timeout_sec,
+            "mail_test_smtp_port": smtp_port,
+            "mail_test_smtp_security": security,
+            "mail_test_direct_mx_enabled": bool(direct_value),
+        }
+    )
+    return resolved_provider_config(cfg)
 
 
 def probe_cloudflare_temp_email(data: dict) -> dict:
@@ -2249,23 +2571,26 @@ def start_job(
         return False, str(exc)
 
     log_path = LOG_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    with _job_lock:
-        if _job.get("running"):
-            return False, "已有任务在运行"
-        _job["running"] = True
-        _job["stop"] = False
-        _job["status"] = "starting"
-        _job["count"] = count
-        _job["concurrency"] = concurrency
-        _job["success"] = 0
-        _job["fail"] = 0
-        _job["outcomes"] = {}
-        _job["current_round"] = 0
-        _job["workers"] = {}
-        _job["started_at"] = datetime.now().isoformat(timespec="seconds")
-        _job["finished_at"] = None
-        _job["last_error"] = ""
-        _job["log_path"] = str(log_path)
+    with _activity_lock:
+        if email_receive_test_is_running():
+            return False, "邮箱收件测试运行中，不能启动注册任务"
+        with _job_lock:
+            if _job.get("running"):
+                return False, "已有任务在运行"
+            _job["running"] = True
+            _job["stop"] = False
+            _job["status"] = "starting"
+            _job["count"] = count
+            _job["concurrency"] = concurrency
+            _job["success"] = 0
+            _job["fail"] = 0
+            _job["outcomes"] = {}
+            _job["current_round"] = 0
+            _job["workers"] = {}
+            _job["started_at"] = datetime.now().isoformat(timespec="seconds")
+            _job["finished_at"] = None
+            _job["last_error"] = ""
+            _job["log_path"] = str(log_path)
     _logs.clear()
     log_line(
         f"任务创建：轮数={count} 并发={concurrency} proxy={PROXY_URL}"
@@ -3911,6 +4236,121 @@ def api_test_email_config():
     return jsonify(result)
 
 
+@app.post("/api/config/email/test-capabilities")
+def api_email_test_capabilities():
+    need = require_login()
+    if need:
+        return need
+    data = request.get_json(force=True, silent=True) or {}
+    private_config = {}
+    try:
+        private_config = merge_email_test_config(data)
+        provider = normalize_mail_provider(private_config.get("email_provider"))
+        if not provider_ready(private_config, provider):
+            raise ValueError(f"邮箱源 {provider} 配置不完整")
+        mailbox, provider = make_mailbox(
+            private_config,
+            provider,
+            proxy=str(private_config.get("proxy") or ""),
+        )
+        capabilities = sender_capabilities(private_config, provider, mailbox)
+        requested = str(private_config.get("mail_test_sender_mode") or "auto")
+        selected = ""
+        if requested == "auto":
+            selected = next(
+                (item["mode"] for item in capabilities if item.get("available")), ""
+            )
+        else:
+            selected = requested
+        return jsonify(
+            {
+                "ok": True,
+                "provider": provider,
+                "selected_mode": selected,
+                "capabilities": capabilities,
+            }
+        )
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": sanitize_receive_test_error(
+                        exc, config=private_config or data
+                    ),
+                }
+            ),
+            400,
+        )
+
+
+@app.post("/api/config/email/receive-test")
+def api_start_email_receive_test():
+    need = require_login()
+    if need:
+        return need
+    if registration_is_running():
+        return (
+            jsonify(
+                {"ok": False, "error": "注册任务运行中，不能启动邮箱收件测试"}
+            ),
+            409,
+        )
+    data = request.get_json(force=True, silent=True) or {}
+    private_config = {}
+    try:
+        private_config = merge_email_test_config(data)
+        provider = normalize_mail_provider(private_config.get("email_provider"))
+        if not provider_ready(private_config, provider):
+            raise ValueError(f"邮箱源 {provider} 配置不完整")
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": sanitize_receive_test_error(
+                        exc, config=private_config or data
+                    ),
+                }
+            ),
+            400,
+        )
+    ok, result = start_email_receive_test(private_config)
+    if not ok:
+        status = 409 if "运行" in str(result.get("error") or "") else 500
+        return jsonify({"ok": False, "error": result.get("error")}), status
+    return jsonify({"ok": True, "test": result}), 202
+
+
+@app.get("/api/config/email/receive-test/<test_id>")
+def api_email_receive_test_status(test_id: str):
+    need = require_login()
+    if need:
+        return need
+    state = email_receive_test_snapshot(test_id)
+    if state is None:
+        return (
+            jsonify(
+                {"ok": False, "error": "邮箱收件测试不存在或已过期"}
+            ),
+            404,
+        )
+    return jsonify({"ok": True, "test": state})
+
+
+@app.post("/api/config/email/receive-test/<test_id>/cancel")
+def api_cancel_email_receive_test(test_id: str):
+    need = require_login()
+    if need:
+        return need
+    ok, result = cancel_email_receive_test(test_id)
+    if not ok:
+        if result.get("missing"):
+            return jsonify({"ok": False, "error": result["error"]}), 404
+        return jsonify({"ok": False, **result}), 409
+    return jsonify({"ok": True, "test": result})
+
+
 @app.get("/api/job/status")
 def api_job_status():
     need = require_login()
@@ -4007,6 +4447,13 @@ def api_job_start():
     need = require_login()
     if need:
         return need
+    if email_receive_test_is_running():
+        return (
+            jsonify(
+                {"ok": False, "error": "邮箱收件测试运行中，不能启动注册任务"}
+            ),
+            409,
+        )
     data = request.get_json(force=True, silent=True) or {}
     try:
         count = int(data.get("count") or 1)
