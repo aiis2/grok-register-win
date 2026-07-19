@@ -2749,11 +2749,36 @@ INDEX_HTML = r"""
     .storage-stat .label{font-size:10.5px;letter-spacing:.45px;text-transform:uppercase;color:var(--muted2)}
     .storage-stat .value{margin-top:5px;font-family:Bahnschrift,"Arial Narrow",sans-serif;font-size:18px;color:var(--fg)}
     .storage-warning{grid-column:1/-1;padding:9px 10px;border:1px solid #5b3b14;border-radius:10px;background:rgba(180,100,20,.1);color:#f0c674;font-size:11.5px;line-height:1.5}
+    .mail-test-settings{margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:13px;background:linear-gradient(145deg,#101620,#171e2b)}
+    .mail-test-settings h3{margin:0 0 11px;font-size:12px;letter-spacing:.5px;text-transform:uppercase;color:var(--muted)}
+    .mail-test-warning{margin-top:10px;padding:9px 11px;border:1px solid #5b3b14;border-radius:9px;background:rgba(180,100,20,.1);color:#f0c674;font-size:11.5px;line-height:1.5}
+    .email-test-modal{position:fixed;inset:0;z-index:30;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(3,6,11,.78);backdrop-filter:blur(7px)}
+    .email-test-modal.open{display:flex}
+    .email-test-dialog{width:min(720px,100%);max-height:min(820px,calc(100vh - 32px));overflow:auto;border:1px solid var(--line2);border-radius:18px;background:linear-gradient(160deg,#151c29,#0e131c);box-shadow:0 24px 80px rgba(0,0,0,.6)}
+    .email-test-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:20px 20px 15px;border-bottom:1px solid var(--line)}
+    .email-test-head h2{margin:0;font-size:18px}.email-test-head p{margin:5px 0 0;color:var(--muted);font-size:12px;line-height:1.5}
+    .email-test-body{padding:18px 20px 20px}
+    .email-test-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-bottom:16px}
+    .email-test-fact{min-height:64px;padding:10px 11px;border:1px solid var(--line);border-radius:10px;background:var(--bg2)}
+    .email-test-fact span{display:block;color:var(--muted2);font-size:10.5px;text-transform:uppercase;letter-spacing:.4px}
+    .email-test-fact strong{display:block;margin-top:5px;font-size:12px;word-break:break-word}
+    .email-test-timeline{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:5px;margin:5px 0 15px;padding:0;list-style:none}
+    .email-test-stage{position:relative;padding:26px 3px 5px;text-align:center;color:var(--muted2);font-size:10px;line-height:1.25}
+    .email-test-stage::before{content:"";position:absolute;top:8px;left:50%;width:10px;height:10px;margin-left:-5px;border:2px solid var(--line2);border-radius:50%;background:var(--bg2);z-index:2}
+    .email-test-stage::after{content:"";position:absolute;top:13px;left:-50%;width:100%;height:2px;background:var(--line2)}
+    .email-test-stage:first-child::after{display:none}
+    .email-test-stage.done{color:var(--ok)}.email-test-stage.done::before{border-color:var(--ok);background:var(--ok)}.email-test-stage.done::after{background:var(--ok)}
+    .email-test-stage.current{color:var(--accent);font-weight:600}.email-test-stage.current::before{border-color:var(--accent);box-shadow:0 0 12px rgba(110,168,254,.65)}
+    .email-test-stage.failed{color:var(--bad)}.email-test-stage.failed::before{border-color:var(--bad);background:var(--bad)}
+    .email-test-message{min-height:48px;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);color:var(--muted);font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+    .email-test-message.error{border-color:#5a2b2b;background:#2a1717;color:#ffb4b4}.email-test-message.success{border-color:#23543d;background:#10271d;color:#8ce7bb}
+    .email-test-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:9px;margin-top:16px}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
     .toast{position:fixed;right:20px;bottom:20px;background:var(--card2);border:1px solid var(--line2);padding:12px 16px;border-radius:10px;display:none;z-index:9;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:13px}
     code{background:var(--chip);padding:2px 6px;border-radius:4px;font-size:12px;color:var(--accent)}
     @media(max-width:800px){ th:nth-child(3),td:nth-child(3){display:none} .row{flex-direction:column;align-items:stretch} input,select{min-width:0}.storage-shell{grid-template-columns:1fr}.worker-grid{grid-template-columns:1fr 1fr} }
-    @media(max-width:520px){.worker-grid{grid-template-columns:1fr}.storage-actions{flex-direction:column}.storage-actions .btn{justify-content:center}.storage-stats{grid-template-columns:1fr 1fr}}
+    @media(max-width:700px){.email-test-timeline{grid-template-columns:repeat(4,minmax(0,1fr));row-gap:9px}.email-test-stage:nth-child(5)::after{display:none}.email-test-facts{grid-template-columns:1fr}.email-test-dialog{max-height:calc(100vh - 16px)}}
+    @media(max-width:520px){.worker-grid{grid-template-columns:1fr}.storage-actions{flex-direction:column}.storage-actions .btn{justify-content:center}.storage-stats{grid-template-columns:1fr 1fr}.email-test-modal{padding:8px}.email-test-head,.email-test-body{padding-left:14px;padding-right:14px}.email-test-actions .btn{flex:1;justify-content:center}}
   </style>
 </head>
 <body>
@@ -2861,8 +2886,9 @@ INDEX_HTML = r"""
       <label style="min-width:auto;flex-direction:row;align-items:center;gap:8px;padding-bottom:10px">
         <input type="checkbox" id="email_failover" style="width:auto;min-width:0"/> 失败时自动换源
       </label>
-      <button class="btn primary" onclick="saveEmailConfig()">保存邮箱设置</button>
+      <button class="btn primary" id="btn_email_save" onclick="saveEmailConfig()">保存邮箱设置</button>
       <button class="btn" id="btn_email_test" onclick="testCloudflareEmailConnection()" style="display:none">测试连接</button>
+      <button class="btn ok" id="btn_email_receive_test" onclick="openEmailReceiveTest()">✉ 测试收件</button>
     </div>
 
     <div id="box_cfworker" class="mail-box" style="display:none;margin-top:10px">
@@ -3027,12 +3053,21 @@ INDEX_HTML = r"""
     </div>
 
     <div id="box_freemail" class="mail-box" style="display:none;margin-top:10px">
+      <div class="muted" id="freemail_source_hint" style="font-size:12px;margin-bottom:8px;line-height:1.55">
+        可使用页面配置，或 Windows 环境变量 MAIL_WEB_URL、ADMIN_NAME、ADMIN_PASSWORD。环境变量只在运行时读取。
+      </div>
       <div class="row">
         <label style="flex:2">API URL
           <input type="text" id="freemail_api_url"/>
         </label>
         <label>Admin Token
           <input type="password" id="freemail_admin_token"/>
+        </label>
+        <label>管理员用户名
+          <input type="text" id="freemail_username" autocomplete="username"/>
+        </label>
+        <label>管理员密码
+          <input type="password" id="freemail_password" autocomplete="new-password" placeholder="留空保留已有配置"/>
         </label>
         <label>域名
           <input type="text" id="freemail_domain"/>
@@ -3065,6 +3100,53 @@ INDEX_HTML = r"""
         <label>Account ID
           <input type="text" id="laoudo_account_id"/>
         </label>
+      </div>
+    </div>
+
+    <div class="mail-test-settings" id="mail_test_settings">
+      <h3>通用收件验证 · 发件策略</h3>
+      <div class="row">
+        <label>策略
+          <select id="mail_test_sender_mode">
+            <option value="auto">自动：原生 API → SMTP → Direct MX</option>
+            <option value="native">仅邮箱服务原生 API</option>
+            <option value="smtp">仅 SMTP Relay</option>
+            <option value="direct_mx">仅 Direct MX</option>
+          </select>
+        </label>
+        <label>收件等待（秒）
+          <input type="number" id="mail_test_timeout_sec" min="15" max="300" value="90"/>
+        </label>
+        <label style="flex:2">SMTP 主机
+          <input type="text" id="mail_test_smtp_host" placeholder="smtp.example.com"/>
+        </label>
+        <label>SMTP 端口
+          <input type="number" id="mail_test_smtp_port" min="1" max="65535" value="587"/>
+        </label>
+        <label>SMTP 安全
+          <select id="mail_test_smtp_security">
+            <option value="starttls">STARTTLS</option>
+            <option value="ssl">SSL/TLS</option>
+            <option value="plain">Plain（不加密）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label>SMTP 用户名
+          <input type="text" id="mail_test_smtp_username" autocomplete="username"/>
+        </label>
+        <label>SMTP 密码
+          <input type="password" id="mail_test_smtp_password" autocomplete="new-password" placeholder="留空保留已有配置"/>
+        </label>
+        <label style="flex:2">SMTP 发件地址
+          <input type="email" id="mail_test_smtp_from" placeholder="sender@example.com"/>
+        </label>
+        <label style="min-width:auto;flex-direction:row;align-items:center;gap:8px;padding-bottom:10px">
+          <input type="checkbox" id="mail_test_direct_mx_enabled" style="width:auto;min-width:0"/> 启用 Direct MX
+        </label>
+      </div>
+      <div class="mail-test-warning">
+        Direct MX 默认关闭；本机网络或收件服务器可能封锁 25 端口，且无 DKIM/SPF 的匿名投递可能被拒。目标服务器仅从本次测试邮箱域名的 MX 记录解析。
       </div>
     </div>
 
@@ -3112,6 +3194,32 @@ INDEX_HTML = r"""
     {% else %}
     <div style="padding:24px;color:var(--muted);text-align:center">暂无 accounts_*.txt</div>
     {% endif %}
+  </div>
+</div>
+<div class="email-test-modal" id="email_receive_test_modal" role="dialog" aria-modal="true" aria-labelledby="email_receive_test_title" onclick="if(event.target===this) closeEmailReceiveTest(false)">
+  <div class="email-test-dialog" tabindex="-1">
+    <div class="email-test-head">
+      <div>
+        <h2 id="email_receive_test_title">邮箱收件验证</h2>
+        <p>生成一次性邮箱，发送 Grok 格式测试验证码，再复用当前邮箱适配器读取并精确匹配。</p>
+      </div>
+      <button class="btn" type="button" aria-label="关闭" onclick="closeEmailReceiveTest(false)">×</button>
+    </div>
+    <div class="email-test-body">
+      <div class="email-test-facts">
+        <div class="email-test-fact"><span>邮箱源</span><strong id="email_receive_test_provider">—</strong></div>
+        <div class="email-test-fact"><span>发件策略</span><strong id="email_receive_test_sender">能力探测中</strong></div>
+        <div class="email-test-fact"><span>测试邮箱</span><strong id="email_receive_test_email">尚未创建</strong></div>
+      </div>
+      <ol class="email-test-timeline" id="email_receive_test_timeline" aria-label="测试进度"></ol>
+      <div class="muted" id="email_receive_test_timing" style="min-height:18px;margin:0 0 8px;font-size:11.5px">等待开始</div>
+      <div class="email-test-message" id="email_receive_test_message" role="status" aria-live="polite">正在检查可用发件方式…</div>
+      <div class="email-test-actions">
+        <button class="btn primary" type="button" id="email_receive_test_start" onclick="startEmailReceiveTest()">发送验证码并测试</button>
+        <button class="btn danger" type="button" id="email_receive_test_cancel" onclick="cancelEmailReceiveTest()" disabled>取消测试</button>
+        <button class="btn" type="button" id="email_receive_test_close" onclick="closeEmailReceiveTest(true)">关闭</button>
+      </div>
+    </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -3304,8 +3412,33 @@ async function loadEmailConfig(){
     _set('cloudmail_admin_password', e.cloudmail_admin_password);
     _set('cloudmail_domain', e.cloudmail_domain);
     _set('freemail_api_url', e.freemail_api_url);
-    _set('freemail_admin_token', e.freemail_admin_token);
+    _set('freemail_admin_token', '');
+    _set('freemail_username', e.freemail_username);
+    _set('freemail_password', '');
     _set('freemail_domain', e.freemail_domain);
+    _set('mail_test_sender_mode', e.mail_test_sender_mode||'auto');
+    _set('mail_test_timeout_sec', e.mail_test_timeout_sec||90);
+    _set('mail_test_smtp_host', e.mail_test_smtp_host);
+    _set('mail_test_smtp_port', e.mail_test_smtp_port||587);
+    _set('mail_test_smtp_security', e.mail_test_smtp_security||'starttls');
+    _set('mail_test_smtp_username', e.mail_test_smtp_username);
+    _set('mail_test_smtp_password', '');
+    _set('mail_test_smtp_from', e.mail_test_smtp_from);
+    _check('mail_test_direct_mx_enabled', e.mail_test_direct_mx_enabled);
+    const freemailPassword=document.getElementById('freemail_password');
+    if(freemailPassword){
+      freemailPassword.placeholder=e.freemail_password_configured?'已保存；留空不修改':(e.freemail_env_password_available?'使用 ADMIN_PASSWORD 环境变量':'留空表示未配置');
+    }
+    const smtpPassword=document.getElementById('mail_test_smtp_password');
+    if(smtpPassword) smtpPassword.placeholder=e.mail_test_smtp_password_configured?'已保存；留空不修改':'留空表示不使用 SMTP 认证';
+    const freemailHint=document.getElementById('freemail_source_hint');
+    if(freemailHint){
+      const env=[];
+      if(e.freemail_env_url_available) env.push('MAIL_WEB_URL');
+      if(e.freemail_env_username_available) env.push('ADMIN_NAME');
+      if(e.freemail_env_password_available) env.push('ADMIN_PASSWORD');
+      freemailHint.textContent=env.length?('当前可用环境变量：'+env.join('、')+'；页面显式配置优先，密钥不会回显。'):'可使用页面配置，或 Windows 环境变量 MAIL_WEB_URL、ADMIN_NAME、ADMIN_PASSWORD。';
+    }
     _set('opentrashmail_api_url', e.opentrashmail_api_url);
     _set('opentrashmail_domain', e.opentrashmail_domain);
     _set('opentrashmail_password', e.opentrashmail_password);
@@ -3318,7 +3451,7 @@ async function loadEmailConfig(){
     setEmailHint('加载邮箱配置失败: '+err.message);
   }
 }
-async function saveEmailConfig(){
+function emailConfigPayload(){
   const body={
     provider: (document.getElementById('email_provider').value||'cfworker'),
     email_failover: document.getElementById('email_failover').checked,
@@ -3357,7 +3490,18 @@ async function saveEmailConfig(){
     cloudmail_domain: _val('cloudmail_domain'),
     freemail_api_url: _val('freemail_api_url'),
     freemail_admin_token: _val('freemail_admin_token'),
+    freemail_username: _val('freemail_username'),
+    freemail_password: _val('freemail_password'),
     freemail_domain: _val('freemail_domain'),
+    mail_test_sender_mode: _val('mail_test_sender_mode'),
+    mail_test_timeout_sec: _val('mail_test_timeout_sec'),
+    mail_test_smtp_host: _val('mail_test_smtp_host'),
+    mail_test_smtp_port: _val('mail_test_smtp_port'),
+    mail_test_smtp_security: _val('mail_test_smtp_security'),
+    mail_test_smtp_username: _val('mail_test_smtp_username'),
+    mail_test_smtp_password: _val('mail_test_smtp_password'),
+    mail_test_smtp_from: _val('mail_test_smtp_from'),
+    mail_test_direct_mx_enabled: !!document.getElementById('mail_test_direct_mx_enabled').checked,
     opentrashmail_api_url: _val('opentrashmail_api_url'),
     opentrashmail_domain: _val('opentrashmail_domain'),
     opentrashmail_password: _val('opentrashmail_password'),
@@ -3365,6 +3509,10 @@ async function saveEmailConfig(){
     laoudo_email: _val('laoudo_email'),
     laoudo_account_id: _val('laoudo_account_id'),
   };
+  return body;
+}
+async function saveEmailConfig(){
+  const body=emailConfigPayload();
   try{
     const j=await api('/api/config/email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     toast(j.message||'邮箱设置已保存');
@@ -3395,6 +3543,205 @@ async function testCloudflareEmailConnection(){
     if(button) button.disabled=false;
   }
 }
+const EMAIL_RECEIVE_TEST_STAGES=[
+  ['checking','检查配置'],['creating','创建邮箱'],['snapshotting','收件快照'],['sending','发送测试信'],
+  ['waiting','等待收件'],['verifying','核对验证码'],['cleaning','清理邮箱'],['succeeded','验证成功']
+];
+let emailReceiveTestId=sessionStorage.getItem('emailReceiveTestId')||'';
+let emailReceivePollTimer=null;
+let emailReceiveRunning=!!emailReceiveTestId;
+let emailReceiveRegistrationRunning=false;
+let emailReceiveMustAcknowledge=false;
+let emailReceiveCapabilityReady=false;
+
+function renderEmailReceiveTimeline(status,errorStage){
+  const timeline=document.getElementById('email_receive_test_timeline');
+  if(!timeline) return;
+  const active=(status==='failed'||status==='cancelled')?(errorStage||'checking'):status;
+  const activeIndex=Math.max(0,EMAIL_RECEIVE_TEST_STAGES.findIndex(item=>item[0]===active));
+  timeline.replaceChildren();
+  EMAIL_RECEIVE_TEST_STAGES.forEach((item,index)=>{
+    const li=document.createElement('li');
+    li.className='email-test-stage';
+    li.dataset.stage=item[0];
+    li.textContent=item[1];
+    if(status==='succeeded'||index<activeIndex) li.classList.add('done');
+    if(index===activeIndex&&status!=='succeeded'){
+      li.classList.add((status==='failed'||status==='cancelled')?'failed':'current');
+      li.setAttribute('aria-current','step');
+    }
+    if(status==='succeeded'&&item[0]==='succeeded'){
+      li.classList.add('current'); li.setAttribute('aria-current','step');
+    }
+    timeline.appendChild(li);
+  });
+}
+
+function setEmailReceiveMessage(text,kind){
+  const message=document.getElementById('email_receive_test_message');
+  if(!message) return;
+  message.textContent=String(text||'');
+  message.className='email-test-message'+(kind?' '+kind:'');
+}
+
+function syncEmailReceiveControls(state){
+  const running=state?!!state.running:emailReceiveRunning;
+  emailReceiveRunning=running;
+  const fieldIds=['email_provider','btn_email_save','btn_email_test','mail_test_sender_mode','mail_test_timeout_sec','mail_test_smtp_host','mail_test_smtp_port','mail_test_smtp_security','mail_test_smtp_username','mail_test_smtp_password','mail_test_smtp_from','mail_test_direct_mx_enabled','freemail_api_url','freemail_admin_token','freemail_username','freemail_password','freemail_domain'];
+  fieldIds.forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=running;});
+  const registerButton=document.getElementById('btn_start');
+  if(registerButton) registerButton.disabled=emailReceiveRegistrationRunning||running;
+  const receiveButton=document.getElementById('btn_email_receive_test');
+  if(receiveButton){
+    receiveButton.disabled=emailReceiveRegistrationRunning;
+    receiveButton.textContent=running?'↗ 查看测试进度':'✉ 测试收件';
+  }
+  const startButton=document.getElementById('email_receive_test_start');
+  if(startButton) startButton.disabled=running||!emailReceiveCapabilityReady;
+  const cancelButton=document.getElementById('email_receive_test_cancel');
+  if(cancelButton) cancelButton.disabled=!running||!!(state&&state.cancel_requested);
+}
+
+function renderEmailReceiveTest(test){
+  const state=test||{};
+  const status=String(state.status||'checking');
+  document.getElementById('email_receive_test_provider').textContent=state.provider||'—';
+  document.getElementById('email_receive_test_sender').textContent=state.sender_mode||'选择中';
+  document.getElementById('email_receive_test_email').textContent=state.email||'尚未创建';
+  renderEmailReceiveTimeline(status,state.error_stage);
+  const timings=[];
+  if(state.total_sec!==null&&state.total_sec!==undefined) timings.push('总耗时 '+Number(state.total_sec).toFixed(1)+' 秒');
+  if(state.receive_sec!==null&&state.receive_sec!==undefined) timings.push('收件等待 '+Number(state.receive_sec).toFixed(1)+' 秒');
+  if(state.cleanup&&state.cleanup!=='not_needed') timings.push('清理 '+state.cleanup);
+  document.getElementById('email_receive_test_timing').textContent=timings.join(' · ')||'测试进行中';
+  const terminal=['succeeded','failed','cancelled'].includes(status);
+  if(status==='succeeded'){
+    const warning=(state.warnings||[]).length?'\n警告：'+state.warnings.join('；'):'';
+    setEmailReceiveMessage('收件验证成功。邮箱源、发件链路与验证码读取均可用。'+warning,'success');
+  }else if(status==='failed'){
+    setEmailReceiveMessage('失败阶段 '+(state.error_stage||status)+'：'+(state.error||'邮箱收件测试失败'),'error');
+  }else if(status==='cancelled'){
+    setEmailReceiveMessage('测试已取消'+(state.error_stage?'（阶段 '+state.error_stage+'）':''),'error');
+  }else{
+    const label=(EMAIL_RECEIVE_TEST_STAGES.find(item=>item[0]===status)||[status,status])[1];
+    setEmailReceiveMessage(label+'… 请保持页面开启，关闭模态框不会取消测试。','');
+  }
+  emailReceiveMustAcknowledge=status==='failed'||status==='cancelled';
+  emailReceiveCapabilityReady=terminal||emailReceiveCapabilityReady;
+  syncEmailReceiveControls(state);
+}
+
+function closeEmailReceiveTest(force){
+  if(emailReceiveMustAcknowledge&&!force) return;
+  const modal=document.getElementById('email_receive_test_modal');
+  if(modal) modal.classList.remove('open');
+}
+
+async function openEmailReceiveTest(){
+  const modal=document.getElementById('email_receive_test_modal');
+  if(!modal) return;
+  modal.classList.add('open');
+  const dialog=modal.querySelector('.email-test-dialog');
+  if(dialog) dialog.focus();
+  if(emailReceiveTestId){
+    emailReceiveCapabilityReady=true;
+    await pollEmailReceiveTest();
+    return;
+  }
+  emailReceiveMustAcknowledge=false;
+  emailReceiveCapabilityReady=false;
+  renderEmailReceiveTimeline('checking','');
+  document.getElementById('email_receive_test_provider').textContent=_val('email_provider')||'—';
+  document.getElementById('email_receive_test_sender').textContent='能力探测中';
+  document.getElementById('email_receive_test_email').textContent='尚未创建';
+  document.getElementById('email_receive_test_timing').textContent='尚未开始';
+  setEmailReceiveMessage('正在主动检查当前配置支持的发件方式…','');
+  syncEmailReceiveControls();
+  try{
+    const result=await api('/api/config/email/test-capabilities',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(emailConfigPayload())
+    });
+    const capabilities=result.capabilities||[];
+    const descriptions=capabilities.map(item=>`${item.mode}: ${item.available?'可用':(item.reason||'不可用')}`);
+    emailReceiveCapabilityReady=capabilities.some(item=>item.available);
+    document.getElementById('email_receive_test_provider').textContent=result.provider||'—';
+    document.getElementById('email_receive_test_sender').textContent=result.selected_mode||'无可用策略';
+    setEmailReceiveMessage(descriptions.join('\n')+(emailReceiveCapabilityReady?'\n点击“发送验证码并测试”开始。':'\n请先补全一种发件方式。'),emailReceiveCapabilityReady?'':'error');
+  }catch(error){
+    emailReceiveCapabilityReady=false;
+    emailReceiveMustAcknowledge=true;
+    setEmailReceiveMessage('能力检查失败：'+error.message,'error');
+  }
+  syncEmailReceiveControls();
+}
+
+async function startEmailReceiveTest(){
+  if(emailReceiveRunning) return;
+  emailReceiveMustAcknowledge=false;
+  emailReceiveCapabilityReady=true;
+  setEmailReceiveMessage('正在创建邮箱收件测试…','');
+  try{
+    const result=await api('/api/config/email/receive-test',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(emailConfigPayload())
+    });
+    const state=result.test||{};
+    emailReceiveTestId=state.test_id||'';
+    if(emailReceiveTestId) sessionStorage.setItem('emailReceiveTestId',emailReceiveTestId);
+    emailReceiveRunning=true;
+    renderEmailReceiveTest(state);
+    await pollEmailReceiveTest();
+  }catch(error){
+    emailReceiveRunning=false;
+    emailReceiveMustAcknowledge=true;
+    setEmailReceiveMessage('启动失败：'+error.message,'error');
+    syncEmailReceiveControls();
+  }
+}
+
+async function pollEmailReceiveTest(){
+  if(emailReceivePollTimer){clearTimeout(emailReceivePollTimer);emailReceivePollTimer=null;}
+  if(!emailReceiveTestId) return;
+  try{
+    const result=await api('/api/config/email/receive-test/'+encodeURIComponent(emailReceiveTestId));
+    const state=result.test||{};
+    renderEmailReceiveTest(state);
+    const terminal=['succeeded','failed','cancelled'].includes(String(state.status||''));
+    if(terminal){
+      emailReceiveRunning=false;
+      emailReceiveTestId='';
+      sessionStorage.removeItem('emailReceiveTestId');
+      syncEmailReceiveControls(state);
+      return;
+    }
+    emailReceivePollTimer=setTimeout(pollEmailReceiveTest,1000);
+  }catch(error){
+    emailReceiveRunning=false;
+    emailReceiveTestId='';
+    sessionStorage.removeItem('emailReceiveTestId');
+    emailReceiveMustAcknowledge=true;
+    setEmailReceiveMessage('读取测试状态失败：'+error.message,'error');
+    syncEmailReceiveControls();
+  }
+}
+
+async function cancelEmailReceiveTest(){
+  if(!emailReceiveTestId) return;
+  const button=document.getElementById('email_receive_test_cancel');
+  if(button) button.disabled=true;
+  try{
+    const result=await api('/api/config/email/receive-test/'+encodeURIComponent(emailReceiveTestId)+'/cancel',{method:'POST'});
+    renderEmailReceiveTest(result.test||{});
+    setEmailReceiveMessage('已请求取消，正在安全清理测试邮箱…','');
+    emailReceivePollTimer=setTimeout(pollEmailReceiveTest,300);
+  }catch(error){
+    setEmailReceiveMessage('取消失败：'+error.message,'error');
+    if(button) button.disabled=false;
+  }
+}
+
+document.addEventListener('keydown',event=>{
+  if(event.key==='Escape') closeEmailReceiveTest(false);
+});
 function setEmailHint(text){
   const el=document.getElementById('email_hint');
   if(!el) return;
@@ -3477,13 +3824,15 @@ async function poll(){
     const j=await api('/api/job/status');
     const st=j.job||{};
     const cpa=j.cpa||{};
+    emailReceiveRegistrationRunning=!!st.running;
     document.getElementById('st_status').textContent=st.status||'idle';
     document.getElementById('st_dot').className='dot'+(st.running?' run':'');
     document.getElementById('st_sf').textContent=`${st.success||0} / ${st.fail||0}`;
-    document.getElementById('btn_start').disabled=!!st.running;
+    document.getElementById('btn_start').disabled=!!st.running||emailReceiveRunning;
     document.getElementById('btn_stop').disabled=!st.running;
     document.getElementById('register_concurrency').disabled=!!st.running;
     document.getElementById('browser_engine').disabled=!!st.running;
+    syncEmailReceiveControls();
     const concurrencyStat=document.getElementById('st_concurrency');
     if(concurrencyStat) concurrencyStat.textContent=`${st.active_workers||0} / ${st.effective_concurrency||0}`;
     renderWorkerStates(st);
@@ -3514,6 +3863,8 @@ async function poll(){
 loadEmailConfig();
 loadBrowserEngine();
 loadCredentialConfig();
+renderEmailReceiveTimeline('checking','');
+if(emailReceiveTestId) pollEmailReceiveTest();
 poll();
 setInterval(poll, 2000);
 </script>

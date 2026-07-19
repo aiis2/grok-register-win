@@ -258,3 +258,65 @@ def test_routes_require_auth_when_panel_auth_is_enabled(monkeypatch):
     )
 
     assert response.status_code == 401
+
+
+def test_html_contains_generic_receive_test_controls_and_modal():
+    html = panel_app.INDEX_HTML
+
+    for element_id in (
+        "btn_email_receive_test",
+        "email_receive_test_modal",
+        "email_receive_test_timeline",
+        "email_receive_test_provider",
+        "email_receive_test_sender",
+        "email_receive_test_email",
+        "email_receive_test_timing",
+        "email_receive_test_message",
+        "email_receive_test_cancel",
+        "email_receive_test_close",
+        "mail_test_sender_mode",
+        "mail_test_timeout_sec",
+        "mail_test_smtp_host",
+        "mail_test_smtp_port",
+        "mail_test_smtp_security",
+        "mail_test_smtp_username",
+        "mail_test_smtp_password",
+        "mail_test_smtp_from",
+        "mail_test_direct_mx_enabled",
+        "freemail_username",
+        "freemail_password",
+    ):
+        assert f'id="{element_id}"' in html
+    button_tag = re.search(r'<button[^>]+id="btn_email_receive_test"[^>]*>', html)
+    assert button_tag is not None
+    assert "display:none" not in button_tag.group(0)
+
+
+def test_html_receive_test_client_contract_is_generic_and_secret_safe():
+    html = panel_app.INDEX_HTML
+
+    for function_name in (
+        "openEmailReceiveTest",
+        "startEmailReceiveTest",
+        "pollEmailReceiveTest",
+        "cancelEmailReceiveTest",
+    ):
+        assert f"function {function_name}" in html or f"function {function_name}(" in html
+    assert "/api/config/email/test-capabilities" in html
+    assert "/api/config/email/receive-test" in html
+    assert "/cancel" in html
+    for stage in (
+        "checking",
+        "creating",
+        "snapshotting",
+        "sending",
+        "waiting",
+        "verifying",
+        "cleaning",
+        "succeeded",
+    ):
+        assert stage in html
+    assert "['succeeded','failed','cancelled'].includes" in html
+    assert "_set('freemail_password', e.freemail_password)" not in html
+    assert "_set('mail_test_smtp_password', e.mail_test_smtp_password)" not in html
+    assert ".textContent=test.code" not in html
