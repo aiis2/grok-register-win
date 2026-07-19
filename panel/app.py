@@ -3662,7 +3662,7 @@ async function openEmailReceiveTest(){
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(emailConfigPayload())
     });
     const capabilities=result.capabilities||[];
-    const descriptions=capabilities.map(item=>`${item.mode}: ${item.available?'可用':(item.reason||'不可用')}`);
+    const descriptions=capabilities.map(item=>`${item.mode}: ${item.available?('可用'+(item.reason?'（'+item.reason+'）':'')):(item.reason||'不可用')}`);
     emailReceiveCapabilityReady=capabilities.some(item=>item.available);
     document.getElementById('email_receive_test_provider').textContent=result.provider||'—';
     document.getElementById('email_receive_test_sender').textContent=result.selected_mode||'无可用策略';

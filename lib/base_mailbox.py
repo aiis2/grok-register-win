@@ -4606,12 +4606,36 @@ class FreemailMailbox(BaseMailbox):
         self._get_session()
         payload = self._login_payload or {}
         if bool(payload.get("can_send")):
-            return {"available": True, "reason": ""}
+            return {
+                "available": True,
+                "reason": "账号允许发件；服务端发件渠道将在实际发送时验证",
+            }
         if not (self.admin_token or (self.username and self.password)):
             reason = "Freemail 未配置管理员认证，无法使用原生发件"
         else:
             reason = "Freemail 当前账号未启用发件权限"
         return {"available": False, "reason": reason}
+
+    @staticmethod
+    def _raise_freemail_api_error(response, action: str) -> None:
+        if 200 <= int(getattr(response, "status_code", 0) or 0) < 300:
+            return
+        message = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                message = str(
+                    payload.get("error") or payload.get("message") or ""
+                ).strip()
+        except Exception:
+            message = ""
+        status = int(getattr(response, "status_code", 0) or 0)
+        detail = message[:300] if message else f"HTTP {status}"
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(f"Freemail {action}失败 (HTTP {status}): {detail}") from exc
+        raise RuntimeError(f"Freemail {action}失败 (HTTP {status}): {detail}")
 
     def send_test_message(
         self,
@@ -4636,7 +4660,7 @@ class FreemailMailbox(BaseMailbox):
             },
             timeout=20,
         )
-        response.raise_for_status()
+        self._raise_freemail_api_error(response, "发件")
         payload = response.json()
         if not isinstance(payload, dict) or not payload.get("success"):
             raise RuntimeError("Freemail 发件接口返回失败")
@@ -4656,7 +4680,7 @@ class FreemailMailbox(BaseMailbox):
             params={"address": address},
             timeout=15,
         )
-        response.raise_for_status()
+        self._raise_freemail_api_error(response, "删除邮箱")
         payload = response.json()
         return bool(
             isinstance(payload, dict)

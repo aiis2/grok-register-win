@@ -67,7 +67,10 @@ def test_probe_reports_login_send_capability_and_reuses_session(monkeypatch):
     first = mailbox.probe_send_capability()
     second = mailbox.probe_send_capability()
 
-    assert first == {"available": True, "reason": ""}
+    assert first == {
+        "available": True,
+        "reason": "账号允许发件；服务端发件渠道将在实际发送时验证",
+    }
     assert second == first
     assert [call[1] for call in session.calls] == [
         "https://mail.example.com/api/login"
@@ -127,11 +130,14 @@ def test_send_http_error_is_raised_before_json_parse(monkeypatch):
         monkeypatch,
         [
             FakeResponse({"success": True, "can_send": 1}),
-            FakeResponse(status_code=503),
+            FakeResponse(
+                {"error": "发送失败: 发件渠道暂不可用"},
+                status_code=503,
+            ),
         ],
     )
 
-    with pytest.raises(requests.HTTPError, match="503"):
+    with pytest.raises(RuntimeError, match="发件渠道暂不可用"):
         mailbox.send_test_message(
             sender="sender@example.com",
             recipient="recipient@example.com",
