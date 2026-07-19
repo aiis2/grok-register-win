@@ -126,6 +126,57 @@ def test_cli_batch_emits_one_start_and_result_pair_per_terminal_round(monkeypatc
     assert "private-sso" not in markers
 
 
+def test_cli_turnstile_stall_restarts_slot_and_retries_same_round(
+    tmp_path, monkeypatch
+):
+    logs = []
+    transitions = []
+    profile_calls = []
+    monkeypatch.setitem(main.config, "credentials_dir", str(tmp_path / "credentials"))
+    monkeypatch.setitem(main.config, "enable_nsfw", False)
+    monkeypatch.setattr(main, "cli_log", logs.append)
+    monkeypatch.setattr(main, "get_round_timeout_sec", lambda: 60)
+    monkeypatch.setattr(main, "start_browser", lambda **kwargs: None)
+    monkeypatch.setattr(main, "cleanup_runtime_memory", lambda **kwargs: None)
+    monkeypatch.setattr(main, "cleanup_active_mailbox", lambda **kwargs: True)
+    monkeypatch.setattr(main, "sleep_with_cancel", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "open_signup_page", lambda **kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "fill_email_and_submit",
+        lambda **kwargs: ("private@example.com", "private-jwt"),
+    )
+    monkeypatch.setattr(
+        main, "fill_code_and_submit", lambda *args, **kwargs: "ABC-123"
+    )
+
+    def fill_profile(**kwargs):
+        profile_calls.append(True)
+        if len(profile_calls) == 1:
+            raise main.TurnstileRetryNeeded("灰色占位无 iframe")
+        return {"given_name": "A", "family_name": "B", "password": "secret"}
+
+    def transition(has_more, log_callback=None, force_restart=False):
+        transitions.append((has_more, force_restart))
+        return "restarted" if force_restart else "final"
+
+    monkeypatch.setattr(main, "fill_profile_and_submit", fill_profile)
+    monkeypatch.setattr(main, "wait_for_sso_cookie", lambda **kwargs: "private-sso")
+    monkeypatch.setattr(
+        main, "add_token_to_grok2api_pools", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(main, "transition_browser_for_next_attempt", transition)
+
+    main.run_registration_cli(1, total_count=1)
+
+    assert len(profile_calls) == 2
+    assert transitions[0] == (True, True)
+    assert transitions[-1] == (False, False)
+    results = [line for line in logs if "@@GROK_ROUND_RESULT" in line]
+    assert "status=retry" in results[0]
+    assert "status=success" in results[-1]
+
+
 def test_cli_writes_worker_scoped_credentials_and_redacted_markers(
     tmp_path, monkeypatch
 ):
@@ -340,6 +391,34 @@ def test_relaunch_environment_contains_only_remaining_count():
     assert env["GROK_ROUND_OFFSET"] == "3"
     assert env["GROK_REGISTER_TOTAL"] == "5"
     assert env["ROUND_TIMEOUT_SEC"] == "90"
+
+
+def test_worker_batch_uses_config_snapshot_without_rewriting_shared_file(
+    monkeypatch,
+):
+    config_snapshot = {
+        "email_provider": "freemail",
+        "freemail_api_url": "https://mail.example.com",
+        "browser_engine": "chromium",
+        "round_timeout_sec": 300,
+    }
+    saves = []
+    monkeypatch.setattr(panel_app, "load_config", lambda: dict(config_snapshot))
+    monkeypatch.setattr(panel_app, "save_config", lambda cfg: saves.append(dict(cfg)))
+    monkeypatch.setattr(
+        panel_app, "resolve_proxy_url", lambda: "http://127.0.0.1:7897"
+    )
+    monkeypatch.setattr(panel_app, "log_line", lambda message: None)
+
+    def fail_after_preflight(*args, **kwargs):
+        raise RuntimeError("stop after preflight")
+
+    monkeypatch.setattr(panel_app.subprocess, "Popen", fail_after_preflight)
+
+    summary = panel_app._run_batch(1, 1, 1, worker_id=1)
+
+    assert summary["fatal"] is True
+    assert saves == []
 
 
 @pytest.mark.parametrize(

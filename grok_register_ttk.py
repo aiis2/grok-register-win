@@ -207,12 +207,25 @@ config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
 _email_provider_index = 0
 
+# Turnstile 默认每 8 秒自动重试。给组件一次自动重试机会，再做一次官方 reset；
+# reset 后仍只有 64px 空占位时，不再耗完整个资料页/单账号超时。
+TURNSTILE_TOKEN_MIN_LENGTH = 80
+TURNSTILE_RESET_AFTER_SEC = 15
+TURNSTILE_RESET_GRACE_SEC = 15
+TURNSTILE_MAX_WAIT_SEC = 40
+
 
 class RegistrationCancelled(Exception):
     pass
 
 
 class AccountRetryNeeded(Exception):
+    pass
+
+
+class TurnstileRetryNeeded(AccountRetryNeeded):
+    """The current browser profile cannot initialize Turnstile and must be replaced."""
+
     pass
 
 
@@ -2544,10 +2557,17 @@ return true;
         return False
 
 
-def transition_browser_for_next_attempt(has_more: bool, log_callback=None) -> str:
+def transition_browser_for_next_attempt(
+    has_more: bool, log_callback=None, force_restart: bool = False
+) -> str:
     """Reuse when healthy, restart once when unhealthy, and do nothing at end."""
     if not has_more:
         return "final"
+    if force_restart:
+        if log_callback:
+            log_callback("[*] Turnstile 恢复失败，重启当前并发槽的浏览器与独立 Profile")
+        restart_browser(log_callback=log_callback)
+        return "restarted"
     if prepare_browser_for_next_account(log_callback=log_callback):
         return "reused"
     restart_browser(log_callback=log_callback)
@@ -3250,6 +3270,156 @@ return 'clicked';
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
+def inspect_turnstile_state():
+    """Return the current widget state without logging or exposing the token value."""
+    global page
+    if page is None:
+        raise Exception("页面未就绪，无法检查 Turnstile")
+
+    raw = page.run_js(
+        r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden'
+    && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+}
+function isChallengeFrame(node) {
+  const text = [
+    node.getAttribute('src'), node.getAttribute('title'),
+    node.getAttribute('name'), node.getAttribute('id')
+  ].filter(Boolean).join(' ').toLowerCase();
+  return text.includes('turnstile') || text.includes('challenge')
+    || text.includes('cloudflare');
+}
+function countShadowChallengeFrames(root) {
+  let count = 0;
+  for (const node of Array.from(root.querySelectorAll('*'))) {
+    if (!node.shadowRoot) continue;
+    count += Array.from(node.shadowRoot.querySelectorAll('iframe')).filter(isChallengeFrame).length;
+    count += countShadowChallengeFrames(node.shadowRoot);
+  }
+  return count;
+}
+
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const widgetMatch = String((cfInput && cfInput.id) || '').match(/^cf-chl-widget-(.+)_response$/);
+const widgetId = widgetMatch ? widgetMatch[1] : '';
+let token = String((cfInput && cfInput.value) || '').trim();
+if (!token && window.turnstile && typeof turnstile.getResponse === 'function') {
+  try { token = String(turnstile.getResponse(widgetId || undefined) || '').trim(); }
+  catch (e) {}
+}
+
+const directFrames = Array.from(document.querySelectorAll('iframe')).filter(isChallengeFrame);
+const nearbyShadowRoots = [];
+let ancestor = cfInput && cfInput.parentElement;
+for (let depth = 0; ancestor && depth < 4; depth += 1, ancestor = ancestor.parentElement) {
+  if (ancestor.shadowRoot) nearbyShadowRoots.push(ancestor.shadowRoot);
+}
+const shadowFrameCount = nearbyShadowRoots.reduce(
+  (total, root) => total
+    + Array.from(root.querySelectorAll('iframe')).filter(isChallengeFrame).length
+    + countShadowChallengeFrames(root),
+  0
+);
+const passwordInput = document.querySelector('input[type="password"], input[name="password"]');
+const form = passwordInput && passwordInput.closest('form');
+let challengeSlot = null;
+if (cfInput) {
+  const parent = cfInput.parentElement;
+  const grandparent = parent && parent.parentElement;
+  if (grandparent && grandparent.getBoundingClientRect().height >= 50) challengeSlot = grandparent;
+}
+if (!challengeSlot && form) {
+  challengeSlot = Array.from(form.querySelectorAll('div')).find((node) => {
+    if (!isVisible(node)) return false;
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    const explicit64 = String(node.style.height || '').trim() === '64px';
+    const graySkeleton = String(style.backgroundColor || '').includes('128, 128, 128');
+    return rect.height >= 50 && rect.height <= 90 && rect.width >= 240
+      && (explicit64 || graySkeleton);
+  }) || null;
+}
+
+const siteKeyPresent = !!document.querySelector('div.cf-turnstile, [data-sitekey]');
+const frameCount = directFrames.length + shadowFrameCount;
+const present = !!cfInput || !!challengeSlot || siteKeyPresent || frameCount > 0;
+const initialized = token.length >= 80 || frameCount > 0;
+const placeholder = present && token.length < 80 && !initialized && !!challengeSlot;
+return {
+  present: present,
+  token_len: token.length,
+  initialized: initialized,
+  placeholder: placeholder,
+  iframe_count: frameCount,
+  widget_id_found: !!widgetId,
+  api_ready: !!(window.turnstile && typeof turnstile.reset === 'function')
+};
+        """
+    )
+    if not isinstance(raw, dict):
+        raise Exception("Turnstile 状态检查返回无效数据")
+    return {
+        "present": bool(raw.get("present")),
+        "token_len": max(0, int(raw.get("token_len") or 0)),
+        "initialized": bool(raw.get("initialized")),
+        "placeholder": bool(raw.get("placeholder")),
+        "iframe_count": max(0, int(raw.get("iframe_count") or 0)),
+        "widget_id_found": bool(raw.get("widget_id_found")),
+        "api_ready": bool(raw.get("api_ready")),
+    }
+
+
+def reset_turnstile_widget():
+    """Reset only the widget mounted in the current profile form."""
+    global page
+    if page is None:
+        return {"ok": False, "widget_id_found": False, "error": "page-not-ready"}
+    raw = page.run_js(
+        r"""
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const widgetMatch = String((cfInput && cfInput.id) || '').match(/^cf-chl-widget-(.+)_response$/);
+const widgetId = widgetMatch ? widgetMatch[1] : '';
+if (!window.turnstile || typeof turnstile.reset !== 'function') {
+  return {ok: false, widget_id_found: !!widgetId, error: 'reset-unavailable'};
+}
+try {
+  turnstile.reset(widgetId || undefined);
+  return {ok: true, widget_id_found: !!widgetId, error: ''};
+} catch (e) {
+  return {ok: false, widget_id_found: !!widgetId, error: String(e || 'reset-failed').slice(0, 160)};
+}
+        """
+    )
+    if not isinstance(raw, dict):
+        return {"ok": False, "widget_id_found": False, "error": "invalid-reset-result"}
+    return {
+        "ok": bool(raw.get("ok")),
+        "widget_id_found": bool(raw.get("widget_id_found")),
+        "error": str(raw.get("error") or "")[:160],
+    }
+
+
+def turnstile_recovery_action(state, *, waited, reset_waited=None):
+    """Choose a bounded recovery action for a pending Turnstile widget."""
+    current = state if isinstance(state, dict) else {}
+    if not current.get("present"):
+        return "ready"
+    if int(current.get("token_len") or 0) >= TURNSTILE_TOKEN_MIN_LENGTH:
+        return "ready"
+    elapsed = max(0.0, float(waited or 0))
+    if elapsed >= TURNSTILE_MAX_WAIT_SEC:
+        return "restart"
+    if reset_waited is None:
+        return "reset" if elapsed >= TURNSTILE_RESET_AFTER_SEC else "wait"
+    if max(0.0, float(reset_waited or 0)) >= TURNSTILE_RESET_GRACE_SEC:
+        return "restart"
+    return "wait"
+
+
 def getTurnstileToken(log_callback=None, cancel_callback=None, allow_reset=False):
     global page
     if page is None:
@@ -3393,7 +3563,10 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     deadline = time.time() + timeout
     form_filled_once = False
     wait_cf_since = None
-    last_cf_retry_at = 0.0
+    turnstile_reset_at = None
+    last_cf_log_at = 0.0
+    last_cf_interaction_at = 0.0
+    cf_pass_logged = False
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -3454,16 +3627,6 @@ const submitBtn = buttons.find((node) => {
     return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
 });
 
-// 必须等待 Cloudflare 校验通过后再提交
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solvedByToken = token.length >= 80;
-    if (!solvedByToken) return 'wait-cloudflare:' + token.length;
-}
-
 if (submitBtn) {
     return 'ready-to-submit';
 }
@@ -3473,65 +3636,6 @@ return 'filled-no-submit';
                 family_name,
                 password,
             )
-
-            if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
-                form_filled_once = True
-                token_len = filled.split(":", 1)[1] if ":" in filled else "0"
-                if log_callback:
-                    log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
-                if token_len == "0":
-                    now0 = time.time()
-                    if wait_cf_since is None:
-                        wait_cf_since = now0
-                    # Managed Turnstile often auto-solves if we wait; avoid spam-clicking early.
-                    waited = now0 - wait_cf_since
-                    if waited >= 6 and hasattr(page, "click_turnstile"):
-                        try:
-                            detail = page.click_turnstile() or {}
-                            if log_callback:
-                                log_callback(
-                                    f"[Debug] Turnstile 交互: clicked={detail.get('clicked')} "
-                                    f"method={detail.get('method') or '-'} token_len={detail.get('token_len')}"
-                                )
-                        except Exception as early_exc:
-                            if log_callback:
-                                log_callback(f"[Debug] Turnstile 交互失败: {early_exc}")
-                    pause_seconds = random.uniform(1.2, 2.5)
-                    if log_callback:
-                        log_callback(f"[*] Cloudflare token 为空，暂停 {pause_seconds:.1f}s 后继续检测")
-                    sleep_with_cancel(pause_seconds, cancel_callback)
-                now = time.time()
-                if wait_cf_since is None:
-                    wait_cf_since = now
-                # 卡住后自动二次复用 Turnstile 组件
-                if now - wait_cf_since >= 10 and now - last_cf_retry_at >= 8:
-                    if log_callback:
-                        log_callback("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
-                    try:
-                        token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                        if token:
-                            synced = page.run_js(
-                                """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                """,
-                                token,
-                            )
-                            if log_callback:
-                                log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
-                    except Exception as cf_exc:
-                        if log_callback:
-                            log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
-                    last_cf_retry_at = now
-                sleep_with_cancel(0.8, cancel_callback)
-                continue
 
             if filled in ("ready-to-submit", "filled-no-submit"):
                 form_filled_once = True
@@ -3543,6 +3647,92 @@ return String(cfInput.value || '').trim().length;
                 sleep_with_cancel(0.5, cancel_callback)
                 continue
 
+        turnstile_state = inspect_turnstile_state()
+        now = time.time()
+        if turnstile_state["present"] and turnstile_state["token_len"] < TURNSTILE_TOKEN_MIN_LENGTH:
+            if wait_cf_since is None:
+                wait_cf_since = now
+            waited = now - wait_cf_since
+            reset_waited = (
+                None if turnstile_reset_at is None else now - turnstile_reset_at
+            )
+            action = turnstile_recovery_action(
+                turnstile_state,
+                waited=waited,
+                reset_waited=reset_waited,
+            )
+
+            if log_callback and (last_cf_log_at == 0 or now - last_cf_log_at >= 5):
+                if turnstile_state["placeholder"] and not turnstile_state["initialized"]:
+                    detail = "64px 灰色占位尚未生成验证 iframe"
+                elif turnstile_state["initialized"]:
+                    detail = "验证组件已初始化，等待挑战完成"
+                else:
+                    detail = "验证组件正在初始化"
+                log_callback(
+                    f"[*] 等待 Cloudflare 人机验证：{detail}；"
+                    f"已等待 {int(waited)}s，token长度={turnstile_state['token_len']}"
+                )
+                last_cf_log_at = now
+
+            if action == "reset":
+                result = reset_turnstile_widget()
+                turnstile_reset_at = now
+                if result.get("ok"):
+                    if log_callback:
+                        log_callback("[*] Turnstile 长时间未就绪，已执行一次官方 reset")
+                else:
+                    error = result.get("error") or "unknown"
+                    if error == "reset-unavailable":
+                        # A fresh profile can mount the hidden response input before
+                        # Cloudflare exposes window.turnstile. Keep the bounded grace
+                        # window instead of discarding a page that may still initialize.
+                        if log_callback:
+                            log_callback(
+                                "[*] Turnstile API 尚未就绪，继续等待剩余恢复窗口"
+                            )
+                    else:
+                        raise TurnstileRetryNeeded(
+                            f"Turnstile reset 失败（{error}），将更换浏览器 Profile"
+                        )
+                sleep_with_cancel(1, cancel_callback)
+                continue
+
+            if action == "restart":
+                state_label = (
+                    "未初始化（灰色占位无 iframe）"
+                    if not turnstile_state["initialized"]
+                    else "验证超时"
+                )
+                raise TurnstileRetryNeeded(
+                    f"Turnstile {state_label}，{int(waited)}s 内未产生 token，"
+                    "将重启当前并发槽浏览器并重试当前账号"
+                )
+
+            if (
+                hasattr(page, "click_turnstile")
+                and waited >= 6
+                and now - last_cf_interaction_at >= 6
+            ):
+                try:
+                    page.click_turnstile()
+                except Exception:
+                    pass
+                last_cf_interaction_at = now
+            sleep_with_cancel(0.8, cancel_callback)
+            continue
+
+        if (
+            turnstile_state["present"]
+            and turnstile_state["token_len"] >= TURNSTILE_TOKEN_MIN_LENGTH
+            and not cf_pass_logged
+        ):
+            if log_callback:
+                log_callback(
+                    f"[*] Turnstile 已通过，token长度={turnstile_state['token_len']}"
+                )
+            cf_pass_logged = True
+
         submit_state = page.run_js(
             r"""
 function isVisible(node) {
@@ -3551,15 +3741,6 @@ function isVisible(node) {
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
-}
-
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solvedByToken = token.length >= 80;
-    if (!solvedByToken) return 'wait-cloudflare:' + token.length;
 }
 
 function buttonText(node) {
@@ -3588,57 +3769,10 @@ return 'submitted';
             """
         )
 
-        if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
-            if log_callback:
-                token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
-                log_callback(f"[*] 等待 Cloudflare 人机验证通过后再提交... 当前token长度={token_len}")
-            now = time.time()
-            if wait_cf_since is None:
-                wait_cf_since = now
-            # After a grace period, periodically interact with Turnstile (Camoufox)
-            if (
-                hasattr(page, "click_turnstile")
-                and now - wait_cf_since >= 8
-                and now - last_cf_retry_at >= 6
-            ):
-                try:
-                    page.click_turnstile()
-                except Exception:
-                    pass
-            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                if log_callback:
-                    log_callback("[*] 提交前仍卡住，自动再次复用 Turnstile...")
-                try:
-                    token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                    if token:
-                        synced = page.run_js(
-                            """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                            """,
-                            token,
-                        )
-                        if log_callback:
-                            log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
-                except Exception as cf_exc:
-                    if log_callback:
-                        log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
-                last_cf_retry_at = now
-            sleep_with_cancel(0.8, cancel_callback)
-            continue
-
         if submit_state == "submitted":
             if log_callback:
                 log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
             return {"given_name": given_name, "family_name": family_name, "password": password}
-        wait_cf_since = None
         if isinstance(submit_state, str) and submit_state.startswith("no-submit-button") and log_callback:
             visible_buttons = submit_state.split(":", 1)[1] if ":" in submit_state else ""
             suffix = f" 可见按钮: {visible_buttons}" if visible_buttons else ""
@@ -4417,6 +4551,7 @@ class GrokRegisterGUI:
                     self.should_stop, account_deadline, round_timeout
                 )
                 self.log(f"--- 开始第 {i + 1}/{count} 个账号 · 超时 {round_timeout}s ---")
+                force_browser_restart = False
                 try:
                     email = ""
                     dev_token = ""
@@ -4522,6 +4657,7 @@ class GrokRegisterGUI:
                     self.log("[!] 注册被用户停止")
                     break
                 except AccountRetryNeeded as exc:
+                    force_browser_restart = isinstance(exc, TurnstileRetryNeeded)
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
                         self.log(
@@ -4546,7 +4682,9 @@ class GrokRegisterGUI:
                         break
                     has_more = i < count
                     transition_browser_for_next_attempt(
-                        has_more, log_callback=self.log
+                        has_more,
+                        log_callback=self.log,
+                        force_restart=force_browser_restart,
                     )
                     if has_more:
                         sleep_with_cancel(1, self.should_stop)
@@ -4661,6 +4799,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                 controller.should_stop, account_deadline, round_timeout
             )
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 · 超时 {round_timeout}s ---")
+            force_browser_restart = False
             try:
                 email = ""
                 dev_token = ""
@@ -4764,6 +4903,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                 cli_log("[!] 注册被停止")
                 break
             except AccountRetryNeeded as exc:
+                force_browser_restart = isinstance(exc, TurnstileRetryNeeded)
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
                     round_status = "retry"
@@ -4800,7 +4940,9 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                     break
                 has_more = i < count
                 transition_browser_for_next_attempt(
-                    has_more, log_callback=cli_log
+                    has_more,
+                    log_callback=cli_log,
+                    force_restart=force_browser_restart,
                 )
                 if has_more:
                     sleep_with_cancel(1, controller.should_stop)

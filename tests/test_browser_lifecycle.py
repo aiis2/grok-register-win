@@ -187,6 +187,26 @@ def test_next_account_transition_restarts_once_when_reset_fails(monkeypatch):
     assert len(restarts) == 1
 
 
+def test_turnstile_retry_forces_fresh_browser_without_reusing_profile(monkeypatch):
+    prepares = []
+    restarts = []
+    monkeypatch.setattr(
+        main,
+        "prepare_browser_for_next_account",
+        lambda **kwargs: prepares.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        main, "restart_browser", lambda **kwargs: restarts.append(kwargs)
+    )
+
+    assert (
+        main.transition_browser_for_next_attempt(True, force_restart=True)
+        == "restarted"
+    )
+    assert prepares == []
+    assert len(restarts) == 1
+
+
 def test_final_round_transition_does_not_touch_browser(monkeypatch):
     resets = []
     restarts = []

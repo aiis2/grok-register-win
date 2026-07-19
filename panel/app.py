@@ -2139,19 +2139,9 @@ def _run_batch(
     else:
         engine = "chromium"
     cfg_run["browser_engine"] = engine
-    # 只把代理/引擎写回；register_count 保持用户原值
-    try:
-        cfg_save = load_config()
-        cfg_save["proxy"] = cfg_run["proxy"]
-        cfg_save["browser_engine"] = engine
-        if "round_timeout_sec" not in cfg_save:
-            cfg_save["round_timeout_sec"] = DEFAULT_ROUND_TIMEOUT_SEC
-        save_config(cfg_save)
-        cfg = cfg_save
-    except Exception:
-        cfg = cfg_run
-
-    round_timeout = resolve_round_timeout_sec(cfg)
+    # API/job_worker 已在启动 worker 前保存代理和引擎。每个并发槽只读同一份
+    # 快照，避免多个线程同时 os.replace(config.json) 令其它槽短暂读到空配置。
+    round_timeout = resolve_round_timeout_sec(cfg_run)
     env = build_cli_batch_env(
         os.environ.copy(),
         batch_count=batch_count,
@@ -2190,7 +2180,7 @@ def _run_batch(
 
     # 注册前检查邮箱源是否可用（公共 Tempmailer 已移除）
     try:
-        mail_cfg = load_config()
+        mail_cfg = cfg_run
         mail_prov = normalize_email_provider(
             mail_cfg.get("email_provider") or "cfworker"
         )
