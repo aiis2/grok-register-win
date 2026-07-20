@@ -117,7 +117,10 @@ from mail_providers import (  # type: ignore
     provider_ready,
     resolved_provider_config,
 )
-from lib.browser_window import normalize_browser_window_mode
+from lib.browser_window import (
+    normalize_browser_window_mode,
+    parse_browser_window_marker,
+)
 
 try:
     from sso2cpa_core import (  # type: ignore
@@ -1804,6 +1807,7 @@ def unregister_worker_process(worker_id: int, proc: subprocess.Popen) -> bool:
         state["pid"] = None
         if state.get("status") == "running":
             state["status"] = "finishing"
+        state["browser"] = None
         _refresh_legacy_pid_locked()
     return True
 
@@ -1853,6 +1857,37 @@ def record_job_result(index: int, status: str, *, worker_id: int) -> bool:
         worker = _worker_state_locked(worker_id)
         worker["current_round"] = round_index
         worker[aggregate_key] = int(worker.get(aggregate_key) or 0) + 1
+    return True
+
+
+def record_worker_browser_event(worker_id: int, event: dict) -> bool:
+    """Accept a browser marker only from its current supervised worker slot."""
+    worker_key = str(int(worker_id))
+    if int(event.get("worker_id") or 0) != int(worker_id):
+        return False
+    with _job_lock:
+        worker = (_job.get("workers") or {}).get(worker_key)
+        if not isinstance(worker, dict):
+            return False
+        current = worker.get("browser") or {}
+        generation = int(event.get("generation") or 0)
+        current_generation = int(current.get("generation") or 0)
+        if generation < current_generation:
+            return False
+        if generation == current_generation and current_generation:
+            if (
+                int(current.get("pid") or 0) != int(event.get("pid") or 0)
+                or int(current.get("hwnd") or 0) != int(event.get("hwnd") or 0)
+            ):
+                return False
+        worker["browser"] = {
+            "generation": generation,
+            "pid": int(event.get("pid") or 0),
+            "hwnd": int(event.get("hwnd") or 0),
+            "state": str(event.get("state") or "error"),
+            "mode": str(event.get("mode") or "visible"),
+            "fallback": bool(event.get("fallback")),
+        }
     return True
 
 
@@ -2054,6 +2089,9 @@ def supervise_batch_process(
             break
 
         line = str(raw).rstrip("\r\n")
+        browser_event = parse_browser_window_marker(line)
+        if browser_event:
+            record_worker_browser_event(worker_id, browser_event)
         event = consume_batch_marker(state, line, now=current_time)
         if event and event.get("kind") == "start":
             with _job_lock:
@@ -2569,6 +2607,7 @@ def job_worker(
                     "success": 0,
                     "fail": 0,
                     "last_error": "",
+                    "browser": None,
                 }
                 for item in assignments
             }

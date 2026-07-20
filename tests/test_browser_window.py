@@ -11,6 +11,8 @@ from lib.browser_window import (
     WindowControlResult,
     WindowsBrowserWindowController,
     bootstrap_hidden_chromium,
+    format_browser_window_marker,
+    parse_browser_window_marker,
 )
 
 
@@ -269,3 +271,49 @@ def test_failed_bootstrap_terminates_only_spawned_process_and_redacts_arguments(
         raise AssertionError("HiddenLaunchError was not raised")
 
     assert terminated == [9400]
+
+
+def test_browser_window_marker_round_trip_is_stable_and_secret_free():
+    marker = format_browser_window_marker(
+        BrowserWindowRef(
+            worker_id=3,
+            generation=4,
+            pid=9300,
+            hwnd=701,
+            mode="hidden",
+        ),
+        state="hidden",
+        fallback=False,
+    )
+
+    event = parse_browser_window_marker(f"[12:00:00] {marker}")
+
+    assert marker == (
+        "@@GROK_BROWSER_WINDOW worker=3 generation=4 pid=9300 hwnd=701 "
+        "state=hidden mode=hidden fallback=0"
+    )
+    assert event == {
+        "worker_id": 3,
+        "generation": 4,
+        "pid": 9300,
+        "hwnd": 701,
+        "state": "hidden",
+        "mode": "hidden",
+        "fallback": False,
+    }
+    lowered = marker.lower()
+    assert "profile" not in lowered
+    assert "proxy" not in lowered
+    assert "token" not in lowered
+    assert "url" not in lowered
+
+
+def test_browser_window_marker_rejects_malformed_or_unknown_state():
+    assert parse_browser_window_marker("not a marker") is None
+    assert (
+        parse_browser_window_marker(
+            "@@GROK_BROWSER_WINDOW worker=1 generation=1 pid=2 hwnd=3 "
+            "state=surprise mode=hidden fallback=0"
+        )
+        is None
+    )

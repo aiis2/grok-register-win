@@ -446,6 +446,7 @@ def test_start_browser_hidden_mode_records_exact_launch_ownership(monkeypatch):
         hwnd=701,
     )
     apply_calls = []
+    logs = []
 
     @contextmanager
     def hidden_launcher():
@@ -462,7 +463,9 @@ def test_start_browser_hidden_mode_records_exact_launch_ownership(monkeypatch):
         lambda *_args, **_kwargs: apply_calls.append(True),
     )
 
-    instance, active_page = main.start_browser(use_proxy=False)
+    instance, active_page = main.start_browser(
+        log_callback=logs.append, use_proxy=False
+    )
 
     assert instance is fake
     assert active_page is page
@@ -473,6 +476,11 @@ def test_start_browser_hidden_mode_records_exact_launch_ownership(monkeypatch):
     assert main._owned_browser["requested_mode"] == "hidden"
     assert main._owned_browser["actual_mode"] == "hidden"
     assert main._owned_browser["fallback"] is False
+    markers = [line for line in logs if "@@GROK_BROWSER_WINDOW" in line]
+    assert markers == [
+        "@@GROK_BROWSER_WINDOW worker=1 generation=1 pid=8100 hwnd=701 "
+        "state=hidden mode=hidden fallback=0"
+    ]
 
 
 def test_hidden_launch_failure_falls_back_once_to_minimized_never_headless(

@@ -54,10 +54,12 @@ from credential_store import (  # type: ignore
     ensure_layout,
 )
 from lib.browser_window import (
+    BrowserWindowRef,
     HiddenLaunchResult,
     WINDOW_MODE_HIDDEN,
     WINDOW_MODE_MINIMIZED,
     WindowsBrowserWindowController,
+    format_browser_window_marker,
     normalize_browser_window_mode,
     scoped_hidden_chromium_launcher,
 )
@@ -2631,6 +2633,24 @@ def _owned_browser_process_ids(owned=None):
     return result
 
 
+def current_browser_window_marker() -> str:
+    owned = dict(_owned_browser)
+    actual_mode = str(owned.get("actual_mode") or "visible")
+    state = actual_mode if actual_mode in ("hidden", "minimized", "visible") else "error"
+    window_pid = int(owned.get("launcher_pid") or owned.get("pid") or 0)
+    return format_browser_window_marker(
+        BrowserWindowRef(
+            worker_id=get_registration_worker_id(),
+            generation=int(owned.get("generation") or 1),
+            pid=window_pid,
+            hwnd=int(owned.get("hwnd") or 0),
+            mode=actual_mode,
+        ),
+        state=state,
+        fallback=bool(owned.get("fallback")),
+    )
+
+
 def _wait_for_owned_pid_exit(pid: int, timeout: float = 3.0) -> bool:
     if not pid:
         return True
@@ -2835,6 +2855,8 @@ def start_browser(log_callback=None, use_proxy=True):
                     )
                 except Exception:
                     pass
+            if engine == "chromium" and log_callback:
+                log_callback(current_browser_window_marker())
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and get_configured_proxy():

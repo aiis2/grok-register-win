@@ -269,6 +269,73 @@ def test_marker_state_refreshes_deadline_and_deduplicates_results():
     assert state["deadline"] == 50
 
 
+def test_browser_marker_updates_only_matching_worker_and_newer_generation(
+    monkeypatch,
+):
+    monkeypatch.setitem(
+        panel_app._job,
+        "workers",
+        {"3": {"worker_id": 3, "pid": 7654, "status": "running"}},
+    )
+    first = {
+        "worker_id": 3,
+        "generation": 4,
+        "pid": 9300,
+        "hwnd": 701,
+        "state": "hidden",
+        "mode": "hidden",
+        "fallback": False,
+    }
+    stale = {**first, "generation": 3, "pid": 9200, "hwnd": 601}
+    wrong_worker = {**first, "worker_id": 2}
+
+    assert panel_app.record_worker_browser_event(3, first) is True
+    assert panel_app.record_worker_browser_event(3, stale) is False
+    assert panel_app.record_worker_browser_event(3, wrong_worker) is False
+    assert panel_app._job["workers"]["3"]["browser"] == {
+        "generation": 4,
+        "pid": 9300,
+        "hwnd": 701,
+        "state": "hidden",
+        "mode": "hidden",
+        "fallback": False,
+    }
+
+
+def test_supervisor_consumes_browser_marker_without_exposing_it_as_round_result(
+    monkeypatch,
+):
+    monkeypatch.setitem(
+        panel_app._job,
+        "workers",
+        {"1": {"worker_id": 1, "pid": 7654, "status": "running"}},
+    )
+    fake = FakeProcess(
+        [
+            "@@GROK_BROWSER_WINDOW worker=1 generation=2 pid=9300 hwnd=701 "
+            "state=hidden mode=hidden fallback=0",
+            "@@GROK_ROUND_START index=1 total=1 attempt=1",
+            "@@GROK_ROUND_RESULT index=1 total=1 attempt=1 status=success",
+        ]
+    )
+    state = panel_app.new_batch_marker_state(1, 1, 1, 30, now=0)
+    results = []
+
+    summary = panel_app.supervise_batch_process(
+        fake,
+        state,
+        stop_requested=lambda: False,
+        on_result=lambda index, status: results.append((index, status)),
+        terminate_proc=lambda _proc: None,
+        now=lambda: 1,
+        worker_id=1,
+    )
+
+    assert summary["outcomes"] == [(1, "success")]
+    assert results == [(1, "success")]
+    assert panel_app._job["workers"]["1"]["browser"]["hwnd"] == 701
+
+
 def test_retry_result_is_not_counted_as_terminal_round():
     state = panel_app.new_batch_marker_state(1, 1, 1, 30, now=0)
     panel_app.consume_batch_marker(

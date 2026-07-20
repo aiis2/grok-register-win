@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import json
+import re
 import subprocess
 import time
 from contextlib import contextmanager
@@ -19,6 +20,12 @@ WINDOW_MODES = {
     WINDOW_MODE_MINIMIZED,
     WINDOW_MODE_VISIBLE,
 }
+BROWSER_WINDOW_STATES = {"hidden", "minimized", "visible", "closed", "error"}
+_BROWSER_WINDOW_MARKER_RE = re.compile(
+    r"@@GROK_BROWSER_WINDOW\s+worker=(\d+)\s+generation=(\d+)\s+"
+    r"pid=(\d+)\s+hwnd=(\d+)\s+state=([a-z]+)\s+"
+    r"mode=([a-z]+)\s+fallback=([01])"
+)
 
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
@@ -74,6 +81,49 @@ class HiddenLaunchResult:
 
 class HiddenLaunchError(RuntimeError):
     """Raised when a headed Chromium cannot be bootstrapped invisibly."""
+
+
+def format_browser_window_marker(
+    ref: BrowserWindowRef, *, state: str, fallback: bool = False
+) -> str:
+    normalized_state = str(state or "").strip().lower()
+    normalized_mode = str(ref.mode or "").strip().lower()
+    if normalized_state not in BROWSER_WINDOW_STATES:
+        raise ValueError(f"unsupported browser window state: {normalized_state}")
+    if normalized_mode not in WINDOW_MODES:
+        raise ValueError(f"unsupported browser window mode: {normalized_mode}")
+    return (
+        "@@GROK_BROWSER_WINDOW "
+        f"worker={max(1, int(ref.worker_id))} "
+        f"generation={max(1, int(ref.generation))} "
+        f"pid={max(0, int(ref.pid))} "
+        f"hwnd={max(0, int(ref.hwnd))} "
+        f"state={normalized_state} mode={normalized_mode} "
+        f"fallback={1 if fallback else 0}"
+    )
+
+
+def parse_browser_window_marker(line: str):
+    match = _BROWSER_WINDOW_MARKER_RE.search(str(line or ""))
+    if not match:
+        return None
+    worker_id, generation, pid, hwnd = (
+        int(value) for value in match.groups()[:4]
+    )
+    state, mode, fallback = match.groups()[4:]
+    if state not in BROWSER_WINDOW_STATES or mode not in WINDOW_MODES:
+        return None
+    if worker_id < 1 or generation < 1 or pid < 1 or hwnd < 0:
+        return None
+    return {
+        "worker_id": worker_id,
+        "generation": generation,
+        "pid": pid,
+        "hwnd": hwnd,
+        "state": state,
+        "mode": mode,
+        "fallback": fallback == "1",
+    }
 
 
 def terminate_process_tree(pid: int) -> None:
