@@ -53,10 +53,13 @@ from credential_store import (  # type: ignore
     create_worker_output_paths,
     ensure_layout,
 )
-from browser_window import (  # type: ignore
+from lib.browser_window import (
+    HiddenLaunchResult,
     WINDOW_MODE_HIDDEN,
     WINDOW_MODE_MINIMIZED,
+    WindowsBrowserWindowController,
     normalize_browser_window_mode,
+    scoped_hidden_chromium_launcher,
 )
 
 try:
@@ -1000,13 +1003,15 @@ def apply_browser_silent_start(
     return minimized
 
 
-def create_browser_options(browser_proxy=""):
+def create_browser_options(browser_proxy="", window_mode=None):
     worker_id = get_registration_worker_id()
     options = ChromiumOptions()
     options.set_tmp_path(str(browser_runtime_tmp_path(worker_id)))
     options.auto_port(scope=browser_auto_port_scope(worker_id))
     options.set_timeouts(base=1)
-    window_mode = get_browser_window_mode()
+    window_mode = normalize_browser_window_mode(
+        get_browser_window_mode() if window_mode is None else window_mode
+    )
     if window_mode in (WINDOW_MODE_HIDDEN, WINDOW_MODE_MINIMIZED):
         # Keep headed workers out of the foreground while preserving page
         # rendering and timers needed by registration and Turnstile flows.
@@ -2441,12 +2446,25 @@ browser = None
 page = None
 browser_proxy_bridge = None
 browser_started_with_proxy = False
-_owned_browser = {
-    "pid": None,
-    "address": "",
-    "user_data_path": "",
-    "engine": "",
-}
+_browser_generation = 0
+
+
+def empty_owned_browser(engine=""):
+    return {
+        "pid": None,
+        "launcher_pid": None,
+        "address": "",
+        "user_data_path": "",
+        "engine": str(engine or ""),
+        "hwnd": 0,
+        "generation": 0,
+        "requested_mode": "",
+        "actual_mode": "",
+        "fallback": False,
+    }
+
+
+_owned_browser = empty_owned_browser()
 
 
 def setup_light_theme(root):
@@ -2550,29 +2568,67 @@ def tk_option_menu(parent, variable, values, width=12):
     return menu
 
 
-def _capture_browser_ownership(instance, engine: str) -> None:
+def _capture_browser_ownership(
+    instance,
+    engine: str,
+    *,
+    launch_result: HiddenLaunchResult | None = None,
+    requested_mode: str = "",
+    actual_mode: str = "",
+    fallback: bool = False,
+) -> None:
     """Capture only the Chromium instance created by this process."""
-    global _owned_browser
+    global _owned_browser, _browser_generation
     normalized_engine = str(engine or "").strip().lower()
     if normalized_engine != "chromium":
-        _owned_browser = {
-            "pid": None,
-            "address": "",
-            "user_data_path": "",
-            "engine": normalized_engine,
-        }
+        _owned_browser = empty_owned_browser(normalized_engine)
         return
     pid = getattr(instance, "process_id", None)
     try:
         pid = int(pid) if pid not in (None, "") else None
     except (TypeError, ValueError):
         pid = None
+    launcher_pid = (
+        int(launch_result.launcher_pid)
+        if launch_result is not None
+        else pid
+    )
+    hwnd = int(launch_result.hwnd) if launch_result is not None else 0
+    if not hwnd and pid and os.name == "nt":
+        try:
+            hwnd = WindowsBrowserWindowController().find_window_for_pid(pid)
+        except Exception:
+            hwnd = 0
+    _browser_generation += 1
+    requested = normalize_browser_window_mode(
+        requested_mode or get_browser_window_mode()
+    )
+    actual = normalize_browser_window_mode(actual_mode or requested)
     _owned_browser = {
         "pid": pid,
+        "launcher_pid": launcher_pid,
         "address": str(getattr(instance, "address", "") or ""),
         "user_data_path": str(getattr(instance, "user_data_path", "") or ""),
         "engine": normalized_engine,
+        "hwnd": hwnd,
+        "generation": _browser_generation,
+        "requested_mode": requested,
+        "actual_mode": actual,
+        "fallback": bool(fallback),
     }
+
+
+def _owned_browser_process_ids(owned=None):
+    record = owned if isinstance(owned, dict) else _owned_browser
+    result = []
+    for key in ("launcher_pid", "pid"):
+        try:
+            process_id = int(record.get(key) or 0)
+        except (TypeError, ValueError):
+            process_id = 0
+        if process_id and process_id not in result:
+            result.append(process_id)
+    return result
 
 
 def _wait_for_owned_pid_exit(pid: int, timeout: float = 3.0) -> bool:
@@ -2685,12 +2741,16 @@ def start_browser(log_callback=None, use_proxy=True):
     last_exc = None
     proxy_enabled = bool(use_proxy and get_configured_proxy())
     engine = get_browser_engine()
+    requested_window_mode = get_browser_window_mode() if engine == "chromium" else ""
     if log_callback:
         engine_label = "Camoufox 无头" if engine == "camoufox" else "Chromium 有头"
         log_callback(f"[*] 浏览器引擎: {engine_label}")
     for attempt in range(1, 5):
         bridge = None
         previous_foreground = 0
+        launch_result = None
+        actual_window_mode = requested_window_mode
+        window_mode_fallback = False
         try:
             browser_proxy, bridge = prepare_browser_proxy(use_proxy=use_proxy, log_callback=log_callback)
             if engine == "camoufox":
@@ -2718,14 +2778,55 @@ def start_browser(log_callback=None, use_proxy=True):
                         pass
                     bridge = None
             else:
-                previous_foreground = capture_browser_foreground()
-                browser = Chromium(create_browser_options(browser_proxy=browser_proxy))
+                if requested_window_mode == WINDOW_MODE_HIDDEN:
+                    try:
+                        with scoped_hidden_chromium_launcher() as launch_state:
+                            browser = Chromium(
+                                create_browser_options(
+                                    browser_proxy=browser_proxy,
+                                    window_mode=WINDOW_MODE_HIDDEN,
+                                )
+                            )
+                        launch_result = launch_state.get("result")
+                        if launch_result is None:
+                            raise RuntimeError("hidden launcher returned no ownership")
+                    except Exception as hidden_exc:
+                        actual_window_mode = WINDOW_MODE_MINIMIZED
+                        window_mode_fallback = True
+                        if log_callback:
+                            log_callback(
+                                "[!] Chromium 隐藏启动不可用，已回退到最小化兼容模式: "
+                                f"{type(hidden_exc).__name__}"
+                            )
+                        previous_foreground = capture_browser_foreground()
+                        browser = Chromium(
+                            create_browser_options(
+                                browser_proxy=browser_proxy,
+                                window_mode=WINDOW_MODE_MINIMIZED,
+                            )
+                        )
+                else:
+                    if requested_window_mode == WINDOW_MODE_MINIMIZED:
+                        previous_foreground = capture_browser_foreground()
+                    browser = Chromium(
+                        create_browser_options(
+                            browser_proxy=browser_proxy,
+                            window_mode=requested_window_mode,
+                        )
+                    )
                 browser_started_with_proxy = bool(browser_proxy)
-            _capture_browser_ownership(browser, engine)
+            _capture_browser_ownership(
+                browser,
+                engine,
+                launch_result=launch_result,
+                requested_mode=requested_window_mode,
+                actual_mode=actual_window_mode,
+                fallback=window_mode_fallback,
+            )
             browser_proxy_bridge = bridge
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
-            if engine == "chromium":
+            if engine == "chromium" and actual_window_mode == WINDOW_MODE_MINIMIZED:
                 try:
                     apply_browser_silent_start(
                         browser,
@@ -2760,9 +2861,9 @@ def start_browser(log_callback=None, use_proxy=True):
                         browser.quit(del_data=True)
             except Exception:
                 pass
-            owned_pid = _owned_browser.get("pid")
-            if owned_pid and not _wait_for_owned_pid_exit(owned_pid, timeout=2):
-                _terminate_owned_process_tree(owned_pid)
+            for owned_pid in _owned_browser_process_ids():
+                if not _wait_for_owned_pid_exit(owned_pid, timeout=2):
+                    _terminate_owned_process_tree(owned_pid)
             browser = None
             page = None
             browser_proxy_bridge = None
@@ -2784,20 +2885,15 @@ def stop_browser():
                 instance.quit(del_data=True)
         except Exception:
             pass
-    owned_pid = owned.get("pid")
-    if owned_pid and not _wait_for_owned_pid_exit(owned_pid, timeout=3):
-        _terminate_owned_process_tree(owned_pid)
-        _wait_for_owned_pid_exit(owned_pid, timeout=3)
+    for owned_pid in _owned_browser_process_ids(owned):
+        if not _wait_for_owned_pid_exit(owned_pid, timeout=3):
+            _terminate_owned_process_tree(owned_pid)
+            _wait_for_owned_pid_exit(owned_pid, timeout=3)
     stop_browser_proxy_bridge()
     browser = None
     page = None
     browser_started_with_proxy = False
-    _owned_browser = {
-        "pid": None,
-        "address": "",
-        "user_data_path": "",
-        "engine": "",
-    }
+    _owned_browser = empty_owned_browser()
 
 
 def restart_browser(log_callback=None, use_proxy=True):

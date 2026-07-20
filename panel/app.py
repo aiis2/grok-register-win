@@ -117,7 +117,7 @@ from mail_providers import (  # type: ignore
     provider_ready,
     resolved_provider_config,
 )
-from browser_window import normalize_browser_window_mode  # type: ignore
+from lib.browser_window import normalize_browser_window_mode
 
 try:
     from sso2cpa_core import (  # type: ignore

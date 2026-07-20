@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ctypes
 import importlib
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 
 import grok_register_ttk as main
+from lib.browser_window import HiddenLaunchError, HiddenLaunchResult
 
 
 class FakePage:
@@ -98,9 +100,10 @@ def restore_browser_globals(monkeypatch):
     monkeypatch.setattr(
         main,
         "_owned_browser",
-        {"pid": None, "address": "", "user_data_path": "", "engine": ""},
+        main.empty_owned_browser(),
         raising=False,
     )
+    monkeypatch.setattr(main, "_browser_generation", 0, raising=False)
 
 
 def test_prepare_next_account_reuses_healthy_browser(monkeypatch):
@@ -135,12 +138,12 @@ def test_capture_browser_ownership_records_only_chromium():
     fake = FakeBrowser([FakePage()], pid=8877)
 
     main._capture_browser_ownership(fake, "chromium")
-    assert main._owned_browser == {
-        "pid": 8877,
-        "address": "127.0.0.1:9222",
-        "user_data_path": r"C:\Temp\owned-profile",
-        "engine": "chromium",
-    }
+    assert main._owned_browser["pid"] == 8877
+    assert main._owned_browser["launcher_pid"] == 8877
+    assert main._owned_browser["address"] == "127.0.0.1:9222"
+    assert main._owned_browser["user_data_path"] == r"C:\Temp\owned-profile"
+    assert main._owned_browser["engine"] == "chromium"
+    assert main._owned_browser["generation"] == 1
 
     main._capture_browser_ownership(fake, "camoufox")
     assert main._owned_browser["pid"] is None
@@ -401,6 +404,7 @@ def test_start_browser_applies_silent_policy_around_chromium_launch(monkeypatch)
     fake = FakeBrowser([page], pid=4321)
 
     monkeypatch.setattr(main, "get_browser_engine", lambda: "chromium")
+    monkeypatch.setattr(main, "get_browser_window_mode", lambda: "minimized")
     monkeypatch.setattr(
         main,
         "prepare_browser_proxy",
@@ -429,6 +433,87 @@ def test_start_browser_applies_silent_policy_around_chromium_launch(monkeypatch)
     assert browser is fake
     assert active_page is page
     assert events == ["capture", "launch", ("apply", fake, page, 700)]
+
+
+def test_start_browser_hidden_mode_records_exact_launch_ownership(monkeypatch):
+    page = FakeSilentPage()
+    fake = FakeBrowser([page], pid=4321)
+    process = SimpleNamespace(pid=8100)
+    launch_result = HiddenLaunchResult(
+        process=process,
+        launcher_pid=8100,
+        target_id="target-1",
+        hwnd=701,
+    )
+    apply_calls = []
+
+    @contextmanager
+    def hidden_launcher():
+        yield {"result": launch_result}
+
+    monkeypatch.setattr(main, "get_browser_engine", lambda: "chromium")
+    monkeypatch.setattr(main, "get_browser_window_mode", lambda: "hidden")
+    monkeypatch.setattr(main, "prepare_browser_proxy", lambda **_kwargs: ("", None))
+    monkeypatch.setattr(main, "Chromium", lambda _options: fake)
+    monkeypatch.setattr(main, "scoped_hidden_chromium_launcher", hidden_launcher)
+    monkeypatch.setattr(
+        main,
+        "apply_browser_silent_start",
+        lambda *_args, **_kwargs: apply_calls.append(True),
+    )
+
+    instance, active_page = main.start_browser(use_proxy=False)
+
+    assert instance is fake
+    assert active_page is page
+    assert apply_calls == []
+    assert main._owned_browser["pid"] == 4321
+    assert main._owned_browser["launcher_pid"] == 8100
+    assert main._owned_browser["hwnd"] == 701
+    assert main._owned_browser["requested_mode"] == "hidden"
+    assert main._owned_browser["actual_mode"] == "hidden"
+    assert main._owned_browser["fallback"] is False
+
+
+def test_hidden_launch_failure_falls_back_once_to_minimized_never_headless(
+    monkeypatch,
+):
+    page = FakeSilentPage()
+    fake = FakeBrowser([page], pid=4321)
+    launched_options = []
+    logs = []
+
+    @contextmanager
+    def unavailable_hidden_launcher():
+        raise HiddenLaunchError("hidden Chromium launch failed (RuntimeError)")
+        yield  # pragma: no cover
+
+    def launch(options):
+        launched_options.append(options)
+        return fake
+
+    monkeypatch.setattr(main, "get_browser_engine", lambda: "chromium")
+    monkeypatch.setattr(main, "get_browser_window_mode", lambda: "hidden")
+    monkeypatch.setattr(main, "prepare_browser_proxy", lambda **_kwargs: ("", None))
+    monkeypatch.setattr(main, "Chromium", launch)
+    monkeypatch.setattr(
+        main, "scoped_hidden_chromium_launcher", unavailable_hidden_launcher
+    )
+
+    instance, _active_page = main.start_browser(
+        log_callback=logs.append, use_proxy=False
+    )
+
+    assert instance is fake
+    assert len(launched_options) == 1
+    assert "--start-minimized" in launched_options[0].arguments
+    assert not any(
+        arg.startswith("--headless") for arg in launched_options[0].arguments
+    )
+    assert main._owned_browser["requested_mode"] == "hidden"
+    assert main._owned_browser["actual_mode"] == "minimized"
+    assert main._owned_browser["fallback"] is True
+    assert any("隐藏启动不可用" in line for line in logs)
 
 
 def test_repeated_account_transitions_never_restart_a_healthy_browser(monkeypatch):

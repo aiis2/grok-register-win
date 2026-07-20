@@ -6,7 +6,11 @@ from lib.browser_window import (
     WS_EX_APPWINDOW,
     WS_EX_TOOLWINDOW,
     BrowserWindowRef,
+    HiddenLaunchError,
+    HiddenLaunchResult,
+    WindowControlResult,
     WindowsBrowserWindowController,
+    bootstrap_hidden_chromium,
 )
 
 
@@ -155,3 +159,113 @@ def test_find_window_selects_only_chrome_top_level_window_for_exact_pid():
 
     assert controller.find_window_for_pid(9001) == 703
     assert controller.find_window_for_pid(7777) == 0
+
+
+class FakeProcess:
+    def __init__(self, pid=9300):
+        self.pid = pid
+
+
+class FakeWebSocket:
+    def __init__(self):
+        self.sent = []
+        self.closed = False
+
+    def send(self, payload):
+        import json
+
+        self.sent.append(json.loads(payload))
+
+    def recv(self):
+        return '{"id":1,"result":{"targetId":"target-1"}}'
+
+    def close(self):
+        self.closed = True
+
+
+class FakeBootstrapController:
+    def __init__(self, hwnd=701):
+        self.hwnd = hwnd
+        self.hidden_refs = []
+
+    def find_window_for_pid(self, pid):
+        return self.hwnd
+
+    def hide(self, ref):
+        self.hidden_refs.append(ref)
+        return WindowControlResult(True, "hidden")
+
+
+def test_silent_bootstrap_creates_headed_background_minimized_window():
+    process = FakeProcess()
+    websocket = FakeWebSocket()
+    controller = FakeBootstrapController()
+    popen_calls = []
+
+    def popen(arguments, **kwargs):
+        popen_calls.append((list(arguments), dict(kwargs)))
+        return process
+
+    result = bootstrap_hidden_chromium(
+        port=19222,
+        browser_path="chrome.exe",
+        arguments=["--user-data-dir=X", "--silent-launch"],
+        controller=controller,
+        popen=popen,
+        version_reader=lambda _port: {
+            "webSocketDebuggerUrl": "ws://127.0.0.1:19222/devtools/browser/id"
+        },
+        websocket_factory=lambda _url: websocket,
+    )
+
+    launched_arguments = popen_calls[0][0]
+    assert launched_arguments[0] == "chrome.exe"
+    assert "--remote-debugging-port=19222" in launched_arguments
+    assert "--silent-launch" in launched_arguments
+    assert not any(arg.startswith("--headless") for arg in launched_arguments)
+    assert websocket.sent == [
+        {
+            "id": 1,
+            "method": "Target.createTarget",
+            "params": {
+                "url": "about:blank",
+                "newWindow": True,
+                "background": True,
+                "focus": False,
+                "windowState": "minimized",
+            },
+        }
+    ]
+    assert websocket.closed is True
+    assert result == HiddenLaunchResult(
+        process=process,
+        launcher_pid=9300,
+        target_id="target-1",
+        hwnd=701,
+    )
+    assert controller.hidden_refs[0].pid == 9300
+    assert controller.hidden_refs[0].hwnd == 701
+
+
+def test_failed_bootstrap_terminates_only_spawned_process_and_redacts_arguments():
+    process = FakeProcess(pid=9400)
+    terminated = []
+
+    try:
+        bootstrap_hidden_chromium(
+            port=19223,
+            browser_path="chrome.exe",
+            arguments=["--proxy-server=http://user:super-secret@example.test:8080"],
+            controller=FakeBootstrapController(),
+            popen=lambda *_args, **_kwargs: process,
+            version_reader=lambda _port: (_ for _ in ()).throw(
+                RuntimeError("connection failed super-secret")
+            ),
+            process_tree_terminator=lambda pid: terminated.append(pid),
+        )
+    except HiddenLaunchError as exc:
+        assert "super-secret" not in str(exc)
+    else:  # pragma: no cover - explicit assertion gives a clearer failure
+        raise AssertionError("HiddenLaunchError was not raised")
+
+    assert terminated == [9400]

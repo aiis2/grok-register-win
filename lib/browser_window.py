@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import sys
+import json
+import subprocess
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 
 WINDOW_MODE_HIDDEN = "hidden"
@@ -57,6 +62,222 @@ class WindowControlResult:
     state: str
     code: str = ""
     error: str = ""
+
+
+@dataclass(frozen=True)
+class HiddenLaunchResult:
+    process: object
+    launcher_pid: int
+    target_id: str
+    hwnd: int
+
+
+class HiddenLaunchError(RuntimeError):
+    """Raised when a headed Chromium cannot be bootstrapped invisibly."""
+
+
+def terminate_process_tree(pid: int) -> None:
+    """Terminate one exact captured process tree, never a process-name match."""
+    process_id = int(pid or 0)
+    if not process_id:
+        return
+    try:
+        import psutil
+
+        root = psutil.Process(process_id)
+        processes = root.children(recursive=True)
+        processes.append(root)
+        for process in reversed(processes):
+            try:
+                process.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _, alive = psutil.wait_procs(processes, timeout=2)
+        for process in alive:
+            try:
+                process.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=2)
+    except Exception:
+        pass
+
+
+def _read_cdp_version(port: int) -> dict:
+    import requests
+
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        response = session.get(
+            f"http://127.0.0.1:{int(port)}/json/version",
+            headers={"Connection": "close"},
+            timeout=0.5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+    finally:
+        session.close()
+
+
+def _open_cdp_websocket(url: str):
+    from websocket import create_connection
+
+    return create_connection(str(url), timeout=5, suppress_origin=True)
+
+
+def bootstrap_hidden_chromium(
+    *,
+    port: int,
+    browser_path: str,
+    arguments,
+    controller=None,
+    popen=None,
+    version_reader=None,
+    websocket_factory=None,
+    process_tree_terminator=None,
+    timeout: float = 10.0,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> HiddenLaunchResult:
+    """Launch headed Chromium silently, create one background native window, hide it."""
+    controller = controller or WindowsBrowserWindowController()
+    popen = popen or subprocess.Popen
+    version_reader = version_reader or _read_cdp_version
+    websocket_factory = websocket_factory or _open_cdp_websocket
+    process_tree_terminator = process_tree_terminator or terminate_process_tree
+    process = None
+    websocket = None
+    try:
+        launch_arguments = [str(item) for item in list(arguments or [])]
+        if any(item.startswith("--headless") for item in launch_arguments):
+            raise ValueError("headless arguments are forbidden in hidden headed mode")
+        if "--silent-launch" not in launch_arguments:
+            launch_arguments.append("--silent-launch")
+
+        executable = Path(str(browser_path))
+        if executable.is_dir():
+            executable = executable / "chrome.exe"
+        command = [
+            str(executable),
+            f"--remote-debugging-port={int(port)}",
+            *launch_arguments,
+        ]
+        process = popen(
+            command,
+            shell=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        launcher_pid = int(getattr(process, "pid", 0) or 0)
+        if not launcher_pid:
+            raise RuntimeError("spawned Chromium did not expose a PID")
+
+        deadline = monotonic() + max(0.1, float(timeout))
+        version = {}
+        while monotonic() < deadline:
+            version = version_reader(int(port)) or {}
+            if version.get("webSocketDebuggerUrl"):
+                break
+            sleep(0.02)
+        websocket_url = str(version.get("webSocketDebuggerUrl") or "")
+        if not websocket_url:
+            raise RuntimeError("browser CDP endpoint did not become ready")
+
+        websocket = websocket_factory(websocket_url)
+        command_payload = {
+            "id": 1,
+            "method": "Target.createTarget",
+            "params": {
+                "url": "about:blank",
+                "newWindow": True,
+                "background": True,
+                "focus": False,
+                "windowState": "minimized",
+            },
+        }
+        websocket.send(json.dumps(command_payload, separators=(",", ":")))
+        response = {}
+        while monotonic() < deadline:
+            response = json.loads(websocket.recv())
+            if response.get("id") == 1:
+                break
+        if response.get("error"):
+            raise RuntimeError("Target.createTarget was rejected")
+        target_id = str((response.get("result") or {}).get("targetId") or "")
+        if not target_id:
+            raise RuntimeError("Target.createTarget returned no target id")
+
+        hwnd = 0
+        while monotonic() < deadline:
+            hwnd = int(controller.find_window_for_pid(launcher_pid) or 0)
+            if hwnd:
+                break
+            sleep(0.01)
+        if not hwnd:
+            raise RuntimeError("Chromium native window was not found")
+        hidden = controller.hide(
+            BrowserWindowRef(pid=launcher_pid, hwnd=hwnd, mode=WINDOW_MODE_HIDDEN)
+        )
+        if not hidden.ok:
+            raise RuntimeError("Chromium native window could not be hidden")
+        return HiddenLaunchResult(
+            process=process,
+            launcher_pid=launcher_pid,
+            target_id=target_id,
+            hwnd=hwnd,
+        )
+    except HiddenLaunchError:
+        raise
+    except Exception as exc:
+        if process is not None:
+            process_tree_terminator(int(getattr(process, "pid", 0) or 0))
+        raise HiddenLaunchError(
+            f"hidden Chromium launch failed ({type(exc).__name__})"
+        ) from exc
+    finally:
+        if websocket is not None:
+            try:
+                websocket.close()
+            except Exception:
+                pass
+
+
+@contextmanager
+def scoped_hidden_chromium_launcher(
+    *, controller=None, bootstrap=bootstrap_hidden_chromium
+):
+    """Temporarily replace DrissionPage's process spawn without editing the package."""
+    from DrissionPage._functions import browser as drission_browser
+
+    controller = controller or WindowsBrowserWindowController()
+    original_runner = drission_browser._run_browser
+    state: dict[str, HiddenLaunchResult | None] = {"result": None}
+
+    def hidden_runner(port, path, arguments):
+        result = bootstrap(
+            port=int(port),
+            browser_path=str(path),
+            arguments=arguments,
+            controller=controller,
+        )
+        state["result"] = result
+        return result.process
+
+    drission_browser._run_browser = hidden_runner
+    try:
+        yield state
+    except Exception:
+        result = state.get("result")
+        if result is not None:
+            terminate_process_tree(result.launcher_pid)
+        raise
+    finally:
+        drission_browser._run_browser = original_runner
 
 
 class CtypesWindowsApi:
