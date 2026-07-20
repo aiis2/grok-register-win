@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -288,21 +289,53 @@ def test_browser_options_isolate_profile_root_by_worker_and_process(
     )
 
 
-def test_browser_options_request_silent_minimized_start_when_enabled(monkeypatch):
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("hidden", "hidden"),
+        ("minimized", "minimized"),
+        ("visible", "visible"),
+        ("", "hidden"),
+        ("unknown", "hidden"),
+    ],
+)
+def test_normalize_browser_window_mode_on_windows(value, expected):
+    browser_window = importlib.import_module("lib.browser_window")
+
+    assert (
+        browser_window.normalize_browser_window_mode(value, platform="win32")
+        == expected
+    )
+
+
+def test_hidden_mode_is_headed_and_uses_silent_launch(monkeypatch):
     monkeypatch.setattr(
-        main, "browser_silent_start_enabled", lambda: True, raising=False
+        main, "get_browser_window_mode", lambda: "hidden", raising=False
+    )
+
+    options = main.create_browser_options()
+
+    assert "--silent-launch" in options.arguments
+    assert "--start-minimized" not in options.arguments
+    assert not any(arg.startswith("--headless") for arg in options.arguments)
+
+
+def test_minimized_mode_retains_compatibility_flag(monkeypatch):
+    monkeypatch.setattr(
+        main, "get_browser_window_mode", lambda: "minimized", raising=False
     )
 
     options = main.create_browser_options()
 
     assert "--start-minimized" in options.arguments
+    assert "--silent-launch" not in options.arguments
 
 
 def test_silent_minimized_browser_keeps_background_automation_unthrottled(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        main, "browser_silent_start_enabled", lambda: True, raising=False
+        main, "get_browser_window_mode", lambda: "hidden", raising=False
     )
 
     options = main.create_browser_options()

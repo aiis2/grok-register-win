@@ -18,6 +18,7 @@ def isolated_config(tmp_path, monkeypatch):
                 "credentials_dir": "data/credentials",
                 "register_concurrency": 4,
                 "browser_engine": "chromium",
+                "browser_window_mode": "hidden",
             }
         ),
         encoding="utf-8",
@@ -87,14 +88,37 @@ def test_job_start_persists_and_passes_valid_concurrency(
 
     response = panel_app.app.test_client().post(
         "/api/job/start",
-        json={"count": 7, "concurrency": 3, "browser_engine": "chromium"},
+        json={
+            "count": 7,
+            "concurrency": 3,
+            "browser_engine": "chromium",
+            "browser_window_mode": "minimized",
+        },
     )
 
     assert response.status_code == 200
     assert calls == [(7, 3)]
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["register_concurrency"] == 3
+    assert saved["browser_window_mode"] == "minimized"
     assert response.get_json()["concurrency"] == 3
+
+
+def test_browser_config_get_and_post_round_trip_window_mode(isolated_config):
+    client = panel_app.app.test_client()
+
+    before = client.get("/api/config/browser")
+    updated = client.post(
+        "/api/config/browser",
+        json={"browser_engine": "chromium", "browser_window_mode": "visible"},
+    )
+    after = client.get("/api/config/browser")
+
+    assert before.status_code == 200
+    assert before.get_json()["browser_window_mode"] == "hidden"
+    assert updated.status_code == 200
+    assert updated.get_json()["browser_window_mode"] == "visible"
+    assert after.get_json()["browser_window_mode"] == "visible"
 
 
 def test_job_start_uses_saved_concurrency_when_request_omits_it(

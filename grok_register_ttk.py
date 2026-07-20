@@ -53,6 +53,11 @@ from credential_store import (  # type: ignore
     create_worker_output_paths,
     ensure_layout,
 )
+from browser_window import (  # type: ignore
+    WINDOW_MODE_HIDDEN,
+    WINDOW_MODE_MINIMIZED,
+    normalize_browser_window_mode,
+)
 
 try:
     import mail_providers as mail_providers  # type: ignore
@@ -201,6 +206,8 @@ DEFAULT_CONFIG = {
     "grok2api_remote_app_key": "",
     # chromium = DrissionPage 有头; camoufox = Camoufox 无头（反检测 Firefox）
     "browser_engine": "chromium",
+    # hidden = 隐藏有头窗口; minimized = 最小化兼容; visible = 正常显示
+    "browser_window_mode": "hidden",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -913,6 +920,12 @@ def browser_silent_start_enabled() -> bool:
     return os.name == "nt"
 
 
+def get_browser_window_mode() -> str:
+    env = str(os.environ.get("GROK_BROWSER_WINDOW_MODE") or "").strip()
+    value = env if env else config.get("browser_window_mode", "hidden")
+    return normalize_browser_window_mode(value)
+
+
 def capture_browser_foreground(*, user32=None) -> int:
     """Capture the user's active window immediately before Chromium starts."""
     if not browser_silent_start_enabled():
@@ -993,16 +1006,20 @@ def create_browser_options(browser_proxy=""):
     options.set_tmp_path(str(browser_runtime_tmp_path(worker_id)))
     options.auto_port(scope=browser_auto_port_scope(worker_id))
     options.set_timeouts(base=1)
-    if browser_silent_start_enabled():
+    window_mode = get_browser_window_mode()
+    if window_mode in (WINDOW_MODE_HIDDEN, WINDOW_MODE_MINIMIZED):
         # Keep headed workers out of the foreground while preserving page
         # rendering and timers needed by registration and Turnstile flows.
         for argument in (
-            "--start-minimized",
             "--disable-backgrounding-occluded-windows",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
         ):
             options.set_argument(argument)
+    if window_mode == WINDOW_MODE_HIDDEN:
+        options.set_argument("--silent-launch")
+    elif window_mode == WINDOW_MODE_MINIMIZED:
+        options.set_argument("--start-minimized")
     # Server-friendly browser path / flags
     for _browser_path in (
         os.environ.get("BROWSER_PATH") or "",

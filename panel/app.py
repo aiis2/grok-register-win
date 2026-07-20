@@ -117,6 +117,7 @@ from mail_providers import (  # type: ignore
     provider_ready,
     resolved_provider_config,
 )
+from browser_window import normalize_browser_window_mode  # type: ignore
 
 try:
     from sso2cpa_core import (  # type: ignore
@@ -1966,6 +1967,7 @@ def build_cli_batch_env(
     engine: str,
     timeout: int,
     worker_id: int = 1,
+    window_mode: str = "hidden",
 ) -> dict:
     env = dict(base_env or {})
     env["PYTHONUNBUFFERED"] = "1"
@@ -1975,6 +1977,7 @@ def build_cli_batch_env(
     env["GROK_ROUND_OFFSET"] = str(int(round_offset))
     env["GROK_REGISTER_TOTAL"] = str(int(total))
     env["GROK_WORKER_ID"] = str(normalize_registration_concurrency(worker_id))
+    env["GROK_BROWSER_WINDOW_MODE"] = normalize_browser_window_mode(window_mode)
     return env
 
 
@@ -2139,6 +2142,10 @@ def _run_batch(
     else:
         engine = "chromium"
     cfg_run["browser_engine"] = engine
+    window_mode = normalize_browser_window_mode(
+        cfg_run.get("browser_window_mode") or "hidden"
+    )
+    cfg_run["browser_window_mode"] = window_mode
     # API/job_worker 已在启动 worker 前保存代理和引擎。每个并发槽只读同一份
     # 快照，避免多个线程同时 os.replace(config.json) 令其它槽短暂读到空配置。
     round_timeout = resolve_round_timeout_sec(cfg_run)
@@ -2150,6 +2157,7 @@ def _run_batch(
         engine=engine,
         timeout=round_timeout,
         worker_id=worker_id,
+        window_mode=window_mode,
     )
     # Windows / local: use system Chrome/Edge; allow override (chromium engine only)
     if engine == "chromium":
@@ -4845,6 +4853,9 @@ def api_get_browser_config():
         {
             "ok": True,
             "browser_engine": _normalize_browser_engine(cfg.get("browser_engine") or "chromium"),
+            "browser_window_mode": normalize_browser_window_mode(
+                cfg.get("browser_window_mode") or "hidden"
+            ),
         }
     )
 
@@ -4856,14 +4867,19 @@ def api_set_browser_config():
         return need
     data = request.get_json(force=True, silent=True) or {}
     eng = _normalize_browser_engine(data.get("browser_engine") or "chromium")
+    window_mode = normalize_browser_window_mode(
+        data.get("browser_window_mode") or "hidden"
+    )
     cfg = load_config()
     cfg["browser_engine"] = eng
+    cfg["browser_window_mode"] = window_mode
     save_config(cfg)
     label = "Camoufox 无头" if eng == "camoufox" else "Chromium 有头"
     return jsonify(
         {
             "ok": True,
             "browser_engine": eng,
+            "browser_window_mode": window_mode,
             "message": f"浏览器引擎已保存: {label}",
         }
     )
@@ -4901,6 +4917,10 @@ def api_job_start():
     if "browser_engine" in data:
         eng = _normalize_browser_engine(data.get("browser_engine"))
         cfg["browser_engine"] = eng
+    if "browser_window_mode" in data:
+        cfg["browser_window_mode"] = normalize_browser_window_mode(
+            data.get("browser_window_mode")
+        )
     save_config_atomic(cfg)
     ok, msg = start_job(count, concurrency)
     if not ok:

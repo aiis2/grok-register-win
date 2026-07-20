@@ -2,6 +2,7 @@
   "proxy": "http://127.0.0.1:7897",
   "allow_proxy_fallback": false,
   "browser_engine": "chromium",
+  "browser_window_mode": "hidden",
   "enable_nsfw": true,
   "register_count": 1,
   "register_concurrency": 1,

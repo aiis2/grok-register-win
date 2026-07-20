@@ -472,11 +472,13 @@ def test_worker_environment_contains_unique_worker_identity():
         engine="chromium",
         timeout=120,
         worker_id=2,
+        window_mode="hidden",
     )
 
     assert env["GROK_WORKER_ID"] == "2"
     assert env["GROK_REGISTER_COUNT"] == "3"
     assert env["GROK_ROUND_OFFSET"] == "4"
+    assert env["GROK_BROWSER_WINDOW_MODE"] == "hidden"
 
 
 def test_worker_assignments_run_at_the_same_time_and_keep_all_results():
