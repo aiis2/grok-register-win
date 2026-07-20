@@ -5,6 +5,7 @@ import json
 import pytest
 
 from panel import app as panel_app
+from lib.browser_window import WindowControlResult
 
 
 @pytest.fixture
@@ -173,6 +174,193 @@ def test_job_status_exposes_sorted_worker_array_and_effective_concurrency(
     assert job["effective_concurrency"] == 2
     assert job["active_workers"] == 1
     assert job["outcomes"] == {"1": "success"}
+
+
+def _running_worker(worker_id, *, generation, pid, hwnd, state="hidden"):
+    return {
+        "worker_id": worker_id,
+        "pid": 8000 + worker_id,
+        "status": "running",
+        "start_index": worker_id,
+        "batch_count": 1,
+        "browser": {
+            "generation": generation,
+            "pid": pid,
+            "hwnd": hwnd,
+            "state": state,
+            "mode": "hidden",
+            "fallback": False,
+        },
+    }
+
+
+def test_show_worker_browser_hides_other_registered_window_first(
+    isolated_config, monkeypatch
+):
+    calls = []
+    workers = {
+        "1": _running_worker(
+            1, generation=3, pid=9101, hwnd=7101, state="visible"
+        ),
+        "2": _running_worker(
+            2, generation=4, pid=9102, hwnd=7102, state="hidden"
+        ),
+    }
+    monkeypatch.setitem(panel_app._job, "running", True)
+    monkeypatch.setitem(panel_app._job, "workers", workers)
+
+    def fake_control(ref, action):
+        calls.append((action, ref.worker_id, ref.generation, ref.pid, ref.hwnd))
+        return WindowControlResult(True, "hidden" if action == "hide" else "visible")
+
+    monkeypatch.setattr(panel_app, "control_worker_browser", fake_control)
+
+    response = panel_app.app.test_client().post(
+        "/api/job/workers/2/browser/show"
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        ("hide", 1, 3, 9101, 7101),
+        ("show", 2, 4, 9102, 7102),
+    ]
+    assert workers["1"]["browser"]["state"] == "hidden"
+    assert workers["2"]["browser"]["state"] == "visible"
+    assert response.get_json()["browser"]["state"] == "visible"
+
+
+def test_hide_worker_browser_controls_only_requested_registered_window(
+    isolated_config, monkeypatch
+):
+    calls = []
+    workers = {
+        "1": _running_worker(
+            1, generation=3, pid=9201, hwnd=7201, state="visible"
+        ),
+        "2": _running_worker(
+            2, generation=4, pid=9202, hwnd=7202, state="visible"
+        ),
+    }
+    monkeypatch.setitem(panel_app._job, "running", True)
+    monkeypatch.setitem(panel_app._job, "workers", workers)
+    monkeypatch.setattr(
+        panel_app,
+        "control_worker_browser",
+        lambda ref, action: calls.append((action, ref.worker_id))
+        or WindowControlResult(True, "hidden"),
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/job/workers/1/browser/hide"
+    )
+
+    assert response.status_code == 200
+    assert calls == [("hide", 1)]
+    assert workers["1"]["browser"]["state"] == "hidden"
+    assert workers["2"]["browser"]["state"] == "visible"
+
+
+@pytest.mark.parametrize(
+    ("running", "workers", "expected"),
+    [
+        (False, {}, "注册任务未运行"),
+        (True, {"1": {"worker_id": 1, "status": "running"}}, "浏览器窗口不可用"),
+        (
+            True,
+            {
+                "1": _running_worker(
+                    1, generation=1, pid=9301, hwnd=0, state="hidden"
+                )
+            },
+            "浏览器窗口不可用",
+        ),
+    ],
+)
+def test_worker_browser_control_rejects_unavailable_window(
+    isolated_config, monkeypatch, running, workers, expected
+):
+    monkeypatch.setitem(panel_app._job, "running", running)
+    monkeypatch.setitem(panel_app._job, "workers", workers)
+    monkeypatch.setattr(
+        panel_app,
+        "control_worker_browser",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("native control must not run")
+        ),
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/job/workers/1/browser/show"
+    )
+
+    assert response.status_code == 409
+    assert expected in response.get_json()["error"]
+
+
+def test_worker_browser_control_rejects_stale_generation_on_writeback(
+    isolated_config, monkeypatch
+):
+    workers = {
+        "1": _running_worker(
+            1, generation=7, pid=9401, hwnd=7401, state="hidden"
+        )
+    }
+    monkeypatch.setitem(panel_app._job, "running", True)
+    monkeypatch.setitem(panel_app._job, "workers", workers)
+
+    def restart_before_result(_ref, _action):
+        workers["1"]["browser"] = {
+            **workers["1"]["browser"],
+            "generation": 8,
+            "pid": 9402,
+            "hwnd": 7402,
+        }
+        return WindowControlResult(True, "visible")
+
+    monkeypatch.setattr(
+        panel_app, "control_worker_browser", restart_before_result
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/job/workers/1/browser/show"
+    )
+
+    assert response.status_code == 409
+    assert "已重启" in response.get_json()["error"]
+    assert workers["1"]["browser"]["generation"] == 8
+    assert workers["1"]["browser"]["state"] == "hidden"
+
+
+def test_worker_browser_control_surfaces_native_ownership_error(
+    isolated_config, monkeypatch
+):
+    workers = {
+        "1": _running_worker(
+            1, generation=2, pid=9501, hwnd=7501, state="hidden"
+        )
+    }
+    monkeypatch.setitem(panel_app._job, "running", True)
+    monkeypatch.setitem(panel_app._job, "workers", workers)
+    monkeypatch.setattr(
+        panel_app,
+        "control_worker_browser",
+        lambda _ref, _action: WindowControlResult(
+            False,
+            "error",
+            code="ownership_changed",
+            error="browser window ownership changed",
+        ),
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/job/workers/1/browser/show"
+    )
+
+    assert response.status_code == 409
+    payload = response.get_json()
+    assert payload["code"] == "ownership_changed"
+    assert "归属" in payload["error"]
+    assert workers["1"]["browser"]["state"] == "hidden"
 
 
 def test_poll_disables_storage_migration_while_registration_runs():

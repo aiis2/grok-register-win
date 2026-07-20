@@ -118,6 +118,9 @@ from mail_providers import (  # type: ignore
     resolved_provider_config,
 )
 from lib.browser_window import (
+    BrowserWindowRef,
+    WindowControlResult,
+    WindowsBrowserWindowController,
     normalize_browser_window_mode,
     parse_browser_window_marker,
 )
@@ -275,6 +278,7 @@ def _active_credential_files(layout: CredentialLayout) -> List[Path]:
 
 # --------------- job state ---------------
 _job_lock = threading.Lock()
+_browser_control_lock = threading.Lock()
 _activity_lock = threading.Lock()
 _credential_migration_lock = threading.Lock()
 _job: Dict = {
@@ -1889,6 +1893,145 @@ def record_worker_browser_event(worker_id: int, event: dict) -> bool:
             "fallback": bool(event.get("fallback")),
         }
     return True
+
+
+def _browser_ref_from_worker(worker: dict) -> Optional[BrowserWindowRef]:
+    browser = worker.get("browser") if isinstance(worker, dict) else None
+    if not isinstance(browser, dict):
+        return None
+    try:
+        ref = BrowserWindowRef(
+            worker_id=int(worker.get("worker_id") or 0),
+            generation=int(browser.get("generation") or 0),
+            pid=int(browser.get("pid") or 0),
+            hwnd=int(browser.get("hwnd") or 0),
+            mode=normalize_browser_window_mode(browser.get("mode")),
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        ref.worker_id < 1
+        or ref.generation < 1
+        or ref.pid < 1
+        or ref.hwnd < 1
+    ):
+        return None
+    return ref
+
+
+def _browser_ref_is_current_locked(ref: BrowserWindowRef) -> bool:
+    worker = (_job.get("workers") or {}).get(str(ref.worker_id))
+    current = _browser_ref_from_worker(worker) if isinstance(worker, dict) else None
+    return current == ref
+
+
+def _set_browser_state_if_current(
+    ref: BrowserWindowRef, state: str
+) -> Optional[dict]:
+    with _job_lock:
+        if not _browser_ref_is_current_locked(ref):
+            return None
+        worker = (_job.get("workers") or {})[str(ref.worker_id)]
+        worker["browser"]["state"] = str(state)
+        return copy.deepcopy(worker["browser"])
+
+
+def control_worker_browser(
+    ref: BrowserWindowRef, action: str
+) -> WindowControlResult:
+    """Control exactly one captured HWND after validating its captured PID."""
+    controller = WindowsBrowserWindowController()
+    if action == "hide":
+        return controller.hide(ref)
+    if action == "show":
+        return controller.show(ref, activate=True)
+    return WindowControlResult(
+        False, "error", code="invalid_action", error="unsupported action"
+    )
+
+
+def _browser_control_error(result: WindowControlResult) -> str:
+    if result.code == "window_missing":
+        return "浏览器窗口已关闭或不可用"
+    if result.code == "ownership_changed":
+        return "浏览器窗口归属已变化，已拒绝控制"
+    if result.code == "invalid_action":
+        return "不支持的浏览器窗口操作"
+    detail = str(result.error or "").strip()
+    return f"浏览器窗口控制失败: {detail}" if detail else "浏览器窗口控制失败"
+
+
+def control_registered_worker_browser(worker_id: int, action: str):
+    """Show/hide a current worker browser without trusting stale markers."""
+    worker_key = str(int(worker_id))
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action not in ("show", "hide"):
+        return False, {"code": "invalid_action", "error": "不支持的浏览器窗口操作"}
+
+    with _browser_control_lock:
+        with _job_lock:
+            if not _job.get("running"):
+                return False, {
+                    "code": "job_not_running",
+                    "error": "注册任务未运行",
+                }
+            target_worker = (_job.get("workers") or {}).get(worker_key)
+            target_ref = (
+                _browser_ref_from_worker(target_worker)
+                if isinstance(target_worker, dict)
+                and target_worker.get("status") == "running"
+                and target_worker.get("pid") is not None
+                else None
+            )
+            if target_ref is None:
+                return False, {
+                    "code": "window_unavailable",
+                    "error": "该 worker 的浏览器窗口不可用",
+                }
+            other_refs = []
+            if normalized_action == "show":
+                for key, worker in (_job.get("workers") or {}).items():
+                    if key == worker_key or not isinstance(worker, dict):
+                        continue
+                    if worker.get("status") != "running" or worker.get("pid") is None:
+                        continue
+                    browser = worker.get("browser") or {}
+                    if browser.get("state") == "hidden":
+                        continue
+                    ref = _browser_ref_from_worker(worker)
+                    if ref is not None:
+                        other_refs.append(ref)
+
+        for other_ref in other_refs:
+            hidden = control_worker_browser(other_ref, "hide")
+            if not hidden.ok:
+                return False, {
+                    "code": hidden.code or "control_failed",
+                    "error": _browser_control_error(hidden),
+                }
+            if _set_browser_state_if_current(other_ref, hidden.state) is None:
+                return False, {
+                    "code": "stale_window",
+                    "error": "浏览器已重启，窗口状态已变化，请重试",
+                }
+
+        result = control_worker_browser(target_ref, normalized_action)
+        if not result.ok:
+            return False, {
+                "code": result.code or "control_failed",
+                "error": _browser_control_error(result),
+            }
+        browser = _set_browser_state_if_current(target_ref, result.state)
+        if browser is None:
+            return False, {
+                "code": "stale_window",
+                "error": "浏览器已重启，窗口状态已变化，请重试",
+            }
+        return True, {
+            "worker_id": int(worker_id),
+            "action": normalized_action,
+            "browser": browser,
+        }
 
 
 def _update_stats_from_log(line: str):
@@ -4976,6 +5119,17 @@ def api_job_stop():
     if not ok:
         return jsonify({"ok": False, "error": msg}), 400
     return jsonify({"ok": True, "message": msg})
+
+
+@app.post("/api/job/workers/<int:worker_id>/browser/<action>")
+def api_control_worker_browser(worker_id: int, action: str):
+    need = require_login()
+    if need:
+        return need
+    ok, result = control_registered_worker_browser(worker_id, action)
+    if not ok:
+        return jsonify({"ok": False, **result}), 409
+    return jsonify({"ok": True, **result})
 
 
 @app.get("/health")
