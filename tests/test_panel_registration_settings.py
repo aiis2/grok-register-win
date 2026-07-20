@@ -86,6 +86,7 @@ def test_worker_browser_renderer_uses_safe_dom_and_duplicate_request_guard():
     )[1].split("let credentialActionBusy", 1)[0]
 
     assert "worker.browser" in render_source
+    assert "browser.generation" in render_source
     assert "document.createElement('button')" in render_source
     assert ".textContent=" in render_source
     assert "innerHTML" not in render_source
@@ -183,12 +184,17 @@ def test_browser_config_get_and_post_round_trip_window_mode(isolated_config):
         "/api/config/browser",
         json={"browser_engine": "chromium", "browser_window_mode": "visible"},
     )
+    legacy_engine_only = client.post(
+        "/api/config/browser", json={"browser_engine": "chromium"}
+    )
     after = client.get("/api/config/browser")
 
     assert before.status_code == 200
     assert before.get_json()["browser_window_mode"] == "hidden"
     assert updated.status_code == 200
     assert updated.get_json()["browser_window_mode"] == "visible"
+    assert legacy_engine_only.status_code == 200
+    assert legacy_engine_only.get_json()["browser_window_mode"] == "visible"
     assert after.get_json()["browser_window_mode"] == "visible"
 
 

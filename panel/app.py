@@ -1796,6 +1796,9 @@ def register_worker_process(worker_id: int, proc: subprocess.Popen) -> bool:
         state = _worker_state_locked(worker)
         state["pid"] = getattr(proc, "pid", None)
         state["status"] = "running"
+        # A newly supervised CLI starts its browser generation at 1. Never
+        # compare its marker against ownership left by a previous CLI process.
+        state["browser"] = None
         _refresh_legacy_pid_locked()
     return True
 
@@ -1829,6 +1832,7 @@ def terminate_worker_process(worker_id: int, proc: subprocess.Popen) -> bool:
             state = _worker_state_locked(worker)
             state["pid"] = None
             state["status"] = "stopping"
+            state["browser"] = None
             _refresh_legacy_pid_locked()
     _terminate_register_proc(proc)
     return True
@@ -1872,6 +1876,14 @@ def record_worker_browser_event(worker_id: int, event: dict) -> bool:
     with _job_lock:
         worker = (_job.get("workers") or {}).get(worker_key)
         if not isinstance(worker, dict):
+            return False
+        owned_proc = _procs.get(int(worker_id))
+        if (
+            owned_proc is None
+            or worker.get("status") != "running"
+            or int(worker.get("pid") or 0)
+            != int(getattr(owned_proc, "pid", 0) or 0)
+        ):
             return False
         current = worker.get("browser") or {}
         generation = int(event.get("generation") or 0)
@@ -3546,7 +3558,8 @@ function renderWorkerStates(st){
       const browserMain=document.createElement('div'); browserMain.className='worker-browser-main';
       const browserLabel=document.createElement('strong'); browserLabel.textContent=stateLabels[browserState]||browserState;
       const browserDetail=document.createElement('span');
-      browserDetail.textContent=(modeLabels[String(browser.mode||'')]||'Chromium 有头')+' · PID '+(browser.pid||'—');
+      const generation=Number(browser.generation||0);
+      browserDetail.textContent=(modeLabels[String(browser.mode||'')]||'Chromium 有头')+' · PID '+(browser.pid||'—')+(generation>0?' · G'+generation:'');
       browserMain.append(browserLabel,browserDetail);
       if(browser.fallback){
         const fallback=document.createElement('span'); fallback.className='worker-browser-fallback'; fallback.textContent='已安全降级';
@@ -5118,11 +5131,17 @@ def api_set_browser_config():
     if need:
         return need
     data = request.get_json(force=True, silent=True) or {}
-    eng = _normalize_browser_engine(data.get("browser_engine") or "chromium")
-    window_mode = normalize_browser_window_mode(
-        data.get("browser_window_mode") or "hidden"
-    )
     cfg = load_config()
+    eng = _normalize_browser_engine(
+        data.get("browser_engine")
+        if "browser_engine" in data
+        else cfg.get("browser_engine") or "chromium"
+    )
+    window_mode = normalize_browser_window_mode(
+        data.get("browser_window_mode")
+        if "browser_window_mode" in data
+        else cfg.get("browser_window_mode") or "hidden"
+    )
     cfg["browser_engine"] = eng
     cfg["browser_window_mode"] = window_mode
     save_config(cfg)

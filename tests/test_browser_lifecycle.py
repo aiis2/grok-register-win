@@ -522,6 +522,9 @@ def test_hidden_launch_failure_falls_back_once_to_minimized_never_headless(
     assert main._owned_browser["actual_mode"] == "minimized"
     assert main._owned_browser["fallback"] is True
     assert any("隐藏启动不可用" in line for line in logs)
+    assert any(
+        "hidden Chromium launch failed (RuntimeError)" in line for line in logs
+    )
 
 
 def test_repeated_account_transitions_never_restart_a_healthy_browser(monkeypatch):

@@ -272,6 +272,7 @@ def test_marker_state_refreshes_deadline_and_deduplicates_results():
 def test_browser_marker_updates_only_matching_worker_and_newer_generation(
     monkeypatch,
 ):
+    monkeypatch.setattr(panel_app, "_procs", {3: FakeProcess(pid=7654)})
     monkeypatch.setitem(
         panel_app._job,
         "workers",
@@ -305,11 +306,6 @@ def test_browser_marker_updates_only_matching_worker_and_newer_generation(
 def test_supervisor_consumes_browser_marker_without_exposing_it_as_round_result(
     monkeypatch,
 ):
-    monkeypatch.setitem(
-        panel_app._job,
-        "workers",
-        {"1": {"worker_id": 1, "pid": 7654, "status": "running"}},
-    )
     fake = FakeProcess(
         [
             "@@GROK_BROWSER_WINDOW worker=1 generation=2 pid=9300 hwnd=701 "
@@ -317,6 +313,12 @@ def test_supervisor_consumes_browser_marker_without_exposing_it_as_round_result(
             "@@GROK_ROUND_START index=1 total=1 attempt=1",
             "@@GROK_ROUND_RESULT index=1 total=1 attempt=1 status=success",
         ]
+    )
+    monkeypatch.setattr(panel_app, "_procs", {1: fake})
+    monkeypatch.setitem(
+        panel_app._job,
+        "workers",
+        {"1": {"worker_id": 1, "pid": 7654, "status": "running"}},
     )
     state = panel_app.new_batch_marker_state(1, 1, 1, 30, now=0)
     results = []
@@ -334,6 +336,32 @@ def test_supervisor_consumes_browser_marker_without_exposing_it_as_round_result(
     assert summary["outcomes"] == [(1, "success")]
     assert results == [(1, "success")]
     assert panel_app._job["workers"]["1"]["browser"]["hwnd"] == 701
+
+
+def test_browser_marker_is_rejected_after_worker_process_termination(monkeypatch):
+    monkeypatch.setattr(panel_app, "_procs", {})
+    monkeypatch.setattr(panel_app, "_terminated_processes", set())
+    monkeypatch.setitem(panel_app._job, "workers", {})
+    monkeypatch.setattr(panel_app, "_terminate_register_proc", lambda _proc: None)
+    proc = FakeProcess(pid=7654)
+    panel_app.register_worker_process(1, proc)
+    panel_app.terminate_worker_process(1, proc)
+
+    accepted = panel_app.record_worker_browser_event(
+        1,
+        {
+            "worker_id": 1,
+            "generation": 1,
+            "pid": 9300,
+            "hwnd": 701,
+            "state": "hidden",
+            "mode": "hidden",
+            "fallback": False,
+        },
+    )
+
+    assert accepted is False
+    assert panel_app._job["workers"]["1"]["browser"] is None
 
 
 def test_retry_result_is_not_counted_as_terminal_round():
@@ -630,6 +658,53 @@ def test_unregister_worker_process_cannot_remove_replacement_process(monkeypatch
 
     assert panel_app._procs[1] is replacement
     assert panel_app._job["workers"]["1"]["pid"] == 8102
+
+
+def test_register_replacement_process_clears_stale_browser_ownership(monkeypatch):
+    monkeypatch.setattr(panel_app, "_procs", {})
+    monkeypatch.setitem(panel_app._job, "workers", {})
+    original = FakeProcess(pid=8201)
+    replacement = FakeProcess(pid=8202)
+    panel_app.register_worker_process(1, original)
+    panel_app._job["workers"]["1"]["browser"] = {
+        "generation": 3,
+        "pid": 9201,
+        "hwnd": 701,
+        "state": "hidden",
+        "mode": "hidden",
+        "fallback": False,
+    }
+
+    panel_app.register_worker_process(1, replacement)
+
+    assert panel_app._procs[1] is replacement
+    assert panel_app._job["workers"]["1"]["pid"] == 8202
+    assert panel_app._job["workers"]["1"]["browser"] is None
+
+
+def test_terminate_process_clears_browser_before_unregister_race(monkeypatch):
+    monkeypatch.setattr(panel_app, "_procs", {})
+    monkeypatch.setattr(panel_app, "_terminated_processes", set())
+    monkeypatch.setitem(panel_app._job, "workers", {})
+    monkeypatch.setattr(panel_app, "_terminate_register_proc", lambda _proc: None)
+    proc = FakeProcess(pid=8301)
+    panel_app.register_worker_process(1, proc)
+    panel_app._job["workers"]["1"]["browser"] = {
+        "generation": 4,
+        "pid": 9301,
+        "hwnd": 702,
+        "state": "visible",
+        "mode": "hidden",
+        "fallback": False,
+    }
+
+    assert panel_app.terminate_worker_process(1, proc) is True
+    assert panel_app.unregister_worker_process(1, proc) is False
+
+    worker = panel_app._job["workers"]["1"]
+    assert worker["pid"] is None
+    assert worker["status"] == "stopping"
+    assert worker["browser"] is None
 
 
 def test_global_result_aggregation_ignores_duplicate_index(monkeypatch):

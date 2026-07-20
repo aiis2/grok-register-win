@@ -502,9 +502,7 @@ class CtypesWindowsApi:
             raise self._ctypes.WinError(self._ctypes.get_last_error())
 
     def show_window(self, hwnd: int, command: int) -> bool:
-        # The return value describes the previous visibility state, not success.
-        self._user32.ShowWindowAsync(int(hwnd), int(command))
-        return True
+        return bool(self._user32.ShowWindowAsync(int(hwnd), int(command)))
 
     def set_foreground_window(self, hwnd: int) -> bool:
         return bool(self._user32.SetForegroundWindow(int(hwnd)))
@@ -551,7 +549,8 @@ class WindowsBrowserWindowController:
         if invalid:
             return invalid
         try:
-            self.api.show_window(ref.hwnd, SW_HIDE)
+            if not self.api.show_window(ref.hwnd, SW_HIDE):
+                raise RuntimeError("ShowWindowAsync could not queue hide")
             style = self.api.get_ex_style(ref.hwnd)
             style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
             self.api.set_ex_style(ref.hwnd, style)
@@ -568,16 +567,24 @@ class WindowsBrowserWindowController:
         invalid = self._validate(ref)
         if invalid:
             return invalid
+        original_style = None
         try:
-            style = self.api.get_ex_style(ref.hwnd)
-            style = (style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
-            self.api.set_ex_style(ref.hwnd, style)
+            original_style = self.api.get_ex_style(ref.hwnd)
+            visible_style = (original_style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
+            self.api.set_ex_style(ref.hwnd, visible_style)
             self.api.refresh_frame(ref.hwnd)
-            self.api.show_window(ref.hwnd, SW_RESTORE)
+            if not self.api.show_window(ref.hwnd, SW_RESTORE):
+                raise RuntimeError("ShowWindowAsync could not queue restore")
             if activate:
                 self.api.set_foreground_window(ref.hwnd)
             return WindowControlResult(True, "visible")
         except Exception as exc:
+            if original_style is not None:
+                try:
+                    self.api.set_ex_style(ref.hwnd, original_style)
+                    self.api.refresh_frame(ref.hwnd)
+                except Exception:
+                    pass
             return WindowControlResult(
                 False, "error", code="show_failed", error=str(exc)
             )

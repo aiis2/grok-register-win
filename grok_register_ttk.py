@@ -55,6 +55,7 @@ from credential_store import (  # type: ignore
 )
 from lib.browser_window import (
     BrowserWindowRef,
+    HiddenLaunchError,
     HiddenLaunchResult,
     WINDOW_MODE_HIDDEN,
     WINDOW_MODE_MINIMIZED,
@@ -2814,9 +2815,14 @@ def start_browser(log_callback=None, use_proxy=True):
                         actual_window_mode = WINDOW_MODE_MINIMIZED
                         window_mode_fallback = True
                         if log_callback:
+                            safe_detail = (
+                                str(hidden_exc)
+                                if isinstance(hidden_exc, HiddenLaunchError)
+                                else type(hidden_exc).__name__
+                            )
                             log_callback(
                                 "[!] Chromium 隐藏启动不可用，已回退到最小化兼容模式: "
-                                f"{type(hidden_exc).__name__}"
+                                f"{safe_detail}"
                             )
                         previous_foreground = capture_browser_foreground()
                         browser = Chromium(

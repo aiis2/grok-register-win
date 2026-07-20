@@ -149,6 +149,38 @@ def test_invalid_hwnd_is_rejected_without_win32_mutation():
     assert api.style_calls == []
 
 
+def test_hide_reports_error_when_show_window_async_cannot_queue_operation():
+    api = FakeWindowApi(
+        hwnd_pid={701: 9001},
+        ex_styles={701: WS_EX_APPWINDOW},
+        visible={701: True},
+    )
+    api.show_window = lambda _hwnd, _command: False
+    controller = WindowsBrowserWindowController(api=api)
+
+    result = controller.hide(BrowserWindowRef(pid=9001, hwnd=701))
+
+    assert result.ok is False
+    assert result.code == "hide_failed"
+    assert api.ex_styles[701] == WS_EX_APPWINDOW
+
+
+def test_show_rolls_back_taskbar_style_when_async_restore_cannot_queue():
+    api = FakeWindowApi(
+        hwnd_pid={701: 9001},
+        ex_styles={701: WS_EX_TOOLWINDOW},
+        visible={701: False},
+    )
+    api.show_window = lambda _hwnd, _command: False
+    controller = WindowsBrowserWindowController(api=api)
+
+    result = controller.show(BrowserWindowRef(pid=9001, hwnd=701))
+
+    assert result.ok is False
+    assert result.code == "show_failed"
+    assert api.ex_styles[701] == WS_EX_TOOLWINDOW
+
+
 def test_find_window_selects_only_chrome_top_level_window_for_exact_pid():
     api = FakeWindowApi(
         hwnd_pid={701: 9001, 702: 9002, 703: 9001},
