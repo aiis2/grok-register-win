@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ctypes
+from types import SimpleNamespace
+
 import pytest
 
 import grok_register_ttk as main
@@ -44,6 +47,45 @@ class FakeBrowser:
 
     def quit(self, **kwargs):
         self.quit_calls.append(kwargs)
+
+
+class FakeSilentPage(FakePage):
+    def __init__(self):
+        super().__init__()
+        self.minimize_calls = 0
+        self.set = SimpleNamespace(window=SimpleNamespace(mini=self._mini))
+
+    def _mini(self):
+        self.minimize_calls += 1
+
+
+class FakeUser32:
+    def __init__(self, *, foreground=0, foreground_pid=0, valid_windows=None):
+        self.foreground = foreground
+        self.foreground_pid = foreground_pid
+        self.valid_windows = set(valid_windows or [])
+        self.show_calls = []
+        self.restore_calls = []
+
+    def GetForegroundWindow(self):
+        return self.foreground
+
+    def GetWindowThreadProcessId(self, _window, process_id_ptr):
+        ctypes.cast(process_id_ptr, ctypes.POINTER(ctypes.c_ulong)).contents.value = (
+            self.foreground_pid
+        )
+        return 1
+
+    def ShowWindowAsync(self, window, command):
+        self.show_calls.append((window, command))
+        return 1
+
+    def IsWindow(self, window):
+        return int(window in self.valid_windows)
+
+    def SetForegroundWindow(self, window):
+        self.restore_calls.append(window)
+        return 1
 
 
 @pytest.fixture(autouse=True)
@@ -244,6 +286,116 @@ def test_browser_options_isolate_profile_root_by_worker_and_process(
     assert options.tmp_path == str(
         tmp_path / "grok-register-win" / "browser" / "w3-p2468"
     )
+
+
+def test_browser_options_request_silent_minimized_start_when_enabled(monkeypatch):
+    monkeypatch.setattr(
+        main, "browser_silent_start_enabled", lambda: True, raising=False
+    )
+
+    options = main.create_browser_options()
+
+    assert "--start-minimized" in options.arguments
+
+
+def test_silent_minimized_browser_keeps_background_automation_unthrottled(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        main, "browser_silent_start_enabled", lambda: True, raising=False
+    )
+
+    options = main.create_browser_options()
+
+    assert "--disable-backgrounding-occluded-windows" in options.arguments
+    assert "--disable-background-timer-throttling" in options.arguments
+    assert "--disable-renderer-backgrounding" in options.arguments
+
+
+def test_silent_browser_start_minimizes_without_activation_and_restores_focus(
+    monkeypatch,
+):
+    helper = getattr(main, "apply_browser_silent_start", None)
+    assert callable(helper), "silent-start window helper is missing"
+    monkeypatch.setattr(main, "browser_silent_start_enabled", lambda: True)
+    page = FakeSilentPage()
+    browser = FakeBrowser([page], pid=4321)
+    user32 = FakeUser32(
+        foreground=800,
+        foreground_pid=4321,
+        valid_windows={700, 800},
+    )
+
+    assert helper(browser, page, previous_foreground=700, user32=user32) is True
+    assert user32.show_calls == [(800, 7)]
+    assert page.minimize_calls == 1
+    assert user32.restore_calls == [700]
+
+
+def test_silent_browser_start_never_overrides_a_new_user_foreground(monkeypatch):
+    helper = getattr(main, "apply_browser_silent_start", None)
+    assert callable(helper), "silent-start window helper is missing"
+    monkeypatch.setattr(main, "browser_silent_start_enabled", lambda: True)
+    page = FakeSilentPage()
+    browser = FakeBrowser([page], pid=4321)
+    user32 = FakeUser32(
+        foreground=900,
+        foreground_pid=9999,
+        valid_windows={700, 900},
+    )
+
+    assert helper(browser, page, previous_foreground=700, user32=user32) is True
+    assert page.minimize_calls == 1
+    assert user32.show_calls == []
+    assert user32.restore_calls == []
+
+
+def test_capture_browser_foreground_only_when_silent_start_is_enabled(monkeypatch):
+    capture = getattr(main, "capture_browser_foreground", None)
+    assert callable(capture), "silent-start foreground capture is missing"
+    user32 = FakeUser32(foreground=700)
+
+    monkeypatch.setattr(main, "browser_silent_start_enabled", lambda: True)
+    assert capture(user32=user32) == 700
+
+    monkeypatch.setattr(main, "browser_silent_start_enabled", lambda: False)
+    assert capture(user32=user32) == 0
+
+
+def test_start_browser_applies_silent_policy_around_chromium_launch(monkeypatch):
+    events = []
+    page = FakeSilentPage()
+    fake = FakeBrowser([page], pid=4321)
+
+    monkeypatch.setattr(main, "get_browser_engine", lambda: "chromium")
+    monkeypatch.setattr(
+        main,
+        "prepare_browser_proxy",
+        lambda **_kwargs: ("", None),
+    )
+    monkeypatch.setattr(main, "create_browser_options", lambda **_kwargs: object())
+
+    def launch(_options):
+        events.append("launch")
+        return fake
+
+    def capture():
+        events.append("capture")
+        return 700
+
+    def apply(instance, active_page, *, previous_foreground):
+        events.append(("apply", instance, active_page, previous_foreground))
+        return True
+
+    monkeypatch.setattr(main, "Chromium", launch)
+    monkeypatch.setattr(main, "capture_browser_foreground", capture)
+    monkeypatch.setattr(main, "apply_browser_silent_start", apply)
+
+    browser, active_page = main.start_browser(use_proxy=False)
+
+    assert browser is fake
+    assert active_page is page
+    assert events == ["capture", "launch", ("apply", fake, page, 700)]
 
 
 def test_repeated_account_transitions_never_restart_a_healthy_browser(monkeypatch):

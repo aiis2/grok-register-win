@@ -908,12 +908,101 @@ def browser_runtime_tmp_path(
     )
 
 
+def browser_silent_start_enabled() -> bool:
+    """Start headed Chromium minimized on Windows so workers do not take focus."""
+    return os.name == "nt"
+
+
+def capture_browser_foreground(*, user32=None) -> int:
+    """Capture the user's active window immediately before Chromium starts."""
+    if not browser_silent_start_enabled():
+        return 0
+    try:
+        import ctypes
+
+        win_api = user32 if user32 is not None else ctypes.windll.user32
+        return int(win_api.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def apply_browser_silent_start(
+    instance,
+    active_page,
+    *,
+    previous_foreground: int = 0,
+    user32=None,
+) -> bool:
+    """Keep a new headed Chromium minimized without overriding later user focus."""
+    if not browser_silent_start_enabled():
+        return False
+
+    try:
+        browser_pid = int(getattr(instance, "process_id", None) or 0)
+    except (TypeError, ValueError):
+        browser_pid = 0
+
+    browser_owned_foreground = False
+    foreground = 0
+    minimized = False
+    try:
+        import ctypes
+
+        win_api = user32 if user32 is not None else ctypes.windll.user32
+        foreground = int(win_api.GetForegroundWindow() or 0)
+        if foreground and browser_pid:
+            foreground_pid = ctypes.c_ulong()
+            win_api.GetWindowThreadProcessId(
+                foreground, ctypes.byref(foreground_pid)
+            )
+            browser_owned_foreground = foreground_pid.value == browser_pid
+            if browser_owned_foreground:
+                # SW_SHOWMINNOACTIVE: minimize without activating this window.
+                minimized = bool(win_api.ShowWindowAsync(foreground, 7))
+    except Exception:
+        win_api = None
+
+    try:
+        active_page.set.window.mini()
+        minimized = True
+    except Exception:
+        pass
+
+    if browser_owned_foreground and previous_foreground and win_api is not None:
+        try:
+            current_foreground = int(win_api.GetForegroundWindow() or 0)
+            user_has_not_selected_another_window = current_foreground in (
+                0,
+                foreground,
+            )
+            if (
+                user_has_not_selected_another_window
+                and previous_foreground != foreground
+                and win_api.IsWindow(previous_foreground)
+            ):
+                win_api.SetForegroundWindow(previous_foreground)
+        except Exception:
+            pass
+
+    return minimized
+
+
 def create_browser_options(browser_proxy=""):
     worker_id = get_registration_worker_id()
     options = ChromiumOptions()
     options.set_tmp_path(str(browser_runtime_tmp_path(worker_id)))
     options.auto_port(scope=browser_auto_port_scope(worker_id))
     options.set_timeouts(base=1)
+    if browser_silent_start_enabled():
+        # Keep headed workers out of the foreground while preserving page
+        # rendering and timers needed by registration and Turnstile flows.
+        for argument in (
+            "--start-minimized",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+        ):
+            options.set_argument(argument)
     # Server-friendly browser path / flags
     for _browser_path in (
         os.environ.get("BROWSER_PATH") or "",
@@ -2584,6 +2673,7 @@ def start_browser(log_callback=None, use_proxy=True):
         log_callback(f"[*] 浏览器引擎: {engine_label}")
     for attempt in range(1, 5):
         bridge = None
+        previous_foreground = 0
         try:
             browser_proxy, bridge = prepare_browser_proxy(use_proxy=use_proxy, log_callback=log_callback)
             if engine == "camoufox":
@@ -2611,12 +2701,22 @@ def start_browser(log_callback=None, use_proxy=True):
                         pass
                     bridge = None
             else:
+                previous_foreground = capture_browser_foreground()
                 browser = Chromium(create_browser_options(browser_proxy=browser_proxy))
                 browser_started_with_proxy = bool(browser_proxy)
             _capture_browser_ownership(browser, engine)
             browser_proxy_bridge = bridge
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
+            if engine == "chromium":
+                try:
+                    apply_browser_silent_start(
+                        browser,
+                        page,
+                        previous_foreground=previous_foreground,
+                    )
+                except Exception:
+                    pass
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and get_configured_proxy():
