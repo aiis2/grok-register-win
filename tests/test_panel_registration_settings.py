@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -91,6 +92,29 @@ def test_worker_browser_renderer_uses_safe_dom_and_duplicate_request_guard():
     assert "browserControlPending.has(workerId)" in control_source
     assert "browserControlPending.add(workerId)" in control_source
     assert "browserControlPending.delete(workerId)" in control_source
+
+
+def test_documentation_describes_hidden_headed_release():
+    root = Path(panel_app.__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    release = (root / "docs" / "releases" / "v1.6.0.md").read_text(
+        encoding="utf-8"
+    )
+
+    for phrase in (
+        "`hidden` **不是 headless 模式**",
+        "PID + HWND",
+        "显示浏览器",
+        "任务结束后该 worker 的浏览器立即退出",
+    ):
+        assert phrase in readme
+    for phrase in (
+        "Windows 隐藏有头浏览器",
+        "不会切换无头模式",
+        "generation/PID/HWND",
+        "不跨下一次注册任务保留常驻进程",
+    ):
+        assert phrase in release
 
 
 def test_index_renders_saved_registration_concurrency(isolated_config):
