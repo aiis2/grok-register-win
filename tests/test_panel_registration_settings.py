@@ -47,6 +47,52 @@ def test_panel_contains_concurrency_worker_and_credential_controls():
     assert "不会覆盖" in html
 
 
+def test_panel_contains_headed_browser_window_mode_and_worker_controls():
+    html = panel_app.INDEX_HTML
+
+    assert 'id="browser_window_mode"' in html
+    assert '<option value="hidden">隐藏有头' in html
+    assert '<option value="minimized">最小化有头' in html
+    assert '<option value="visible">正常显示有头' in html
+    assert "browser_window_mode" in html
+    assert "async function controlWorkerBrowser(workerId,action)" in html
+    assert "/api/job/workers/" in html
+    assert "显示浏览器" in html
+    assert "隐藏浏览器" in html
+
+
+def test_browser_config_js_saves_starts_and_locks_window_mode():
+    html = panel_app.INDEX_HTML
+    save_source = html.split("async function saveBrowserEngine(){", 1)[1].split(
+        "async function startJob(){", 1
+    )[0]
+    start_source = html.split("async function startJob(){", 1)[1].split(
+        "async function stopJob(){", 1
+    )[0]
+
+    assert "browser_window_mode" in save_source
+    assert "browser_window_mode" in start_source
+    assert "document.getElementById('browser_window_mode').disabled=!!st.running;" in html
+
+
+def test_worker_browser_renderer_uses_safe_dom_and_duplicate_request_guard():
+    html = panel_app.INDEX_HTML
+    render_source = html.split("function renderWorkerStates(st){", 1)[1].split(
+        "let credentialActionBusy", 1
+    )[0]
+    control_source = html.split(
+        "async function controlWorkerBrowser(workerId,action){", 1
+    )[1].split("let credentialActionBusy", 1)[0]
+
+    assert "worker.browser" in render_source
+    assert "document.createElement('button')" in render_source
+    assert ".textContent=" in render_source
+    assert "innerHTML" not in render_source
+    assert "browserControlPending.has(workerId)" in control_source
+    assert "browserControlPending.add(workerId)" in control_source
+    assert "browserControlPending.delete(workerId)" in control_source
+
+
 def test_index_renders_saved_registration_concurrency(isolated_config):
     response = panel_app.app.test_client().get("/")
 

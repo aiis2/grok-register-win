@@ -2984,6 +2984,11 @@ INDEX_HTML = r"""
     .worker-status{font-size:11px;color:var(--muted);padding:2px 7px;border-radius:999px;background:var(--chip)}
     .worker-range{margin:7px 0 8px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;font-size:11.5px}
     .worker-metrics{font-size:11px;color:var(--muted2)}
+    .worker-browser{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px;padding-top:9px;border-top:1px solid var(--line)}
+    .worker-browser-main{display:flex;align-items:center;flex-wrap:wrap;gap:5px;min-width:0;color:var(--muted);font-size:10.5px}
+    .worker-browser-main strong{color:var(--fg);font-size:11px;font-weight:600}
+    .worker-browser-fallback{padding:2px 6px;border-radius:999px;background:rgba(255,180,84,.12);color:var(--warn);font-size:9.5px}
+    button.btn.worker-browser-action{padding:5px 8px;border-radius:7px;font-size:10.5px;white-space:nowrap;flex-shrink:0}
     .storage-shell{display:grid;grid-template-columns:minmax(280px,1.35fr) minmax(260px,1fr);gap:16px;align-items:stretch}
     .storage-control{border:1px solid var(--line);border-radius:13px;background:linear-gradient(145deg,#101620,#171e2b);padding:14px}
     .storage-control label{width:100%}
@@ -3070,12 +3075,19 @@ INDEX_HTML = r"""
           <option value="camoufox">Camoufox 无头（反检测 Firefox）</option>
         </select>
       </label>
+      <label>Chromium 窗口模式
+        <select id="browser_window_mode" onchange="saveBrowserEngine()">
+          <option value="hidden">隐藏有头（不占任务栏）</option>
+          <option value="minimized">最小化有头</option>
+          <option value="visible">正常显示有头</option>
+        </select>
+      </label>
       <button class="btn ok" id="btn_start" onclick="startJob()">▶ 开始注册</button>
       <button class="btn danger" id="btn_stop" onclick="stopJob()">■ 停止</button>
       <button class="btn" onclick="backfillCpa()" title="把尚未转成 CPA 的历史 SSO 入队">补转未转换 CPA</button>
     </div>
     <div class="control-note">
-      并发度支持 1–10。每个槽使用独立 CLI 进程、有头浏览器和临时 Profile；同一槽会在账号批次内复用浏览器，超时只重启该槽。
+      并发度支持 1–10。每个槽使用独立 CLI 进程、有头浏览器和临时 Profile；“隐藏有头”不是无头模式，窗口默认不显示且不进入任务栏，可在对应 Worker 卡片中手动显示或隐藏。任务结束后浏览器立即退出。
     </div>
     <div class="muted" style="margin-top:10px;font-size:12px" id="cpa_hint">
       代理走本机 Clash（config.json 的 proxy，常见 7897）。节点在 Clash 里选。注册成功后自动转 CPA。
@@ -3488,6 +3500,7 @@ function formatBytes(value){
   if(bytes<1024*1024) return (bytes/1024).toFixed(1)+' KiB';
   return (bytes/(1024*1024)).toFixed(1)+' MiB';
 }
+const browserControlPending=new Set();
 function renderWorkerStates(st){
   const grid=document.getElementById('worker_grid');
   if(!grid) return;
@@ -3523,8 +3536,60 @@ function renderWorkerStates(st){
     const result=document.createElement('span'); result.textContent=`${worker.success||0} 成 / ${worker.fail||0} 败`;
     metrics.append(pid,result);
     card.append(top,range,metrics);
+
+    const browser=(worker.browser&&typeof worker.browser==='object')?worker.browser:null;
+    if(browser){
+      const browserState=String(browser.state||'error');
+      const stateLabels={hidden:'已隐藏',minimized:'已最小化',visible:'已显示',closed:'已关闭',error:'不可用'};
+      const modeLabels={hidden:'隐藏有头',minimized:'最小化有头',visible:'正常显示有头'};
+      const browserRow=document.createElement('div'); browserRow.className='worker-browser';
+      const browserMain=document.createElement('div'); browserMain.className='worker-browser-main';
+      const browserLabel=document.createElement('strong'); browserLabel.textContent=stateLabels[browserState]||browserState;
+      const browserDetail=document.createElement('span');
+      browserDetail.textContent=(modeLabels[String(browser.mode||'')]||'Chromium 有头')+' · PID '+(browser.pid||'—');
+      browserMain.append(browserLabel,browserDetail);
+      if(browser.fallback){
+        const fallback=document.createElement('span'); fallback.className='worker-browser-fallback'; fallback.textContent='已安全降级';
+        browserMain.appendChild(fallback);
+      }
+      browserRow.appendChild(browserMain);
+      const workerId=Number(worker.worker_id||0);
+      const controllable=status==='running'&&workerId>0&&Number(browser.pid||0)>0&&Number(browser.hwnd||0)>0&&['hidden','minimized','visible'].includes(browserState);
+      if(controllable){
+        const action=browserState==='visible'?'hide':'show';
+        const button=document.createElement('button');
+        button.type='button';
+        button.className='btn worker-browser-action';
+        button.dataset.workerId=String(workerId);
+        button.dataset.action=action;
+        button.textContent=action==='show'?'显示浏览器':'隐藏浏览器';
+        button.disabled=browserControlPending.has(workerId);
+        button.addEventListener('click',()=>controlWorkerBrowser(workerId,action));
+        browserRow.appendChild(button);
+      }
+      card.appendChild(browserRow);
+    }
     grid.appendChild(card);
   });
+}
+async function controlWorkerBrowser(workerId,action){
+  workerId=Number(workerId);
+  if(browserControlPending.has(workerId)) return;
+  if(!Number.isInteger(workerId)||workerId<1||!['show','hide'].includes(action)) return;
+  browserControlPending.add(workerId);
+  document.querySelectorAll('.worker-browser-action').forEach(button=>{
+    if(Number(button.dataset.workerId)===workerId) button.disabled=true;
+  });
+  try{
+    const j=await api('/api/job/workers/'+workerId+'/browser/'+action,{method:'POST'});
+    const state=(j.browser||{}).state||'';
+    toast((action==='show'?'浏览器已显示':'浏览器已隐藏')+(state?' · '+state:''));
+  }catch(e){
+    toast('浏览器窗口操作失败: '+e.message);
+  }finally{
+    browserControlPending.delete(workerId);
+    await poll();
+  }
 }
 let credentialActionBusy=false;
 let credentialControlsBlocked=false;
@@ -4038,14 +4103,17 @@ async function loadBrowserEngine(){
     const j=await api('/api/config/browser');
     const eng=(j.browser_engine||'chromium').toLowerCase();
     document.getElementById('browser_engine').value=(eng==='camoufox'?'camoufox':'chromium');
+    const mode=String(j.browser_window_mode||'hidden').toLowerCase();
+    document.getElementById('browser_window_mode').value=['hidden','minimized','visible'].includes(mode)?mode:'hidden';
   }catch(e){}
 }
 async function saveBrowserEngine(){
   const browser_engine=document.getElementById('browser_engine').value;
+  const browser_window_mode=document.getElementById('browser_window_mode').value;
   try{
-    const j=await api('/api/config/browser',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browser_engine})});
-    toast(j.message||('浏览器引擎: '+(j.browser_engine||browser_engine)));
-  }catch(e){toast('保存浏览器引擎失败: '+e.message)}
+    const j=await api('/api/config/browser',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browser_engine,browser_window_mode})});
+    toast(j.message||('浏览器设置: '+(j.browser_engine||browser_engine)+' / '+(j.browser_window_mode||browser_window_mode)));
+  }catch(e){toast('保存浏览器设置失败: '+e.message)}
 }
 async function startJob(){
   const count=parseInt(document.getElementById('count').value||'1',10);
@@ -4063,7 +4131,8 @@ async function startJob(){
     try{ await saveEmailConfig(); }catch(e){}
     try{ await saveBrowserEngine(); }catch(e){}
     const j=await api('/api/job/start',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({count, concurrency, browser_engine: document.getElementById('browser_engine').value})});
+      body:JSON.stringify({count, concurrency, browser_engine: document.getElementById('browser_engine').value,
+        browser_window_mode: document.getElementById('browser_window_mode').value})});
     toast(j.message||'已启动');
   }catch(e){toast('启动失败: '+e.message)}
   finally{
@@ -4098,6 +4167,7 @@ async function poll(){
     document.getElementById('btn_stop').disabled=!st.running;
     document.getElementById('register_concurrency').disabled=!!st.running;
     document.getElementById('browser_engine').disabled=!!st.running;
+    document.getElementById('browser_window_mode').disabled=!!st.running;
     syncEmailReceiveControls();
     const concurrencyStat=document.getElementById('st_concurrency');
     if(concurrencyStat) concurrencyStat.textContent=`${st.active_workers||0} / ${st.effective_concurrency||0}`;
@@ -5057,12 +5127,22 @@ def api_set_browser_config():
     cfg["browser_window_mode"] = window_mode
     save_config(cfg)
     label = "Camoufox 无头" if eng == "camoufox" else "Chromium 有头"
+    window_labels = {
+        "hidden": "隐藏且不占任务栏",
+        "minimized": "最小化",
+        "visible": "正常显示",
+    }
+    detail = (
+        "（窗口模式仅适用于 Chromium）"
+        if eng == "camoufox"
+        else f"（{window_labels[window_mode]}）"
+    )
     return jsonify(
         {
             "ok": True,
             "browser_engine": eng,
             "browser_window_mode": window_mode,
-            "message": f"浏览器引擎已保存: {label}",
+            "message": f"浏览器设置已保存: {label}{detail}",
         }
     )
 
