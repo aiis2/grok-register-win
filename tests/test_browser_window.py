@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import lib.browser_window as browser_window
 from lib.browser_window import (
     SW_HIDE,
     SW_RESTORE,
@@ -13,6 +14,7 @@ from lib.browser_window import (
     bootstrap_hidden_chromium,
     format_browser_window_marker,
     parse_browser_window_marker,
+    resolve_chromium_executable,
 )
 
 
@@ -218,6 +220,7 @@ def test_silent_bootstrap_creates_headed_background_minimized_window():
             "webSocketDebuggerUrl": "ws://127.0.0.1:19222/devtools/browser/id"
         },
         websocket_factory=lambda _url: websocket,
+        executable_resolver=lambda value: value,
     )
 
     launched_arguments = popen_calls[0][0]
@@ -247,6 +250,52 @@ def test_silent_bootstrap_creates_headed_background_minimized_window():
     )
     assert controller.hidden_refs[0].pid == 9300
     assert controller.hidden_refs[0].hwnd == 701
+
+
+def test_silent_bootstrap_resolves_drission_chrome_alias_before_spawn():
+    process = FakeProcess()
+    websocket = FakeWebSocket()
+    popen_calls = []
+
+    result = bootstrap_hidden_chromium(
+        port=19224,
+        browser_path="chrome",
+        arguments=["--user-data-dir=X"],
+        controller=FakeBootstrapController(),
+        popen=lambda arguments, **kwargs: popen_calls.append(
+            (list(arguments), dict(kwargs))
+        )
+        or process,
+        version_reader=lambda _port: {
+            "webSocketDebuggerUrl": "ws://127.0.0.1:19224/devtools/browser/id"
+        },
+        websocket_factory=lambda _url: websocket,
+        executable_resolver=lambda value: (
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            if value == "chrome"
+            else value
+        ),
+    )
+
+    assert result.launcher_pid == process.pid
+    assert popen_calls[0][0][0] == (
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    )
+
+
+def test_resolve_chromium_executable_finds_standard_windows_install(
+    tmp_path, monkeypatch
+):
+    executable = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    monkeypatch.setattr(browser_window.sys, "platform", "win32")
+    monkeypatch.setattr(browser_window.shutil, "which", lambda _value: None)
+    monkeypatch.setenv("ProgramFiles", str(tmp_path))
+    monkeypatch.setenv("ProgramFiles(x86)", "")
+    monkeypatch.setenv("LOCALAPPDATA", "")
+
+    assert resolve_chromium_executable("chrome") == str(executable)
 
 
 def test_failed_bootstrap_terminates_only_spawned_process_and_redacts_arguments():

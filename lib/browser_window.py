@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sys
 import json
+import os
 import re
+import shutil
 import subprocess
 import time
 from contextlib import contextmanager
@@ -180,6 +182,59 @@ def _open_cdp_websocket(url: str):
     return create_connection(str(url), timeout=5, suppress_origin=True)
 
 
+def resolve_chromium_executable(browser_path: str) -> str:
+    """Resolve DrissionPage aliases such as ``chrome`` to an executable."""
+    raw = os.path.expandvars(os.path.expanduser(str(browser_path or "").strip()))
+    raw = raw.strip('"')
+    if not raw:
+        raise FileNotFoundError("Chromium executable was not provided")
+
+    supplied = Path(raw)
+    if supplied.is_file():
+        return str(supplied)
+    if supplied.is_dir():
+        for name in ("chrome.exe", "msedge.exe", "chromium.exe"):
+            candidate = supplied / name
+            if candidate.is_file():
+                return str(candidate)
+
+    discovered = shutil.which(raw)
+    if discovered:
+        return str(Path(discovered))
+
+    if sys.platform == "win32":
+        program_files = os.environ.get("ProgramFiles", "")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", "")
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        chrome_candidates = [
+            Path(root) / suffix
+            for root, suffix in (
+                (program_files, "Google/Chrome/Application/chrome.exe"),
+                (program_files_x86, "Google/Chrome/Application/chrome.exe"),
+                (local_app_data, "Google/Chrome/Application/chrome.exe"),
+                (program_files, "Chromium/Application/chrome.exe"),
+                (local_app_data, "Chromium/Application/chrome.exe"),
+            )
+            if root
+        ]
+        edge_candidates = [
+            Path(root) / "Microsoft/Edge/Application/msedge.exe"
+            for root in (program_files, program_files_x86, local_app_data)
+            if root
+        ]
+        alias = supplied.name.lower()
+        candidates = (
+            edge_candidates + chrome_candidates
+            if "edge" in alias
+            else chrome_candidates + edge_candidates
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+
+    raise FileNotFoundError("Chromium executable could not be resolved")
+
+
 def bootstrap_hidden_chromium(
     *,
     port: int,
@@ -190,6 +245,7 @@ def bootstrap_hidden_chromium(
     version_reader=None,
     websocket_factory=None,
     process_tree_terminator=None,
+    executable_resolver=None,
     timeout: float = 10.0,
     monotonic=time.monotonic,
     sleep=time.sleep,
@@ -200,6 +256,7 @@ def bootstrap_hidden_chromium(
     version_reader = version_reader or _read_cdp_version
     websocket_factory = websocket_factory or _open_cdp_websocket
     process_tree_terminator = process_tree_terminator or terminate_process_tree
+    executable_resolver = executable_resolver or resolve_chromium_executable
     process = None
     websocket = None
     try:
@@ -209,9 +266,7 @@ def bootstrap_hidden_chromium(
         if "--silent-launch" not in launch_arguments:
             launch_arguments.append("--silent-launch")
 
-        executable = Path(str(browser_path))
-        if executable.is_dir():
-            executable = executable / "chrome.exe"
+        executable = executable_resolver(str(browser_path))
         command = [
             str(executable),
             f"--remote-debugging-port={int(port)}",
