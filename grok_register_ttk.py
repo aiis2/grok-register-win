@@ -3661,6 +3661,147 @@ def turnstile_recovery_action(state, *, waited, reset_waited=None):
     return "wait"
 
 
+def _read_turnstile_token():
+    """Read the current Turnstile response without exposing its value to logs."""
+    global page
+    if page is None:
+        return ""
+
+    if hasattr(page, "get_turnstile_token"):
+        try:
+            token = str(page.get_turnstile_token() or "").strip()
+            if token:
+                return token
+        except Exception:
+            pass
+
+    try:
+        token = page.run_js(
+            """
+try {
+  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
+  if (byInput) return byInput;
+  if (window.turnstile && typeof turnstile.getResponse === 'function') {
+    return String(turnstile.getResponse() || '').trim();
+  }
+  return '';
+} catch(e) { return ''; }
+            """
+        )
+    except Exception:
+        token = ""
+    return str(token or "").strip()
+
+
+def interact_turnstile_widget():
+    """Perform one non-blocking Turnstile interaction for either browser backend."""
+    global page
+    if page is None:
+        return {
+            "clicked": False,
+            "method": "page-not-ready",
+            "token": "",
+            "token_len": 0,
+        }
+
+    token = _read_turnstile_token()
+    if len(token) >= TURNSTILE_TOKEN_MIN_LENGTH:
+        return {
+            "clicked": False,
+            "method": "existing-token",
+            "token": token,
+            "token_len": len(token),
+        }
+
+    # Camoufox exposes a dedicated Playwright-frame implementation.
+    if hasattr(page, "click_turnstile"):
+        try:
+            raw = page.click_turnstile() or {}
+        except Exception as exc:
+            return {
+                "clicked": False,
+                "method": "camoufox-frame",
+                "token": "",
+                "token_len": 0,
+                "error": str(exc)[:160],
+            }
+        raw = raw if isinstance(raw, dict) else {}
+        token = str(raw.get("token") or "").strip() or _read_turnstile_token()
+        return {
+            "clicked": bool(raw.get("clicked")),
+            "method": str(raw.get("method") or "camoufox-frame"),
+            "frames": max(0, int(raw.get("frames") or 0)),
+            "token": token,
+            "token_len": len(token),
+        }
+
+    # Chromium/DrissionPage keeps the challenge control inside nested shadow roots.
+    clicked = False
+    method = "chromium-shadow-pending"
+    error = ""
+    try:
+        challenge_input = page.ele("@name=cf-turnstile-response")
+        if challenge_input:
+            wrapper = challenge_input.parent()
+            iframe = None
+            try:
+                iframe = wrapper.shadow_root.ele("tag:iframe")
+            except Exception:
+                iframe = None
+            if iframe:
+                try:
+                    iframe.run_js(
+                        """
+window.dtp = 1;
+function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+let sx = getRandomInt(800, 1200);
+let sy = getRandomInt(400, 700);
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
+                        """
+                    )
+                except Exception:
+                    pass
+                try:
+                    body = iframe.ele("tag:body")
+                    body_shadow = body.shadow_root if body else None
+                    button = body_shadow.ele("tag:input") if body_shadow else None
+                    if button:
+                        button.click()
+                        clicked = True
+                        method = "chromium-shadow"
+                except Exception as exc:
+                    error = str(exc)[:160]
+        else:
+            clicked = bool(
+                page.run_js(
+                    """
+const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
+  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
+  return String(txt).toLowerCase().includes('turnstile');
+});
+if (!nodes.length || typeof nodes[0].click !== 'function') return false;
+nodes[0].click();
+return true;
+                    """
+                )
+            )
+            method = "chromium-container" if clicked else "chromium-container-pending"
+    except Exception as exc:
+        error = str(exc)[:160]
+
+    token = _read_turnstile_token()
+    result = {
+        "clicked": clicked,
+        "method": method,
+        "token": token,
+        "token_len": len(token),
+    }
+    if error:
+        result["error"] = error
+    return result
+
+
 def getTurnstileToken(log_callback=None, cancel_callback=None, allow_reset=False):
     global page
     if page is None:
@@ -3679,93 +3820,18 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, allow_reset=False
     for attempt in range(0, 24):
         raise_if_cancelled(cancel_callback)
         try:
-            token = ""
-            if hasattr(page, "get_turnstile_token"):
-                try:
-                    token = str(page.get_turnstile_token() or "").strip()
-                except Exception:
-                    token = ""
-            if not token:
-                token = page.run_js(
-                    """
-try {
-  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
-  if (byInput) return byInput;
-  if (window.turnstile && typeof turnstile.getResponse === 'function') {
-    return String(turnstile.getResponse() || '').trim();
-  }
-  return '';
-} catch(e) { return ''; }
-                    """
-                )
-            token = str(token or "").strip()
-            if len(token) >= 80:
+            detail = interact_turnstile_widget()
+            token = str(detail.get("token") or "").strip()
+            if len(token) >= TURNSTILE_TOKEN_MIN_LENGTH:
                 if log_callback:
                     log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
-
-            # 1) Camoufox dedicated click path (Playwright frames)
-            if hasattr(page, "click_turnstile"):
-                try:
-                    detail = page.click_turnstile() or {}
-                    if log_callback and (attempt == 0 or attempt % 4 == 0):
-                        log_callback(
-                            f"[Debug] Turnstile 点击: clicked={detail.get('clicked')} "
-                            f"method={detail.get('method') or '-'} "
-                            f"frames={detail.get('frames')} "
-                            f"token_len={detail.get('token_len')}"
-                        )
-                    token2 = str(detail.get("token") or "").strip()
-                    if not token2 and hasattr(page, "get_turnstile_token"):
-                        token2 = str(page.get_turnstile_token() or "").strip()
-                    if len(token2) >= 80:
-                        if log_callback:
-                            log_callback(f"[*] Turnstile 已通过，token长度={len(token2)}")
-                        return token2
-                except Exception as click_exc:
-                    if log_callback and attempt == 0:
-                        log_callback(f"[Debug] Turnstile click_turnstile 异常: {click_exc}")
-
-            # 2) DrissionPage-style shadow DOM path (Chromium)
-            challenge_input = page.ele("@name=cf-turnstile-response")
-            if challenge_input:
-                wrapper = challenge_input.parent()
-                iframe = None
-                try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
-                except Exception:
-                    iframe = None
-                if iframe:
-                    try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn:
-                            btn.click()
-                    except Exception:
-                        pass
-            else:
-                # 兜底：尝试触发页面上可见的 Turnstile 容器
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
+            if log_callback and (attempt == 0 or attempt % 4 == 0):
+                log_callback(
+                    f"[Debug] Turnstile 交互: clicked={detail.get('clicked')} "
+                    f"method={detail.get('method') or '-'} "
+                    f"frames={detail.get('frames', '-')} "
+                    f"token_len={detail.get('token_len', 0)}"
                 )
         except Exception:
             pass
@@ -3950,15 +4016,30 @@ return 'filled-no-submit';
                     "将重启当前并发槽浏览器并重试当前账号"
                 )
 
+            has_frame_helper = hasattr(page, "click_turnstile")
+            interaction_interval = 6 if has_frame_helper else 1.5
+            interaction_ready = waited >= 6 if has_frame_helper else True
             if (
-                hasattr(page, "click_turnstile")
-                and waited >= 6
-                and now - last_cf_interaction_at >= 6
+                interaction_ready
+                and (
+                    last_cf_interaction_at == 0
+                    or now - last_cf_interaction_at >= interaction_interval
+                )
             ):
                 try:
-                    page.click_turnstile()
-                except Exception:
-                    pass
+                    detail = interact_turnstile_widget()
+                    if log_callback and (
+                        detail.get("clicked")
+                        or detail.get("token_len", 0) >= TURNSTILE_TOKEN_MIN_LENGTH
+                    ):
+                        log_callback(
+                            f"[Debug] Turnstile 交互: clicked={detail.get('clicked')} "
+                            f"method={detail.get('method') or '-'} "
+                            f"token_len={detail.get('token_len', 0)}"
+                        )
+                except Exception as exc:
+                    if log_callback and last_cf_interaction_at == 0:
+                        log_callback(f"[Debug] Turnstile 交互异常: {str(exc)[:160]}")
                 last_cf_interaction_at = now
             sleep_with_cancel(0.8, cancel_callback)
             continue
