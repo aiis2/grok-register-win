@@ -33,12 +33,21 @@ GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 SW_HIDE = 0
+SW_SHOWNOACTIVATE = 4
 SW_RESTORE = 9
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+SWP_HIDEWINDOW = 0x0080
+SWP_ASYNCWINDOWPOS = 0x4000
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+SPI_GETWORKAREA = 0x0030
+VISIBLE_WINDOW_MARGIN = 64
 HIDDEN_WINDOW_X = -32000
 HIDDEN_WINDOW_Y = -32000
 HIDDEN_WINDOW_POSITION_ARGUMENT = (
@@ -70,6 +79,29 @@ def build_hidden_startupinfo(*, platform: str | None = None):
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
     return startupinfo
+
+
+def rectangles_intersect(first, second) -> bool:
+    """Return whether two ``(left, top, right, bottom)`` rectangles overlap."""
+    return (
+        int(first[0]) < int(second[2])
+        and int(first[2]) > int(second[0])
+        and int(first[1]) < int(second[3])
+        and int(first[3]) > int(second[1])
+    )
+
+
+def safe_visible_window_origin(window_rect, work_area) -> tuple[int, int]:
+    """Choose a stable in-work-area origin for an initially offscreen window."""
+    left, top, right, bottom = (int(value) for value in work_area)
+    window_width = max(1, int(window_rect[2]) - int(window_rect[0]))
+    window_height = max(1, int(window_rect[3]) - int(window_rect[1]))
+    max_x = max(left, right - window_width)
+    max_y = max(top, bottom - window_height)
+    return (
+        min(left + VISIBLE_WINDOW_MARGIN, max_x),
+        min(top + VISIBLE_WINDOW_MARGIN, max_y),
+    )
 
 
 @dataclass(frozen=True)
@@ -465,6 +497,20 @@ class CtypesWindowsApi:
             wintypes.UINT,
         ]
         self._user32.SetWindowPos.restype = wintypes.BOOL
+        self._user32.GetWindowRect.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.RECT),
+        ]
+        self._user32.GetWindowRect.restype = wintypes.BOOL
+        self._user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        self._user32.GetSystemMetrics.restype = ctypes.c_int
+        self._user32.SystemParametersInfoW.argtypes = [
+            wintypes.UINT,
+            wintypes.UINT,
+            wintypes.LPVOID,
+            wintypes.UINT,
+        ]
+        self._user32.SystemParametersInfoW.restype = wintypes.BOOL
 
         if ctypes.sizeof(ctypes.c_void_p) == 8:
             self._get_window_long = self._user32.GetWindowLongPtrW
@@ -530,6 +576,47 @@ class CtypesWindowsApi:
         if not self._user32.SetWindowPos(int(hwnd), 0, 0, 0, 0, 0, flags):
             raise self._ctypes.WinError(self._ctypes.get_last_error())
 
+    def hide_window_no_activate(self, hwnd: int) -> bool:
+        flags = (
+            SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOZORDER
+            | SWP_NOACTIVATE
+            | SWP_FRAMECHANGED
+            | SWP_HIDEWINDOW
+            | SWP_ASYNCWINDOWPOS
+        )
+        return bool(self._user32.SetWindowPos(int(hwnd), 0, 0, 0, 0, 0, flags))
+
+    def window_rect(self, hwnd: int) -> tuple[int, int, int, int]:
+        rect = self._wintypes.RECT()
+        if not self._user32.GetWindowRect(int(hwnd), self._ctypes.byref(rect)):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+    def virtual_screen_rect(self) -> tuple[int, int, int, int]:
+        left = int(self._user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+        top = int(self._user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+        width = max(1, int(self._user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)))
+        height = max(1, int(self._user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)))
+        return (left, top, left + width, top + height)
+
+    def primary_work_area(self) -> tuple[int, int, int, int]:
+        rect = self._wintypes.RECT()
+        if not self._user32.SystemParametersInfoW(
+            SPI_GETWORKAREA, 0, self._ctypes.byref(rect), 0
+        ):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+    def move_window_no_activate(self, hwnd: int, x: int, y: int) -> bool:
+        flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        return bool(
+            self._user32.SetWindowPos(
+                int(hwnd), 0, int(x), int(y), 0, 0, flags
+            )
+        )
+
     def show_window(self, hwnd: int, command: int) -> bool:
         return bool(self._user32.ShowWindowAsync(int(hwnd), int(command)))
 
@@ -540,8 +627,35 @@ class CtypesWindowsApi:
 class WindowsBrowserWindowController:
     """Show or hide only a window whose current PID matches its captured owner."""
 
-    def __init__(self, *, api=None):
+    def __init__(
+        self,
+        *,
+        api=None,
+        visibility_timeout: float = 0.5,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+    ):
         self.api = api if api is not None else CtypesWindowsApi()
+        self.visibility_timeout = max(0.0, float(visibility_timeout))
+        self._monotonic = monotonic
+        self._sleep = sleep
+
+    def _wait_for_visibility(self, hwnd: int, *, visible: bool) -> bool:
+        deadline = self._monotonic() + self.visibility_timeout
+        while True:
+            if bool(self.api.is_window_visible(hwnd)) is bool(visible):
+                return True
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return False
+            self._sleep(min(0.01, remaining))
+
+    def _restore_style(self, hwnd: int, style: int) -> None:
+        try:
+            self.api.set_ex_style(hwnd, style)
+            self.api.refresh_frame(hwnd)
+        except Exception:
+            pass
 
     def _validate(self, ref: BrowserWindowRef) -> WindowControlResult | None:
         if not ref.hwnd or not self.api.is_window(ref.hwnd):
@@ -577,15 +691,19 @@ class WindowsBrowserWindowController:
         invalid = self._validate(ref)
         if invalid:
             return invalid
+        original_style = None
         try:
-            if not self.api.show_window(ref.hwnd, SW_HIDE):
-                raise RuntimeError("ShowWindowAsync could not queue hide")
-            style = self.api.get_ex_style(ref.hwnd)
-            style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
-            self.api.set_ex_style(ref.hwnd, style)
-            self.api.refresh_frame(ref.hwnd)
+            original_style = self.api.get_ex_style(ref.hwnd)
+            hidden_style = (original_style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            self.api.set_ex_style(ref.hwnd, hidden_style)
+            if not self.api.hide_window_no_activate(ref.hwnd):
+                raise RuntimeError("SetWindowPos could not queue no-activate hide")
+            if not self._wait_for_visibility(ref.hwnd, visible=False):
+                raise RuntimeError("browser window remained visible after hide")
             return WindowControlResult(True, "hidden")
         except Exception as exc:
+            if original_style is not None:
+                self._restore_style(ref.hwnd, original_style)
             return WindowControlResult(
                 False, "error", code="hide_failed", error=str(exc)
             )
@@ -602,18 +720,24 @@ class WindowsBrowserWindowController:
             visible_style = (original_style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
             self.api.set_ex_style(ref.hwnd, visible_style)
             self.api.refresh_frame(ref.hwnd)
-            if not self.api.show_window(ref.hwnd, SW_RESTORE):
-                raise RuntimeError("ShowWindowAsync could not queue restore")
+            command = SW_RESTORE if activate else SW_SHOWNOACTIVATE
+            self.api.show_window(ref.hwnd, command)
+            if not self._wait_for_visibility(ref.hwnd, visible=True):
+                raise RuntimeError("browser window remained hidden after restore")
+            window_rect = self.api.window_rect(ref.hwnd)
+            virtual_screen = self.api.virtual_screen_rect()
+            if not rectangles_intersect(window_rect, virtual_screen):
+                x, y = safe_visible_window_origin(
+                    window_rect, self.api.primary_work_area()
+                )
+                if not self.api.move_window_no_activate(ref.hwnd, x, y):
+                    raise RuntimeError("browser window could not be moved onscreen")
             if activate:
                 self.api.set_foreground_window(ref.hwnd)
             return WindowControlResult(True, "visible")
         except Exception as exc:
             if original_style is not None:
-                try:
-                    self.api.set_ex_style(ref.hwnd, original_style)
-                    self.api.refresh_frame(ref.hwnd)
-                except Exception:
-                    pass
+                self._restore_style(ref.hwnd, original_style)
             return WindowControlResult(
                 False, "error", code="show_failed", error=str(exc)
             )

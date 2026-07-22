@@ -27,16 +27,36 @@ class FakeWindowApi:
         visible=None,
         class_names=None,
         windows=None,
+        window_rects=None,
+        virtual_rect=(0, 0, 1920, 1080),
+        work_area=(0, 0, 1920, 1040),
+        show_return=True,
+        show_changes_visibility=True,
+        hide_return=True,
+        keep_visible_after_hide=False,
+        move_return=True,
     ):
         self.hwnd_pid = dict(hwnd_pid or {})
         self.ex_styles = dict(ex_styles or {})
         self.visible = dict(visible or {})
         self.class_names = dict(class_names or {})
         self.windows = list(windows or self.hwnd_pid)
+        self.window_rects = dict(window_rects or {})
+        for hwnd in self.hwnd_pid:
+            self.window_rects.setdefault(int(hwnd), (100, 100, 900, 700))
+        self.virtual_rect = tuple(virtual_rect)
+        self.work_area = tuple(work_area)
+        self.show_return = bool(show_return)
+        self.show_changes_visibility = bool(show_changes_visibility)
+        self.hide_return = bool(hide_return)
+        self.keep_visible_after_hide = bool(keep_visible_after_hide)
+        self.move_return = bool(move_return)
         self.show_calls = []
         self.foreground_calls = []
         self.style_calls = []
         self.frame_calls = []
+        self.hide_no_activate_calls = []
+        self.move_calls = []
 
     def is_window(self, hwnd):
         return int(hwnd) in self.hwnd_pid
@@ -64,8 +84,9 @@ class FakeWindowApi:
         hwnd = int(hwnd)
         command = int(command)
         self.show_calls.append((hwnd, command))
-        self.visible[hwnd] = command != SW_HIDE
-        return True
+        if self.show_changes_visibility:
+            self.visible[hwnd] = command != SW_HIDE
+        return self.show_return
 
     def is_window_visible(self, hwnd):
         return bool(self.visible.get(int(hwnd), False))
@@ -73,6 +94,37 @@ class FakeWindowApi:
     def set_foreground_window(self, hwnd):
         self.foreground_calls.append(int(hwnd))
         return True
+
+    def hide_window_no_activate(self, hwnd):
+        hwnd = int(hwnd)
+        self.hide_no_activate_calls.append(hwnd)
+        if self.hide_return and not self.keep_visible_after_hide:
+            self.visible[hwnd] = False
+        return self.hide_return
+
+    def window_rect(self, hwnd):
+        return tuple(self.window_rects[int(hwnd)])
+
+    def virtual_screen_rect(self):
+        return self.virtual_rect
+
+    def primary_work_area(self):
+        return self.work_area
+
+    def move_window_no_activate(self, hwnd, x, y):
+        hwnd = int(hwnd)
+        x = int(x)
+        y = int(y)
+        self.move_calls.append((hwnd, x, y))
+        if self.move_return:
+            left, top, right, bottom = self.window_rects[hwnd]
+            self.window_rects[hwnd] = (
+                x,
+                y,
+                x + max(1, right - left),
+                y + max(1, bottom - top),
+            )
+        return self.move_return
 
 
 def test_hide_rejects_hwnd_owned_by_another_pid():
@@ -98,11 +150,12 @@ def test_hide_removes_taskbar_style_without_activating():
 
     assert result.ok is True
     assert result.state == "hidden"
-    assert api.show_calls[-1] == (701, SW_HIDE)
+    assert api.show_calls == []
+    assert api.hide_no_activate_calls == [701]
     assert api.foreground_calls == []
     assert api.ex_styles[701] & WS_EX_TOOLWINDOW
     assert not api.ex_styles[701] & WS_EX_APPWINDOW
-    assert api.frame_calls == [701]
+    assert api.frame_calls == []
 
 
 def test_show_restores_same_owned_window_only_on_explicit_request():
@@ -110,6 +163,7 @@ def test_show_restores_same_owned_window_only_on_explicit_request():
         hwnd_pid={701: 9001},
         ex_styles={701: WS_EX_TOOLWINDOW},
         visible={701: False},
+        show_return=False,
     )
     controller = WindowsBrowserWindowController(api=api)
 
@@ -123,6 +177,7 @@ def test_show_restores_same_owned_window_only_on_explicit_request():
     assert api.foreground_calls == [701]
     assert api.ex_styles[701] & WS_EX_APPWINDOW
     assert not api.ex_styles[701] & WS_EX_TOOLWINDOW
+    assert api.move_calls == []
 
 
 def test_show_can_restore_without_activation():
@@ -149,14 +204,31 @@ def test_invalid_hwnd_is_rejected_without_win32_mutation():
     assert api.style_calls == []
 
 
-def test_hide_reports_error_when_show_window_async_cannot_queue_operation():
+def test_hide_rolls_back_taskbar_style_when_no_activate_hide_fails():
     api = FakeWindowApi(
         hwnd_pid={701: 9001},
         ex_styles={701: WS_EX_APPWINDOW},
         visible={701: True},
+        hide_return=False,
     )
-    api.show_window = lambda _hwnd, _command: False
     controller = WindowsBrowserWindowController(api=api)
+
+    result = controller.hide(BrowserWindowRef(pid=9001, hwnd=701))
+
+    assert result.ok is False
+    assert result.code == "hide_failed"
+    assert api.ex_styles[701] == WS_EX_APPWINDOW
+    assert api.hide_no_activate_calls == [701]
+
+
+def test_hide_fails_and_rolls_back_style_when_window_remains_visible():
+    api = FakeWindowApi(
+        hwnd_pid={701: 9001},
+        ex_styles={701: WS_EX_APPWINDOW},
+        visible={701: True},
+        keep_visible_after_hide=True,
+    )
+    controller = WindowsBrowserWindowController(api=api, visibility_timeout=0)
 
     result = controller.hide(BrowserWindowRef(pid=9001, hwnd=701))
 
@@ -165,20 +237,40 @@ def test_hide_reports_error_when_show_window_async_cannot_queue_operation():
     assert api.ex_styles[701] == WS_EX_APPWINDOW
 
 
-def test_show_rolls_back_taskbar_style_when_async_restore_cannot_queue():
+def test_show_rolls_back_taskbar_style_when_window_remains_hidden():
     api = FakeWindowApi(
         hwnd_pid={701: 9001},
         ex_styles={701: WS_EX_TOOLWINDOW},
         visible={701: False},
+        show_changes_visibility=False,
     )
-    api.show_window = lambda _hwnd, _command: False
-    controller = WindowsBrowserWindowController(api=api)
+    controller = WindowsBrowserWindowController(api=api, visibility_timeout=0)
 
     result = controller.show(BrowserWindowRef(pid=9001, hwnd=701))
 
     assert result.ok is False
     assert result.code == "show_failed"
     assert api.ex_styles[701] == WS_EX_TOOLWINDOW
+
+
+def test_show_moves_initial_offscreen_window_into_primary_work_area():
+    api = FakeWindowApi(
+        hwnd_pid={701: 9001},
+        ex_styles={701: WS_EX_TOOLWINDOW},
+        visible={701: False},
+        window_rects={701: (-32000, -32000, -30720, -31200)},
+        virtual_rect=(0, 0, 1920, 1080),
+        work_area=(0, 0, 1920, 1040),
+    )
+    controller = WindowsBrowserWindowController(api=api)
+
+    result = controller.show(
+        BrowserWindowRef(pid=9001, hwnd=701, generation=2), activate=True
+    )
+
+    assert result.ok is True
+    assert api.move_calls == [(701, 64, 64)]
+    assert api.foreground_calls == [701]
 
 
 def test_find_window_selects_only_chrome_top_level_window_for_exact_pid():
