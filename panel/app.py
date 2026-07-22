@@ -5928,6 +5928,65 @@ def api_cpa_backfill():
     return jsonify({"ok": True, "queued": n, "message": f"已入队 {n} 个待转换 SSO"})
 
 
+@app.post("/api/cpa/refresh-all")
+def api_cpa_refresh_all():
+    need = require_login()
+    if need:
+        return need
+    if not _CPA_CORE_OK:
+        return jsonify({"ok": False, "error": f"core unavailable: {_CPA_CORE_ERR}"}), 500
+
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        limit = int(data.get("limit", 10000))
+    except (TypeError, ValueError):
+        limit = 10000
+    limit = max(1, min(limit, 10000))
+
+    if not _credential_import_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "凭据导入正在进行，请稍后重试"}), 409
+    activity_acquired = False
+    migration_acquired = False
+    try:
+        if not _activity_lock.acquire(blocking=False):
+            return jsonify({"ok": False, "error": "注册活动正在切换，请稍后重试"}), 409
+        activity_acquired = True
+        if registration_is_running():
+            return jsonify({"ok": False, "error": "注册任务运行中，不能刷新 SSO"}), 409
+        if not _credential_migration_lock.acquire(blocking=False):
+            return jsonify({"ok": False, "error": "凭据迁移正在进行，请稍后重试"}), 409
+        migration_acquired = True
+
+        fingerprints: Set[str] = set()
+        for account in unique_accounts():
+            sso = normalize_sso(account.get("sso") or "")
+            if sso:
+                fingerprints.add(sso_fingerprint(sso))
+        if not fingerprints:
+            return jsonify({"ok": False, "error": "当前凭据目录没有可刷新的 SSO"}), 400
+
+        total = min(len(fingerprints), limit)
+        queued = enqueue_all_sso_refresh(limit=limit)
+        skipped = max(0, total - queued)
+        log_line(f"[CPA] 全部 SSO 刷新入队: {queued} · 跳过: {skipped}")
+        return jsonify(
+            {
+                "ok": True,
+                "total": total,
+                "queued": queued,
+                "skipped": skipped,
+                "message": f"已将 {queued} 个 SSO 加入刷新队列",
+                "cpa": cpa_stats(),
+            }
+        )
+    finally:
+        if migration_acquired:
+            _credential_migration_lock.release()
+        if activity_acquired:
+            _activity_lock.release()
+        _credential_import_lock.release()
+
+
 def _normalize_browser_engine(value: str) -> str:
     eng = str(value or "").strip().lower()
     if eng in ("camoufox", "firefox", "headless", "cfox"):

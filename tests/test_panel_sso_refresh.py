@@ -19,6 +19,8 @@ def isolated_refresh_state(tmp_path, monkeypatch):
     monkeypatch.setattr(panel_app, "CONFIG_PATH", config_path)
     monkeypatch.delenv(panel_app.CPA_DIR_ENV, raising=False)
     monkeypatch.setattr(panel_app, "_credential_import_lock", threading.RLock())
+    monkeypatch.setattr(panel_app, "_credential_migration_lock", threading.Lock())
+    monkeypatch.setattr(panel_app, "_activity_lock", threading.Lock())
     monkeypatch.setattr(panel_app, "_cpa_lock", threading.Lock())
     monkeypatch.setattr(panel_app, "_cpa_q", queue.Queue())
     monkeypatch.setattr(panel_app, "_cpa_done", set())
@@ -27,6 +29,8 @@ def isolated_refresh_state(tmp_path, monkeypatch):
     monkeypatch.setattr(panel_app, "_CPA_CORE_OK", True)
     monkeypatch.setattr(panel_app, "convert_one", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(panel_app, "CPA_DELAY", 0)
+    monkeypatch.setattr(panel_app, "PANEL_AUTH", False)
+    monkeypatch.setitem(panel_app._job, "running", False)
     monkeypatch.setattr(
         panel_app,
         "_cpa_state",
@@ -238,3 +242,129 @@ def test_refresh_worker_atomically_replaces_existing_cpa_on_success(
     assert panel_app._cpa_state["ok"] == 1
     assert panel_app._cpa_state["fail"] == 0
     assert not list(paths.directory.glob(".*.tmp"))
+
+
+def test_refresh_all_route_queues_available_sso_without_exposing_secrets(
+    isolated_refresh_state, monkeypatch
+):
+    secret = "sso-secret-that-must-not-leak"
+    password = "password-secret-that-must-not-leak"
+    monkeypatch.setattr(
+        panel_app,
+        "unique_accounts",
+        lambda: [
+            {
+                "email": "one@example.com",
+                "password": password,
+                "sso": secret,
+                "source": "accounts_one.txt",
+            },
+            {"email": "empty@example.com", "sso": ""},
+        ],
+    )
+    requested_limits = []
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_all_sso_refresh",
+        lambda limit: (requested_limits.append(limit) or 1),
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/cpa/refresh-all", json={"limit": 10000}
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["total"] == 1
+    assert payload["queued"] == 1
+    assert payload["skipped"] == 0
+    assert payload["cpa"]["pending"] == 0
+    assert requested_limits == [10000]
+    serialized = response.get_data(as_text=True)
+    assert secret not in serialized
+    assert password not in serialized
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [(0, 1), (-50, 1), (50000, 10000), ("invalid", 10000)],
+)
+def test_refresh_all_route_normalizes_limit(
+    isolated_refresh_state, monkeypatch, requested, expected
+):
+    monkeypatch.setattr(
+        panel_app,
+        "unique_accounts",
+        lambda: [{"email": "one@example.com", "sso": "sso-one"}],
+    )
+    limits = []
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_all_sso_refresh",
+        lambda limit: (limits.append(limit) or 1),
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/cpa/refresh-all", json={"limit": requested}
+    )
+
+    assert response.status_code == 200
+    assert limits == [expected]
+
+
+def test_refresh_all_route_rejects_workspace_without_sso(
+    isolated_refresh_state, monkeypatch
+):
+    monkeypatch.setattr(panel_app, "unique_accounts", lambda: [])
+
+    response = panel_app.app.test_client().post(
+        "/api/cpa/refresh-all", json={"limit": 10000}
+    )
+
+    assert response.status_code == 400
+    assert "SSO" in response.get_json()["error"]
+
+
+def test_refresh_all_route_rejects_running_registration(
+    isolated_refresh_state, monkeypatch
+):
+    monkeypatch.setitem(panel_app._job, "running", True)
+    monkeypatch.setattr(
+        panel_app,
+        "unique_accounts",
+        lambda: [{"email": "one@example.com", "sso": "sso-one"}],
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/cpa/refresh-all", json={"limit": 10000}
+    )
+
+    assert response.status_code == 409
+    assert "注册" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize("busy_lock", ["import", "migration"])
+def test_refresh_all_route_rejects_busy_credential_change(
+    isolated_refresh_state, monkeypatch, busy_lock
+):
+    lock = threading.Lock()
+    assert lock.acquire(blocking=False)
+    if busy_lock == "import":
+        monkeypatch.setattr(panel_app, "_credential_import_lock", lock)
+    else:
+        monkeypatch.setattr(panel_app, "_credential_migration_lock", lock)
+    monkeypatch.setattr(
+        panel_app,
+        "unique_accounts",
+        lambda: [{"email": "one@example.com", "sso": "sso-one"}],
+    )
+    try:
+        response = panel_app.app.test_client().post(
+            "/api/cpa/refresh-all", json={"limit": 10000}
+        )
+    finally:
+        lock.release()
+
+    assert response.status_code == 409
+    assert "凭据" in response.get_json()["error"]
