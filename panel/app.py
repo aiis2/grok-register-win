@@ -4698,7 +4698,6 @@ async function refreshAllSso(){
   try{
     const j=await api('/api/cpa/refresh-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:10000})});
     toast(j.message||('已入队 '+(j.queued||0)+' 个 SSO'));
-    poll();
   }catch(e){toast('SSO 刷新失败: '+e.message)}
   finally{await poll()}
 }

@@ -386,6 +386,7 @@ def bootstrap_hidden_chromium(
         settle_deadline = None
         settle_seconds = max(0.0, float(settle_time))
         find_windows = getattr(controller, "find_windows_for_pid", None)
+        window_is_visible = getattr(controller, "window_is_visible", None)
         while True:
             now = monotonic()
             if not hidden_hwnds and now >= deadline:
@@ -405,7 +406,15 @@ def bootstrap_hidden_chromium(
                 candidate = int(controller.find_window_for_pid(launcher_pid) or 0)
                 candidates = [candidate] if candidate else []
             for candidate in candidates:
-                if candidate in hidden_hwnds:
+                visible_again = False
+                if candidate in hidden_hwnds and callable(window_is_visible):
+                    try:
+                        visible_again = bool(
+                            window_is_visible(launcher_pid, candidate)
+                        )
+                    except Exception:
+                        visible_again = False
+                if candidate in hidden_hwnds and not visible_again:
                     continue
                 hidden = controller.hide(
                     BrowserWindowRef(
@@ -435,6 +444,14 @@ def bootstrap_hidden_chromium(
             sleep(0.01)
         if not hwnd:
             raise RuntimeError("Chromium native window was not found")
+        if callable(find_windows) and callable(window_is_visible):
+            remaining_visible = [
+                candidate
+                for candidate in (find_windows(launcher_pid) or [])
+                if window_is_visible(launcher_pid, int(candidate or 0))
+            ]
+            if remaining_visible:
+                raise RuntimeError("Chromium native window remained visible")
         return HiddenLaunchResult(
             process=process,
             launcher_pid=launcher_pid,
@@ -788,6 +805,20 @@ class WindowsBrowserWindowController:
     def find_window_for_pid(self, pid: int) -> int:
         candidates = self.find_windows_for_pid(pid)
         return candidates[0] if candidates else 0
+
+    def window_is_visible(self, pid: int, hwnd: int) -> bool:
+        owner_pid = int(pid or 0)
+        window = int(hwnd or 0)
+        if not owner_pid or not window:
+            return False
+        try:
+            return bool(
+                self.api.is_window(window)
+                and self.api.window_pid(window) == owner_pid
+                and self.api.is_window_visible(window)
+            )
+        except Exception:
+            return False
 
     def hide(self, ref: BrowserWindowRef) -> WindowControlResult:
         invalid = self._validate(ref)

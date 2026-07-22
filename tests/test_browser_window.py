@@ -418,6 +418,27 @@ class SequencedBootstrapController(FakeBootstrapController):
         return windows[0] if windows else 0
 
 
+class ReappearingBootstrapController(FakeBootstrapController):
+    def __init__(self):
+        super().__init__(hwnd=701)
+        self.find_calls = 0
+        self.visible = True
+
+    def find_windows_for_pid(self, pid):
+        self.find_calls += 1
+        if self.find_calls == 3:
+            self.visible = True
+        return [self.hwnd]
+
+    def window_is_visible(self, pid, hwnd):
+        return self.visible
+
+    def hide(self, ref):
+        result = super().hide(ref)
+        self.visible = False
+        return result
+
+
 class FakeClock:
     def __init__(self):
         self.now = 0.0
@@ -516,6 +537,33 @@ def test_silent_bootstrap_hides_delayed_replacement_main_window():
     assert [ref.hwnd for ref in controller.hidden_refs] == [701, 702]
     assert result.hwnd == 702
     assert clock.now <= 0.06
+
+
+def test_silent_bootstrap_rehides_same_main_window_if_chromium_shows_it_again():
+    process = FakeProcess()
+    websocket = FakeWebSocket()
+    controller = ReappearingBootstrapController()
+    clock = FakeClock()
+
+    result = bootstrap_hidden_chromium(
+        port=19227,
+        browser_path="chrome.exe",
+        arguments=["--user-data-dir=X"],
+        controller=controller,
+        popen=lambda *_args, **_kwargs: process,
+        version_reader=lambda _port: {
+            "webSocketDebuggerUrl": "ws://127.0.0.1:19227/devtools/browser/id"
+        },
+        websocket_factory=lambda _url: websocket,
+        executable_resolver=lambda value: value,
+        settle_time=0.05,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert [ref.hwnd for ref in controller.hidden_refs] == [701, 701]
+    assert controller.visible is False
+    assert result.hwnd == 701
 
 
 def test_silent_bootstrap_passes_hidden_startup_info_to_popen():
