@@ -406,8 +406,10 @@
             <div><dt>最近账号</dt><dd id="cpa-last-email">—</dd></div>
           </dl>
           <div class="form-stack cpa-actions">
-            <label class="field" for="cpa-backfill-limit"><span>补转上限</span><input id="cpa-backfill-limit" type="number" min="1" max="1000" value="200" data-busy-group="credentials"></label>
+            <label class="field" for="cpa-backfill-limit"><span>处理上限</span><input id="cpa-backfill-limit" type="number" min="1" max="10000" value="10000" data-busy-group="credentials"></label>
             <button class="button button--secondary" id="cpa-backfill" type="button" data-busy-group="credentials">扫描并补转缺失 CPA</button>
+            <button class="button button--primary" id="cpa-refresh-all" type="button" data-busy-group="credentials">刷新全部 SSO 换票</button>
+            <p class="form-note">此操作不会生成新的 Web SSO；成功原子替换，失败保留旧 CPA，任务在后台串行执行。</p>
           </div>
         </article>
       </div>

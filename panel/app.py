@@ -3619,9 +3619,11 @@ INDEX_HTML = r"""
       <button class="btn ok" id="btn_start" onclick="startJob()">▶ 开始注册</button>
       <button class="btn danger" id="btn_stop" onclick="stopJob()">■ 停止</button>
       <button class="btn" onclick="backfillCpa()" title="把尚未转成 CPA 的历史 SSO 入队">补转未转换 CPA</button>
+      <button class="btn" id="btn_cpa_refresh_all" onclick="refreshAllSso()" title="使用已有 Web SSO 重新换取 OAuth/CPA">刷新全部 SSO</button>
     </div>
     <div class="control-note">
       并发度支持 1–10。每个槽使用独立 CLI 进程、有头浏览器和临时 Profile；“隐藏有头”不是无头模式，窗口默认不显示且不进入任务栏，可在对应 Worker 卡片中手动显示或隐藏。任务结束后浏览器立即退出。
+      SSO 刷新不会生成新的 Web SSO；成功原子替换，失败保留旧 CPA。
     </div>
     <div class="muted" style="margin-top:10px;font-size:12px" id="cpa_hint">
       代理走本机 Clash（config.json 的 proxy，常见 7897）。节点在 Clash 里选。注册成功后自动转 CPA。
@@ -4688,6 +4690,18 @@ async function backfillCpa(){
     poll();
   }catch(e){toast('补转失败: '+e.message)}
 }
+async function refreshAllSso(){
+  const message='确认刷新当前账号池的全部 SSO？\n\n此操作不会生成新的 Web SSO；系统会重新换取 OAuth/CPA，成功原子替换，失败保留旧 CPA。任务会在后台串行执行。';
+  if(!confirm(message)) return;
+  const button=document.getElementById('btn_cpa_refresh_all');
+  if(button) button.disabled=true;
+  try{
+    const j=await api('/api/cpa/refresh-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:10000})});
+    toast(j.message||('已入队 '+(j.queued||0)+' 个 SSO'));
+    poll();
+  }catch(e){toast('SSO 刷新失败: '+e.message)}
+  finally{await poll()}
+}
 let lastLogLen=0;
 async function poll(){
   try{
@@ -4703,6 +4717,7 @@ async function poll(){
     document.getElementById('register_concurrency').disabled=!!st.running;
     document.getElementById('browser_engine').disabled=!!st.running;
     document.getElementById('browser_window_mode').disabled=!!st.running;
+    document.getElementById('btn_cpa_refresh_all').disabled=!!st.running||cpa.core_ok===false;
     syncEmailReceiveControls();
     const concurrencyStat=document.getElementById('st_concurrency');
     if(concurrencyStat) concurrencyStat.textContent=`${st.active_workers||0} / ${st.effective_concurrency||0}`;
@@ -5920,7 +5935,7 @@ def api_cpa_backfill():
         limit = int(data.get("limit") or 200)
     except Exception:
         limit = 200
-    limit = max(1, min(limit, 1000))
+    limit = max(1, min(limit, 10000))
     if not _CPA_CORE_OK:
         return jsonify({"ok": False, "error": f"core unavailable: {_CPA_CORE_ERR}"}), 500
     n = enqueue_missing_accounts(limit=limit)

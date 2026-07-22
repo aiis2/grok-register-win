@@ -465,8 +465,12 @@ def test_v2_credentials_exposes_storage_migration_and_cpa_controls(
         "cpa-status",
         "cpa-backfill-limit",
         "cpa-backfill",
+        "cpa-refresh-all",
     ):
         assert f'id="{element_id}"' in html
+    assert 'max="10000"' in html
+    assert "不会生成新的 Web SSO" in html
+    assert "失败保留旧 CPA" in html
 
 
 def test_v2_credentials_javascript_reuses_existing_safe_contracts():
@@ -478,11 +482,14 @@ def test_v2_credentials_javascript_reuses_existing_safe_contracts():
         "/api/config/credentials/migrate",
         "/api/cpa/status",
         "/api/cpa/backfill",
+        "/api/cpa/refresh-all",
     ):
         assert endpoint in source
     assert "formatBytes" in source
     assert "confirmAction" in source
     assert "setBusy('credentials'" in source
+    assert "async function refreshAllSso()" in source
+    assert "失败时保留旧 CPA" in source
 
 
 def test_v2_logs_exposes_live_controls_and_accessible_output(isolated_v2_panel):

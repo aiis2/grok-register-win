@@ -48,6 +48,19 @@ def test_panel_contains_concurrency_worker_and_credential_controls():
     assert "不会覆盖" in html
 
 
+def test_legacy_panel_exposes_confirmed_full_sso_refresh_control():
+    html = panel_app.INDEX_HTML
+
+    assert 'id="btn_cpa_refresh_all"' in html
+    assert "刷新全部 SSO" in html
+    assert "不会生成新的 Web SSO" in html
+    assert "失败保留旧 CPA" in html
+    assert "async function refreshAllSso()" in html
+    assert "/api/cpa/refresh-all" in html
+    assert "limit:10000" in html
+    assert "confirm(message)" in html
+
+
 def test_panel_contains_headed_browser_window_mode_and_worker_controls():
     html = panel_app.INDEX_HTML
 

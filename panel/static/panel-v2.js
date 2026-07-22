@@ -872,12 +872,14 @@
     const save = document.getElementById('credentials-save');
     const migrate = document.getElementById('credentials-migrate');
     const backfill = document.getElementById('cpa-backfill');
+    const refreshAll = document.getElementById('cpa-refresh-all');
     const limit = document.getElementById('cpa-backfill-limit');
     if (pathInput) pathInput.disabled = busy || blocked;
     if (save) save.disabled = busy || blocked;
     if (migrate) migrate.disabled = busy || blocked;
     if (limit) limit.disabled = busy || Boolean(state.job?.running);
     if (backfill) backfill.disabled = busy || Boolean(state.job?.running) || state.cpa?.core_ok === false;
+    if (refreshAll) refreshAll.disabled = busy || Boolean(state.job?.running) || state.cpa?.core_ok === false;
   }
 
   function requestedCredentialPath() {
@@ -946,7 +948,7 @@
   async function backfillCpa() {
     const limitInput = document.getElementById('cpa-backfill-limit');
     if (!limitInput?.reportValidity()) return;
-    const limit = Math.max(1, Math.min(1000, Number(limitInput.value || 200)));
+    const limit = Math.max(1, Math.min(10000, Number(limitInput.value || 10000)));
     setBusy('credentials', true);
     setInlineError('section-credentials-error');
     try {
@@ -955,6 +957,34 @@
         body: { limit },
       });
       showToast(payload.message || `已入队 ${Number(payload.queued || 0)} 个待转换账号`);
+      await Promise.allSettled([loadCpaStatus(), loadJobStatus({ silent: true })]);
+      window.setTimeout(() => loadCpaStatus().catch(() => {}), 1200);
+    } catch (error) {
+      setInlineError('section-credentials-error', safeErrorMessage(error));
+    } finally {
+      setBusy('credentials', false);
+    }
+  }
+
+  async function refreshAllSso() {
+    const limitInput = document.getElementById('cpa-backfill-limit');
+    if (!limitInput?.reportValidity()) return;
+    const limit = Math.max(1, Math.min(10000, Number(limitInput.value || 10000)));
+    const accepted = await confirmAction({
+      title: '刷新当前账号池的全部 SSO 换票？',
+      message: '此操作不会生成新的 Web SSO。系统会重新换取 OAuth/CPA；成功后原子替换旧 CPA，失败时保留旧 CPA，并在后台串行执行。',
+      acceptLabel: '开始刷新',
+    });
+    if (!accepted) return;
+    setBusy('credentials', true);
+    setInlineError('section-credentials-error');
+    try {
+      const payload = await requestJson('/api/cpa/refresh-all', {
+        method: 'POST',
+        body: { limit },
+      });
+      if (payload.cpa) renderCpaStatus(payload.cpa);
+      showToast(payload.message || `已入队 ${Number(payload.queued || 0)} 个 SSO`);
       await Promise.allSettled([loadCpaStatus(), loadJobStatus({ silent: true })]);
       window.setTimeout(() => loadCpaStatus().catch(() => {}), 1200);
     } catch (error) {
@@ -1666,6 +1696,7 @@
     document.getElementById('credentials-save')?.addEventListener('click', saveCredentialDirectory);
     document.getElementById('credentials-migrate')?.addEventListener('click', migrateCredentialDirectory);
     document.getElementById('cpa-backfill')?.addEventListener('click', backfillCpa);
+    document.getElementById('cpa-refresh-all')?.addEventListener('click', refreshAllSso);
     document.getElementById('logs-pause')?.addEventListener('click', toggleLogPause);
     document.getElementById('logs-autoscroll')?.addEventListener('change', (event) => {
       state.logs.autoScroll = Boolean(event.target.checked);
