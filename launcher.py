@@ -110,6 +110,10 @@ def python_bin() -> str:
     return sys.executable
 
 
+def panel_command() -> list[str]:
+    return [python_bin(), "-m", "panel.app"]
+
+
 def check_proxy(proxy: str) -> None:
     proxy = (proxy or "").strip()
     if not proxy:
@@ -208,7 +212,7 @@ def _main_impl() -> int:
         log(f"[FATAL] missing {panel_py}")
         return 1
 
-    cmd = [python_bin(), str(panel_py)]
+    cmd = panel_command()
     log(f"[*] start panel: {' '.join(cmd)}")
     panel_log = ROOT / "data" / "logs" / "panel_boot.log"
     try:

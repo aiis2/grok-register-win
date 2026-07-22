@@ -27,6 +27,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+# Direct script execution puts panel/ rather than the project root on sys.path.
+# Keep both script and package entry points resolving the same project modules.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 # Ensure stdout/stderr use UTF-8 on Windows (default is GBK/CP936)
 if sys.platform == "win32":
     try:
@@ -5244,11 +5250,16 @@ def health():
     )
 
 
-# start background CPA worker when module loads (systemd imports/runs this file)
-start_cpa_worker()
+# Import-only startup probe used by launcher/package verification.
+_STARTUP_CHECK = os.environ.get("PANEL_STARTUP_CHECK", "").strip() == "1"
+if _STARTUP_CHECK:
+    print("PANEL_STARTUP_OK")
+else:
+    # start background CPA worker when module loads (systemd imports/runs this file)
+    start_cpa_worker()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not _STARTUP_CHECK:
     print(f"Grok Register Panel -> http://0.0.0.0:{PORT}")
     print(f"CPA auto-convert dir -> {current_cpa_paths().directory} core={_CPA_CORE_OK}")
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
