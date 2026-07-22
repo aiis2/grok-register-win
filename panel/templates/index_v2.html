@@ -84,18 +84,86 @@
       <div class="content-grid content-grid--overview">
         <article class="surface-card">
           <div class="card-heading"><div><span class="eyebrow">Progress</span><h2>当前进度</h2></div></div>
-          <div class="empty-state" id="overview-progress-empty"><span aria-hidden="true">◎</span><strong>尚未运行任务</strong><p>进入注册页设置轮数、并发和浏览器模式。</p></div>
+          <div class="overview-progress" id="overview-progress">
+            <div class="progress-summary"><strong id="overview-progress-label">尚未运行任务</strong><span id="overview-progress-value">0 / 0</span></div>
+            <div class="progress-track" role="progressbar" aria-label="注册任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="overview-progress-bar"><span id="overview-progress-fill"></span></div>
+            <p id="overview-progress-detail">进入注册页设置轮数、并发和浏览器模式。</p>
+          </div>
         </article>
         <article class="surface-card">
           <div class="card-heading"><div><span class="eyebrow">Attention</span><h2>最近异常</h2></div><a href="#logs">查看日志</a></div>
-          <div class="empty-state empty-state--compact" id="overview-error-empty"><strong>没有待处理异常</strong><p>任务错误会在这里显示脱敏摘要。</p></div>
+          <div class="latest-error" id="overview-last-error"><strong>没有待处理异常</strong><p id="overview-last-error-text">任务错误会在这里显示脱敏摘要。</p></div>
         </article>
       </div>
     </section>
 
     <section id="section-register" class="panel-section" data-section="register" hidden>
       <div class="section-heading"><div><p class="eyebrow">Registration</p><h1>注册任务</h1><p>配置任务并管理每个并发槽的独立浏览器。</p></div></div>
-      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">↗</span><strong>注册控制即将就绪</strong><p>该区域会接入现有任务、浏览器和 Worker API。</p></div></div>
+      <div class="inline-alert inline-alert--error" id="section-register-error" role="alert" hidden></div>
+      <div class="registration-layout">
+        <article class="surface-card registration-card">
+          <div class="card-heading"><div><span class="eyebrow">Task setup</span><h2>任务参数</h2></div><span class="status-label" id="registration-status">空闲</span></div>
+          <form id="registration-form" class="form-stack">
+            <div class="form-grid form-grid--two">
+              <label class="field" for="register-count">
+                <span>注册轮数</span>
+                <input id="register-count" name="count" type="number" min="1" max="10000" step="1" value="1" required data-busy-group="registration">
+                <small>单次最多 10,000 轮</small>
+              </label>
+              <label class="field" for="register-concurrency">
+                <span>并发浏览器</span>
+                <input id="register-concurrency" name="concurrency" type="number" min="1" max="10" step="1" value="1" required data-busy-group="registration">
+                <small>每个并发独享浏览器</small>
+              </label>
+            </div>
+            <div class="form-grid form-grid--two">
+              <label class="field" for="browser-engine">
+                <span>浏览器引擎</span>
+                <select id="browser-engine" name="browser_engine" data-busy-group="registration">
+                  <option value="chromium">Chromium · 有头</option>
+                  <option value="camoufox">Camoufox · 无头</option>
+                </select>
+                <small>隐藏有头模式仍使用真实窗口</small>
+              </label>
+              <label class="field" for="browser-window-mode">
+                <span>有头窗口模式</span>
+                <select id="browser-window-mode" name="browser_window_mode" data-busy-group="registration">
+                  <option value="hidden">隐藏且不占任务栏</option>
+                  <option value="minimized">最小化到任务栏</option>
+                  <option value="visible">正常显示</option>
+                </select>
+                <small>仅适用于 Chromium</small>
+              </label>
+            </div>
+            <div class="form-actions">
+              <button class="button button--secondary" id="save-browser-settings" type="button" data-busy-group="registration">保存浏览器设置</button>
+              <span class="form-actions__spacer"></span>
+              <button class="button button--danger" id="stop-registration" type="button" disabled data-busy-group="registration">停止任务</button>
+              <button class="button button--primary" id="start-registration" type="submit" data-busy-group="registration">开始注册</button>
+            </div>
+          </form>
+        </article>
+
+        <aside class="surface-card status-card" aria-label="任务状态">
+          <div class="card-heading"><div><span class="eyebrow">Live status</span><h2>执行状态</h2></div></div>
+          <dl class="status-list">
+            <div><dt>当前轮次</dt><dd id="registration-round">0 / 0</dd></div>
+            <div><dt>成功</dt><dd class="status-success" id="registration-success">0</dd></div>
+            <div><dt>失败</dt><dd class="status-danger" id="registration-fail">0</dd></div>
+            <div><dt>活跃 Worker</dt><dd id="registration-workers">0</dd></div>
+            <div><dt>开始时间</dt><dd id="registration-started">—</dd></div>
+          </dl>
+          <div class="task-message" id="registration-message">等待启动注册任务。</div>
+        </aside>
+      </div>
+
+      <div class="subsection-heading">
+        <div><p class="eyebrow">Workers</p><h2>并发浏览器</h2><p>每个 Worker 对应一个独立浏览器；隐藏窗口可在这里临时唤醒。</p></div>
+        <span class="status-label" id="worker-count">0 个 Worker</span>
+      </div>
+      <div class="worker-grid" id="worker-grid" aria-live="polite">
+        <div class="empty-state worker-empty"><span aria-hidden="true">□</span><strong>暂无 Worker</strong><p>任务启动后，每个并发槽会显示在这里。</p></div>
+      </div>
     </section>
 
     <section id="section-accounts" class="panel-section" data-section="accounts" hidden>
@@ -118,6 +186,18 @@
       <div class="surface-card"><div class="empty-state"><span aria-hidden="true">_</span><strong>日志流尚未连接</strong><p>进入该区域后会建立本地 SSE 连接。</p></div></div>
     </section>
   </main>
+
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+    <form method="dialog">
+      <div class="confirm-dialog__icon" aria-hidden="true">!</div>
+      <h2 id="confirm-title">确认操作</h2>
+      <p id="confirm-message">请确认是否继续。</p>
+      <div class="confirm-dialog__actions">
+        <button class="button button--ghost" id="confirm-cancel" value="cancel">取消</button>
+        <button class="button button--danger" id="confirm-accept" value="accept">确认</button>
+      </div>
+    </form>
+  </dialog>
 
   <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
 

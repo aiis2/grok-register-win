@@ -136,3 +136,79 @@ def test_v2_javascript_defines_hash_navigation_and_system_theme_behavior():
     assert "hashchange" in source
     assert "#overview" in source
     assert "textContent" in source
+
+
+def test_v2_registration_has_existing_limits_browser_modes_and_worker_region(
+    isolated_v2_panel,
+):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+
+    assert 'id="registration-form"' in html
+    assert 'id="register-count"' in html
+    assert 'min="1"' in html and 'max="10000"' in html
+    assert 'id="register-concurrency"' in html
+    assert 'max="10"' in html
+    assert 'id="browser-engine"' in html
+    assert 'value="chromium"' in html
+    assert 'value="camoufox"' in html
+    assert 'id="browser-window-mode"' in html
+    for mode in ("hidden", "minimized", "visible"):
+        assert f'value="{mode}"' in html
+    assert 'id="start-registration"' in html
+    assert 'id="stop-registration"' in html
+    assert 'id="worker-grid"' in html
+
+
+def test_v2_uses_accessible_dialog_instead_of_native_confirm(isolated_v2_panel):
+    root = Path(panel_app.__file__).resolve().parent
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    assert '<dialog id="confirm-dialog"' in html
+    assert 'aria-labelledby="confirm-title"' in html
+    assert 'id="confirm-cancel"' in html
+    assert 'id="confirm-accept"' in html
+    assert ".showModal()" in source
+    assert "window.confirm" not in source
+
+
+def test_v2_registration_javascript_reuses_current_backend_contracts():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    for endpoint in (
+        "/api/job/status",
+        "/api/job/start",
+        "/api/job/stop",
+        "/api/config/browser",
+        "/api/job/workers/",
+        "/browser/",
+    ):
+        assert endpoint in source
+    assert "async function requestJson" in source
+    assert "Promise.allSettled" in source
+    assert "browser.generation" in source
+    assert "workerControlPending" in source
+    assert "setInterval" in source
+
+
+def test_v2_worker_renderer_builds_safe_dom_without_inner_html():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+    renderer = source.split("function renderWorkers", 1)[1].split(
+        "async function controlWorkerBrowser", 1
+    )[0]
+
+    assert "document.createElement" in renderer
+    assert ".textContent" in renderer
+    assert "innerHTML" not in renderer
+    assert "browser.generation" in renderer
+
+
+def test_v2_registration_busy_state_is_scoped_to_related_controls():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    assert "setBusy('registration'" in source
+    assert "data-busy-group" in source
+    assert "document.body" not in source.split("function setBusy", 1)[1].split("}", 1)[0]
