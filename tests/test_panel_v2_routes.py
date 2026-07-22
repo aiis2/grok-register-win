@@ -49,22 +49,31 @@ def test_default_and_modern_render_v2_while_legacy_stays_classic(
     assert 'id="register_concurrency"' in legacy_html
 
 
-def test_panel_v2_release_documentation(isolated_v2_panel):
+def test_v1_9_release_documents_hidden_window_and_sso_refresh(isolated_v2_panel):
     root = Path(panel_app.__file__).resolve().parent.parent
     readme = (root / "README.md").read_text(encoding="utf-8")
-    release = (root / "docs" / "releases" / "v1.8.0.md").read_text(
+    release = (root / "docs" / "releases" / "v1.9.0.md").read_text(
         encoding="utf-8"
     )
 
-    assert "version-v1.8.0" in readme
+    assert "version-v1.9.0" in readme
     for phrase in (
         "aiis2",
-        "服务端分页",
-        "SSE",
+        "Chrome_WidgetWin_1",
+        "任务栏",
+        "刷新全部 SSO",
+        "10000",
+        "失败保留旧 CPA",
         "?ui=legacy",
-        "355 passed",
+        "373 passed",
     ):
         assert phrase in release
+    release_lower = release.casefold()
+    assert "asz798838958" not in release_lower
+    assert "lingxiaoyiyu-hub" not in release_lower
+    combined = f"{readme}\n{release}".casefold()
+    assert "38.147.173.173" not in combined
+    assert "mail.aiis2.shop" not in combined
 
 
 def test_v2_uses_only_local_assets_and_has_server_rendered_legacy_fallback(
