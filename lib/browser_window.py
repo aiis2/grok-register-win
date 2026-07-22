@@ -39,6 +39,11 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+HIDDEN_WINDOW_X = -32000
+HIDDEN_WINDOW_Y = -32000
+HIDDEN_WINDOW_POSITION_ARGUMENT = (
+    f"--window-position={HIDDEN_WINDOW_X},{HIDDEN_WINDOW_Y}"
+)
 
 
 def normalize_browser_window_mode(value, *, platform: str | None = None) -> str:
@@ -54,6 +59,17 @@ def normalize_browser_window_mode(value, *, platform: str | None = None) -> str:
     if mode == WINDOW_MODE_HIDDEN and current_platform != "win32":
         return WINDOW_MODE_VISIBLE
     return mode
+
+
+def build_hidden_startupinfo(*, platform: str | None = None):
+    """Build a best-effort Windows hint that keeps the first GUI window hidden."""
+    current_platform = sys.platform if platform is None else str(platform)
+    if current_platform != "win32":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return startupinfo
 
 
 @dataclass(frozen=True)
@@ -246,6 +262,7 @@ def bootstrap_hidden_chromium(
     websocket_factory=None,
     process_tree_terminator=None,
     executable_resolver=None,
+    startupinfo_builder=None,
     timeout: float = 10.0,
     monotonic=time.monotonic,
     sleep=time.sleep,
@@ -257,6 +274,7 @@ def bootstrap_hidden_chromium(
     websocket_factory = websocket_factory or _open_cdp_websocket
     process_tree_terminator = process_tree_terminator or terminate_process_tree
     executable_resolver = executable_resolver or resolve_chromium_executable
+    startupinfo_builder = startupinfo_builder or build_hidden_startupinfo
     process = None
     websocket = None
     try:
@@ -265,6 +283,12 @@ def bootstrap_hidden_chromium(
             raise ValueError("headless arguments are forbidden in hidden headed mode")
         if "--silent-launch" not in launch_arguments:
             launch_arguments.append("--silent-launch")
+        launch_arguments = [
+            item
+            for item in launch_arguments
+            if not item.startswith("--window-position=")
+        ]
+        launch_arguments.append(HIDDEN_WINDOW_POSITION_ARGUMENT)
 
         executable = executable_resolver(str(browser_path))
         command = [
@@ -272,12 +296,15 @@ def bootstrap_hidden_chromium(
             f"--remote-debugging-port={int(port)}",
             *launch_arguments,
         ]
-        process = popen(
-            command,
-            shell=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        popen_kwargs = {
+            "shell": False,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        startupinfo = startupinfo_builder()
+        if startupinfo is not None:
+            popen_kwargs["startupinfo"] = startupinfo
+        process = popen(command, **popen_kwargs)
         launcher_pid = int(getattr(process, "pid", 0) or 0)
         if not launcher_pid:
             raise RuntimeError("spawned Chromium did not expose a PID")
@@ -303,6 +330,8 @@ def bootstrap_hidden_chromium(
                 "background": True,
                 "focus": False,
                 "windowState": "minimized",
+                "left": HIDDEN_WINDOW_X,
+                "top": HIDDEN_WINDOW_Y,
             },
         }
         websocket.send(json.dumps(command_payload, separators=(",", ":")))

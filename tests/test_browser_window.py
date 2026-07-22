@@ -245,7 +245,11 @@ def test_silent_bootstrap_creates_headed_background_minimized_window():
     result = bootstrap_hidden_chromium(
         port=19222,
         browser_path="chrome.exe",
-        arguments=["--user-data-dir=X", "--silent-launch"],
+        arguments=[
+            "--user-data-dir=X",
+            "--silent-launch",
+            "--window-position=10,20",
+        ],
         controller=controller,
         popen=popen,
         version_reader=lambda _port: {
@@ -259,6 +263,8 @@ def test_silent_bootstrap_creates_headed_background_minimized_window():
     assert launched_arguments[0] == "chrome.exe"
     assert "--remote-debugging-port=19222" in launched_arguments
     assert "--silent-launch" in launched_arguments
+    assert launched_arguments.count("--window-position=-32000,-32000") == 1
+    assert "--window-position=10,20" not in launched_arguments
     assert not any(arg.startswith("--headless") for arg in launched_arguments)
     assert websocket.sent == [
         {
@@ -270,6 +276,8 @@ def test_silent_bootstrap_creates_headed_background_minimized_window():
                 "background": True,
                 "focus": False,
                 "windowState": "minimized",
+                "left": -32000,
+                "top": -32000,
             },
         }
     ]
@@ -282,6 +290,32 @@ def test_silent_bootstrap_creates_headed_background_minimized_window():
     )
     assert controller.hidden_refs[0].pid == 9300
     assert controller.hidden_refs[0].hwnd == 701
+
+
+def test_silent_bootstrap_passes_hidden_startup_info_to_popen():
+    process = FakeProcess()
+    websocket = FakeWebSocket()
+    startupinfo = object()
+    popen_calls = []
+
+    bootstrap_hidden_chromium(
+        port=19225,
+        browser_path="chrome.exe",
+        arguments=["--user-data-dir=X"],
+        controller=FakeBootstrapController(),
+        popen=lambda arguments, **kwargs: popen_calls.append(
+            (list(arguments), dict(kwargs))
+        )
+        or process,
+        version_reader=lambda _port: {
+            "webSocketDebuggerUrl": "ws://127.0.0.1:19225/devtools/browser/id"
+        },
+        websocket_factory=lambda _url: websocket,
+        executable_resolver=lambda value: value,
+        startupinfo_builder=lambda: startupinfo,
+    )
+
+    assert popen_calls[0][1]["startupinfo"] is startupinfo
 
 
 def test_silent_bootstrap_resolves_drission_chrome_alias_before_spawn():
