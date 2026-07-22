@@ -200,15 +200,26 @@ def test_log_stream_uses_query_cursor_when_header_is_absent(isolated_log_app):
     assert "first event" not in chunk
 
 
-def test_log_stream_sends_heartbeat_when_no_event_is_available(isolated_log_app):
+def test_log_stream_acknowledges_connection_then_sends_heartbeat_when_idle(
+    isolated_log_app, monkeypatch
+):
+    event_buffer, _slots = isolated_log_app
+    monkeypatch.setattr(event_buffer, "after", lambda _sequence: [])
+    monkeypatch.setattr(
+        event_buffer,
+        "wait_after",
+        lambda _sequence, timeout: [],
+    )
     response = panel_app.app.test_client().get(
         "/api/logs/stream?after=0", buffered=False
     )
-    chunk = next(response.response).decode("utf-8")
+    connected = next(response.response).decode("utf-8")
+    heartbeat = next(response.response).decode("utf-8")
     response.close()
 
-    assert chunk.startswith(": heartbeat")
-    assert chunk.endswith("\n\n")
+    assert connected == ": connected 0\n\n"
+    assert heartbeat.startswith(": heartbeat")
+    assert heartbeat.endswith("\n\n")
 
 
 @pytest.mark.parametrize("cursor", ["invalid", "-1", "1.5"])

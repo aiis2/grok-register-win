@@ -5828,6 +5828,10 @@ def _requested_log_sequence() -> int:
 def _iter_log_stream(after: int):
     cursor = after
     try:
+        if not _log_events.after(cursor):
+            # Flush response headers immediately when the client is already
+            # caught up. Otherwise EventSource.onopen waits for the heartbeat.
+            yield f": connected {cursor}\n\n"
         while True:
             events = _log_events.after(cursor)
             if not events:

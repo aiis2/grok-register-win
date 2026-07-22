@@ -126,6 +126,16 @@ def test_v2_css_uses_semantic_tokens_responsive_layout_and_reduced_motion():
     assert "prefers-reduced-motion" in css
 
 
+def test_v2_screen_reader_only_labels_do_not_expand_mobile_document_width():
+    root = Path(panel_app.__file__).resolve().parent
+    css = (root / "static" / "panel-v2.css").read_text(encoding="utf-8")
+    rule = css.split(".sr-only {", 1)[1].split("}", 1)[0]
+
+    assert "position: absolute" in rule
+    assert "left: 0" in rule
+    assert "top: 0" in rule
+
+
 def test_v2_javascript_defines_hash_navigation_and_system_theme_behavior():
     root = Path(panel_app.__file__).resolve().parent
     source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
