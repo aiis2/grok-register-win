@@ -54,6 +54,7 @@ from flask import (
     session,
     url_for,
 )
+from panel.account_catalog import AccountCatalog, AccountQueryError
 
 # Project root = parent of panel/ (Windows / portable layout)
 _DEFAULT_ROOT = Path(__file__).resolve().parent.parent
@@ -675,6 +676,16 @@ def read_account_lines(path: Path) -> List[str]:
     except Exception:
         return []
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
+_account_catalog = AccountCatalog(
+    fingerprint=sso_fingerprint,
+    read_lines=read_account_lines,
+)
+
+
+def invalidate_account_catalog() -> None:
+    _account_catalog.invalidate()
 
 
 def collect_all_accounts() -> List[Tuple[str, str]]:
@@ -5103,6 +5114,41 @@ def api_accounts():
     )
 
 
+@app.get("/api/v2/accounts")
+def api_v2_accounts():
+    need = require_login()
+    if need:
+        return need
+    try:
+        page = int(request.args.get("page", "1"))
+        page_size = int(request.args.get("page_size", "25"))
+        with _cpa_lock:
+            completed = set(_cpa_done)
+        payload = _account_catalog.query(
+            list_account_files(),
+            completed,
+            page=page,
+            page_size=page_size,
+            q=request.args.get("q", ""),
+            source=request.args.get("source", "all"),
+            status=request.args.get("status", "all"),
+            sort=request.args.get("sort", "newest"),
+        )
+    except (AccountQueryError, TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except OSError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": f"账号目录暂不可用 ({type(exc).__name__})",
+                }
+            ),
+            500,
+        )
+    return jsonify({"ok": True, **payload})
+
+
 @app.get("/api/nodes")
 def api_nodes():
     need = require_login()
@@ -5157,6 +5203,7 @@ def api_accounts_delete():
 
     cpa_archived = 0
     if deleted:
+        invalidate_account_catalog()
         cpa_archived = archive_orphan_cpa(reason="account-delete").archived
 
     if not deleted and errors:
@@ -5257,6 +5304,7 @@ def api_import_credentials():
             raise
 
         _reset_cpa_workspace_state()
+        invalidate_account_catalog()
         switch_snapshot = None
         queued = 0
         for record in records:
@@ -5414,6 +5462,7 @@ def api_migrate_credentials():
             switch_config=switch_config,
         )
         load_cpa_index()
+        invalidate_account_catalog()
         public = credentials_config_public()
         public["migration"] = {
             "copied": result.copied,

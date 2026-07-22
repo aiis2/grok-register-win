@@ -382,8 +382,15 @@ def test_credential_migration_rejects_active_cpa_directory_override(
 
 def test_manual_migration_moves_all_legacy_credentials_and_switches_config(
     isolated_storage,
+    monkeypatch,
 ):
     app_root, config_path = isolated_storage
+    invalidations = []
+    monkeypatch.setattr(
+        panel_app,
+        "invalidate_account_catalog",
+        lambda: invalidations.append(True),
+    )
     (app_root / "accounts_legacy.txt").write_text(
         "legacy@example.com----pw----private-sso", encoding="utf-8"
     )
@@ -420,6 +427,7 @@ def test_manual_migration_moves_all_legacy_credentials_and_switches_config(
     serialized = json.dumps(payload)
     assert "private-sso" not in serialized
     assert "private-jwt" not in serialized
+    assert invalidations == [True]
 
 
 def test_credential_routes_are_registered():

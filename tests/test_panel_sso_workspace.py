@@ -84,6 +84,12 @@ def test_upload_batch_stages_archives_and_queues_without_echoing_sso(
         return True, "queued"
 
     monkeypatch.setattr(panel_app, "enqueue_cpa_convert", capture_enqueue)
+    invalidations = []
+    monkeypatch.setattr(
+        panel_app,
+        "invalidate_account_catalog",
+        lambda: invalidations.append(True),
+    )
     secret = "sso-super-secret"
     password = "password-super-secret"
 
@@ -136,6 +142,7 @@ def test_upload_batch_stages_archives_and_queues_without_echoing_sso(
     assert any(path.name == old_cpa.name for path in archive.rglob("*.json"))
     assert any(path.name == old_index.name for path in archive.rglob("*.json"))
     assert not list((app_root / "vault").glob(".staging-*"))
+    assert invalidations == [True]
 
 
 def test_upload_json_preserves_password_and_deduplicates_sso(
