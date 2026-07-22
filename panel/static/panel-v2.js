@@ -16,6 +16,9 @@
     LOG_LEVEL_KEY,
   ]);
   const LOG_MAX_LINES = 2000;
+  const LOG_VISIBLE_STEP = 300;
+  const LOG_RENDER_INTERVAL_MS = 100;
+  const LOG_SEARCH_DEBOUNCE_MS = 180;
   const DEFAULT_SECTION_HASH = '#overview';
   const THEMES = new Set(['system', 'light', 'dark']);
   const SECTIONS = new Set([
@@ -24,7 +27,6 @@
     'accounts',
     'mail',
     'credentials',
-    'logs',
   ]);
   const EMAIL_VALUE_FIELDS = [
     'cfworker_api_url',
@@ -157,6 +159,11 @@
       autoScroll: readPreference(LOG_AUTOSCROLL_KEY, 'true') !== 'false',
       level: readPreference(LOG_LEVEL_KEY, 'all'),
       query: '',
+      visibleLimit: LOG_VISIBLE_STEP,
+      renderTimer: null,
+      renderFrame: null,
+      renderPending: false,
+      searchTimer: null,
     },
   };
   const workerControlPending = new Set();
@@ -207,9 +214,11 @@
 
   function requestedSection() {
     const hash = window.location.hash.toLowerCase();
-    const fromHash = hash.startsWith('#') ? hash.slice(1) : hash;
-    if (SECTIONS.has(fromHash)) return fromHash;
+    const requested = hash.startsWith('#') ? hash.slice(1) : hash;
+    if (requested === 'logs') return 'register';
+    if (SECTIONS.has(requested)) return requested;
     const stored = readPreference(SECTION_KEY, DEFAULT_SECTION_HASH.slice(1));
+    if (stored === 'logs') return 'register';
     return SECTIONS.has(stored) ? stored : 'overview';
   }
 
@@ -231,10 +240,17 @@
       window.history.pushState(null, '', `#${next}`);
     }
     if (next === 'accounts') ensureAccountsLoaded();
-    if (next === 'logs') {
+    if (next === 'register') {
       renderLogControls();
-      renderLogs();
+      scheduleLogRender({ immediate: true });
       ensureLogStream();
+      if (window.location.hash.toLowerCase() === '#logs') {
+        window.requestAnimationFrame(() => {
+          document.getElementById('registration-log-console')?.scrollIntoView({
+            block: 'start',
+          });
+        });
+      }
     }
   }
 
@@ -1415,14 +1431,57 @@
     setText('logs-mode-detail', detail || (mode === 'connected' ? 'SSE 增量接收中' : ''));
   }
 
-  function renderLogs() {
+  function cancelScheduledLogRender() {
+    if (state.logs.renderTimer) {
+      window.clearTimeout(state.logs.renderTimer);
+      state.logs.renderTimer = null;
+    }
+    if (state.logs.renderFrame) {
+      window.cancelAnimationFrame(state.logs.renderFrame);
+      state.logs.renderFrame = null;
+    }
+  }
+
+  function scheduleLogRender({ immediate = false, renderOptions = {} } = {}) {
+    state.logs.renderPending = true;
+    if (state.section !== 'register') return;
+    if (immediate) {
+      cancelScheduledLogRender();
+      state.logs.renderPending = false;
+      renderLogs(renderOptions);
+      return;
+    }
+    if (state.logs.renderTimer || state.logs.renderFrame) return;
+    state.logs.renderTimer = window.setTimeout(() => {
+      state.logs.renderTimer = null;
+      state.logs.renderFrame = window.requestAnimationFrame(() => {
+        state.logs.renderFrame = null;
+        if (!state.logs.renderPending || state.section !== 'register') return;
+        state.logs.renderPending = false;
+        renderLogs();
+      });
+    }, LOG_RENDER_INTERVAL_MS);
+  }
+
+  function renderLogs({ preserveViewport = false, forceScroll = false } = {}) {
     const sourceLines = activeLogLines();
-    const visible = filteredLogLines();
+    const matching = filteredLogLines();
+    const renderCount = Math.min(state.logs.visibleLimit, matching.length);
+    const visible = matching.slice(-renderCount);
     const suffix = state.logs.paused ? ' · 显示已暂停' : '';
-    setText('logs-count', `${visible.length} / ${sourceLines.length} 条日志${suffix}`);
+    setText(
+      'logs-count',
+      `显示 ${visible.length} / 匹配 ${matching.length} / 保留 ${sourceLines.length} 条日志${suffix}`,
+    );
+    const loadOlder = document.getElementById('logs-load-older');
+    const showLatest = document.getElementById('logs-show-latest');
+    if (loadOlder) loadOlder.disabled = visible.length >= matching.length;
+    if (showLatest) showLatest.disabled = state.logs.visibleLimit <= LOG_VISIBLE_STEP;
     if (state.logs.paused) return;
     const output = document.getElementById('logs-output');
     if (!output) return;
+    const previousScrollHeight = preserveViewport ? output.scrollHeight : 0;
+    const previousScrollTop = preserveViewport ? output.scrollTop : 0;
     if (!visible.length) {
       const empty = createElement('div', 'logs-empty');
       const icon = createElement('span', '', '_');
@@ -1451,7 +1510,35 @@
       fragment.append(row);
     });
     output.replaceChildren(fragment);
-    if (state.logs.autoScroll) output.scrollTop = output.scrollHeight;
+    if (preserveViewport) {
+      output.scrollTop = previousScrollTop + Math.max(
+        0,
+        output.scrollHeight - previousScrollHeight,
+      );
+    } else if (forceScroll || state.logs.autoScroll) {
+      output.scrollTop = output.scrollHeight;
+    }
+  }
+
+  function loadOlderLogs() {
+    const matchingCount = filteredLogLines().length;
+    if (state.logs.visibleLimit >= matchingCount) return;
+    state.logs.visibleLimit = Math.min(
+      matchingCount,
+      state.logs.visibleLimit + LOG_VISIBLE_STEP,
+    );
+    scheduleLogRender({
+      immediate: true,
+      renderOptions: { preserveViewport: true },
+    });
+  }
+
+  function showLatestLogs() {
+    state.logs.visibleLimit = LOG_VISIBLE_STEP;
+    scheduleLogRender({
+      immediate: true,
+      renderOptions: { forceScroll: true },
+    });
   }
 
   function appendLogEvent(sequence, line) {
@@ -1470,7 +1557,7 @@
       const removed = state.logs.lines.shift();
       if (removed) state.logs.seenSequences.delete(removed.sequence);
     }
-    if (state.section === 'logs') renderLogs();
+    scheduleLogRender();
   }
 
   function handleLogEvent(event) {
@@ -1508,7 +1595,7 @@
         level: classifyLogLine(line),
       }));
       setInlineError('section-logs-error');
-      if (state.section === 'logs') renderLogs();
+      scheduleLogRender({ immediate: state.section === 'register' });
     } catch (error) {
       setLogConnectionState('error', 'SSE 与轮询均不可用');
       setInlineError('section-logs-error', safeErrorMessage(error));
@@ -1566,10 +1653,12 @@
   }
 
   function clearLocalLogs() {
+    cancelScheduledLogRender();
     state.logs.lines = [];
     state.logs.fallbackLines = [];
     state.logs.seenSequences.clear();
-    renderLogs();
+    state.logs.visibleLimit = LOG_VISIBLE_STEP;
+    scheduleLogRender({ immediate: true });
     showToast('已清空当前浏览器中的日志显示');
   }
 
@@ -1577,7 +1666,7 @@
     state.logs.paused = !state.logs.paused;
     savePreference(LOG_PAUSED_KEY, String(state.logs.paused));
     renderLogControls();
-    renderLogs();
+    scheduleLogRender({ immediate: true });
   }
 
   function registrationPayload() {
@@ -1701,19 +1790,33 @@
     document.getElementById('logs-autoscroll')?.addEventListener('change', (event) => {
       state.logs.autoScroll = Boolean(event.target.checked);
       savePreference(LOG_AUTOSCROLL_KEY, String(state.logs.autoScroll));
-      if (state.logs.autoScroll) renderLogs();
+      if (state.logs.autoScroll) {
+        scheduleLogRender({
+          immediate: true,
+          renderOptions: { forceScroll: true },
+        });
+      }
     });
     document.getElementById('logs-level')?.addEventListener('change', (event) => {
       state.logs.level = event.target.value || 'all';
+      state.logs.visibleLimit = LOG_VISIBLE_STEP;
       savePreference(LOG_LEVEL_KEY, state.logs.level);
-      renderLogs();
+      scheduleLogRender({ immediate: true });
     });
     document.getElementById('logs-search')?.addEventListener('input', (event) => {
-      state.logs.query = String(event.target.value || '').trim().toLowerCase();
-      renderLogs();
+      window.clearTimeout(state.logs.searchTimer);
+      const query = String(event.target.value || '').trim().toLowerCase();
+      state.logs.searchTimer = window.setTimeout(() => {
+        state.logs.searchTimer = null;
+        state.logs.query = query;
+        state.logs.visibleLimit = LOG_VISIBLE_STEP;
+        scheduleLogRender({ immediate: true });
+      }, LOG_SEARCH_DEBOUNCE_MS);
     });
     document.getElementById('logs-reconnect')?.addEventListener('click', reconnectLogStream);
     document.getElementById('logs-clear')?.addEventListener('click', clearLocalLogs);
+    document.getElementById('logs-load-older')?.addEventListener('click', loadOlderLogs);
+    document.getElementById('logs-show-latest')?.addEventListener('click', showLatestLogs);
     document.getElementById('accounts-search')?.addEventListener('input', (event) => {
       window.clearTimeout(state.accounts.searchTimer);
       state.accounts.searchTimer = window.setTimeout(() => {
@@ -1764,7 +1867,10 @@
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         loadJobStatus({ silent: true }).catch(() => {});
-        if (state.section === 'logs') ensureLogStream();
+        if (state.section === 'register') {
+          scheduleLogRender({ immediate: true });
+          ensureLogStream();
+        }
       }
     });
   }
@@ -1783,6 +1889,8 @@
 
   window.addEventListener('hashchange', () => showSection(requestedSection()));
   window.addEventListener('pagehide', () => {
+    cancelScheduledLogRender();
+    window.clearTimeout(state.logs.searchTimer);
     closeLogSource();
     stopLogFallback();
   });

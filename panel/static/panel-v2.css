@@ -1598,6 +1598,16 @@ a:hover {
   background: var(--text-muted);
 }
 
+.registration-log-section {
+  margin-top: 36px;
+  scroll-margin-top: 132px;
+}
+
+.registration-log-heading {
+  align-items: center;
+  margin-top: 0;
+}
+
 .log-connection[data-state="connected"] .connection-dot {
   background: var(--success);
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--success), transparent 84%);
@@ -1668,6 +1678,19 @@ a:hover {
   padding: 7px 14px;
   color: var(--text-muted);
   background: var(--surface-subtle);
+  font-size: 9px;
+}
+
+.logs-window-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.logs-window-actions .button {
+  min-height: 28px;
+  padding: 4px 9px;
   font-size: 9px;
 }
 
@@ -2022,6 +2045,12 @@ a:hover {
   .logs-meta {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .logs-window-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
   }
 
   .table-footer {

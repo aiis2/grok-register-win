@@ -114,9 +114,10 @@ def test_v2_shell_has_accessible_landmarks_sections_and_theme_controls(
     assert 'aria-label="主导航"' in html
     assert 'id="theme-toggle"' in html
     assert 'aria-label="界面主题"' in html
-    for section in ("overview", "register", "accounts", "mail", "credentials", "logs"):
+    for section in ("overview", "register", "accounts", "mail", "credentials"):
         assert f'id="section-{section}"' in html
         assert f'href="#{section}"' in html
+    assert 'id="registration-log-console"' in html
 
 
 def test_v2_theme_prepaint_runs_before_stylesheet_and_uses_strict_preference(

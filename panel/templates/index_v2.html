@@ -56,11 +56,10 @@
     <nav class="section-nav" aria-label="主导航">
       <div class="section-nav__inner">
         <a href="#overview" data-section-link="overview">概览</a>
-        <a href="#register" data-section-link="register">注册</a>
+        <a href="#register" data-section-link="register">注册与日志</a>
         <a href="#accounts" data-section-link="accounts">账号</a>
         <a href="#mail" data-section-link="mail">邮箱</a>
         <a href="#credentials" data-section-link="credentials">凭据</a>
-        <a href="#logs" data-section-link="logs">日志</a>
       </div>
     </nav>
   </header>
@@ -164,6 +163,35 @@
       </div>
       <div class="worker-grid" id="worker-grid" aria-live="polite">
         <div class="empty-state worker-empty"><span aria-hidden="true">□</span><strong>暂无 Worker</strong><p>任务启动后，每个并发槽会显示在这里。</p></div>
+      </div>
+
+      <div class="registration-log-section" id="registration-log-console">
+        <div class="subsection-heading registration-log-heading">
+          <div><p class="eyebrow">Live stream</p><h2>实时日志</h2><p>增量查看脱敏任务日志；暂停只冻结显示，不影响注册任务或事件接收。</p></div>
+          <div class="log-connection"><span class="connection-dot" aria-hidden="true"></span><strong id="logs-connection-status">尚未连接</strong><small id="logs-mode-detail">进入本页后建立 SSE</small></div>
+        </div>
+        <div class="inline-alert inline-alert--error" id="section-logs-error" role="alert" hidden></div>
+        <article class="surface-card log-console">
+          <div class="logs-toolbar">
+            <button class="button button--secondary" id="logs-pause" type="button" aria-pressed="false">暂停显示</button>
+            <label class="logs-check" for="logs-autoscroll"><input id="logs-autoscroll" type="checkbox" checked><span>自动滚动</span></label>
+            <label class="compact-field" for="logs-level"><span>级别</span><select id="logs-level"><option value="all">全部</option><option value="error">错误</option><option value="warning">警告</option><option value="success">成功</option><option value="system">系统</option></select></label>
+            <label class="search-field logs-search" for="logs-search"><span aria-hidden="true">⌕</span><input id="logs-search" type="search" placeholder="搜索当前日志" autocomplete="off"></label>
+            <button class="button button--ghost" id="logs-reconnect" type="button">重新连接</button>
+            <button class="button button--ghost" id="logs-clear" type="button">清空本地显示</button>
+          </div>
+          <div class="logs-meta">
+            <span id="logs-count">显示 0 / 匹配 0 / 保留 0 条日志</span>
+            <div class="logs-window-actions">
+              <span>浏览器最多保留 2000 条 · 不会写入本地存储</span>
+              <button class="button button--ghost" id="logs-load-older" type="button" disabled>加载更早</button>
+              <button class="button button--ghost" id="logs-show-latest" type="button" disabled>回到最新</button>
+            </div>
+          </div>
+          <div class="logs-output" id="logs-output" role="log" aria-live="polite" aria-relevant="additions text" aria-atomic="false" tabindex="0">
+            <div class="logs-empty" id="logs-empty"><span aria-hidden="true">_</span><strong>等待日志事件</strong><p>SSE 不可用时会自动回退到任务状态轮询。</p></div>
+          </div>
+        </article>
       </div>
     </section>
 
@@ -415,27 +443,6 @@
       </div>
     </section>
 
-    <section id="section-logs" class="panel-section" data-section="logs" hidden>
-      <div class="section-heading">
-        <div><p class="eyebrow">Live stream</p><h1>实时日志</h1><p>增量查看脱敏任务日志；暂停只冻结显示，不影响注册任务或事件接收。</p></div>
-        <div class="log-connection"><span class="connection-dot" aria-hidden="true"></span><strong id="logs-connection-status">尚未连接</strong><small id="logs-mode-detail">进入本页后建立 SSE</small></div>
-      </div>
-      <div class="inline-alert inline-alert--error" id="section-logs-error" role="alert" hidden></div>
-      <article class="surface-card log-console">
-        <div class="logs-toolbar">
-          <button class="button button--secondary" id="logs-pause" type="button" aria-pressed="false">暂停显示</button>
-          <label class="logs-check" for="logs-autoscroll"><input id="logs-autoscroll" type="checkbox" checked><span>自动滚动</span></label>
-          <label class="compact-field" for="logs-level"><span>级别</span><select id="logs-level"><option value="all">全部</option><option value="error">错误</option><option value="warning">警告</option><option value="success">成功</option><option value="system">系统</option></select></label>
-          <label class="search-field logs-search" for="logs-search"><span aria-hidden="true">⌕</span><input id="logs-search" type="search" placeholder="搜索当前日志" autocomplete="off"></label>
-          <button class="button button--ghost" id="logs-reconnect" type="button">重新连接</button>
-          <button class="button button--ghost" id="logs-clear" type="button">清空本地显示</button>
-        </div>
-        <div class="logs-meta"><span id="logs-count">0 条日志</span><span>浏览器最多保留 2000 条 · 不会写入本地存储</span></div>
-        <div class="logs-output" id="logs-output" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0">
-          <div class="logs-empty" id="logs-empty"><span aria-hidden="true">_</span><strong>等待日志事件</strong><p>SSE 不可用时会自动回退到任务状态轮询。</p></div>
-        </div>
-      </article>
-    </section>
   </main>
 
   <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
