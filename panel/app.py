@@ -55,6 +55,7 @@ from flask import (
     url_for,
 )
 from panel.account_catalog import AccountCatalog, AccountQueryError
+from panel.log_stream import SequencedLogBuffer, sanitize_log_message
 
 # Project root = parent of panel/ (Windows / portable layout)
 _DEFAULT_ROOT = Path(__file__).resolve().parent.parent
@@ -324,6 +325,10 @@ _job: Dict = {
     "outcomes": {},
 }
 _logs: Deque[str] = deque(maxlen=2000)
+_log_events = SequencedLogBuffer(maxlen=2000)
+MAX_LOG_STREAM_CLIENTS = 8
+LOG_STREAM_HEARTBEAT_SEC = 15.0
+_log_stream_slots = threading.BoundedSemaphore(MAX_LOG_STREAM_CLIENTS)
 _procs: Dict[int, subprocess.Popen] = {}
 _terminated_processes: Set[int] = set()
 
@@ -540,8 +545,9 @@ _cpa_workspace_generation = 0
 
 def log_line(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
+    line = f"[{ts}] {sanitize_log_message(msg)}"
     _logs.append(line)
+    _log_events.append(line)
     path = _job.get("log_path")
     if path:
         try:
@@ -549,6 +555,11 @@ def log_line(msg: str):
                 f.write(line + "\n")
         except Exception:
             pass
+
+
+def clear_logs() -> None:
+    _logs.clear()
+    _log_events.clear()
 
 
 # 日志过滤：只保留关键信息，屏蔽第三方库噪音
@@ -3334,7 +3345,7 @@ def start_job(
             _job["finished_at"] = None
             _job["last_error"] = ""
             _job["log_path"] = str(log_path)
-    _logs.clear()
+    clear_logs()
     log_line(
         f"任务创建：轮数={count} 并发={concurrency} proxy={PROXY_URL}"
         "（节点由本机 Clash 管理）"
@@ -5751,6 +5762,66 @@ def api_job_status():
             if worker.get("pid") is not None and worker.get("status") == "running"
         )
     return jsonify({"ok": True, "job": job, "logs": list(_logs), "cpa": cpa_stats()})
+
+
+def _requested_log_sequence() -> int:
+    raw = request.headers.get("Last-Event-ID")
+    if raw is None or not raw.strip():
+        raw = request.args.get("after", "0")
+    try:
+        sequence = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("after must be a non-negative integer") from exc
+    if sequence < 0:
+        raise ValueError("after must be a non-negative integer")
+    return sequence
+
+
+def _iter_log_stream(after: int):
+    cursor = after
+    try:
+        while True:
+            events = _log_events.after(cursor)
+            if not events:
+                events = _log_events.wait_after(
+                    cursor,
+                    timeout=LOG_STREAM_HEARTBEAT_SEC,
+                )
+            if not events:
+                yield f": heartbeat {cursor}\n\n"
+                continue
+            for event in events:
+                payload = json.dumps(
+                    {"sequence": event.sequence, "line": event.line},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                yield f"id: {event.sequence}\nevent: log\ndata: {payload}\n\n"
+                cursor = event.sequence
+    finally:
+        _log_stream_slots.release()
+
+
+@app.get("/api/logs/stream")
+def api_log_stream():
+    need = require_login()
+    if need:
+        return need
+    try:
+        after = _requested_log_sequence()
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if not _log_stream_slots.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "实时日志连接数已满，请稍后重试"}), 429
+    return Response(
+        _iter_log_stream(after),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/api/cpa/status")
