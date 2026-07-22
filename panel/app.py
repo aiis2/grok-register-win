@@ -105,7 +105,9 @@ for _p in (str(SSO2CPA_PATH), str(BASE_DIR / "lib"), str(Path(__file__).resolve(
         sys.path.insert(0, _p)
 from credential_store import (  # type: ignore
     CredentialLayout,
+    CredentialImportError,
     CredentialMigrationError,
+    activate_credential_import,
     ensure_layout,
     migrate_credentials,
     normalize_credentials_setting,
@@ -138,6 +140,7 @@ try:
         cpa_to_sub2_account,
         convert_one,
         normalize_sso,
+        parse_uploaded_records,
         safe_filename as cpa_safe_filename,
         sso_fingerprint,
     )
@@ -148,6 +151,7 @@ except Exception as _e:  # pragma: no cover
     convert_one = None  # type: ignore
     build_sub2_payload = None  # type: ignore
     cpa_to_sub2_account = None  # type: ignore
+    parse_uploaded_records = None  # type: ignore
     normalize_sso = lambda t: (t or "").strip()  # type: ignore
     cpa_safe_filename = lambda s: re.sub(r"[^\w.@+-]+", "_", s or "unknown")[:100]  # type: ignore
     sso_fingerprint = lambda s: hashlib.sha256((s or "").encode()).hexdigest()  # type: ignore
@@ -155,6 +159,7 @@ except Exception as _e:  # pragma: no cover
     _CPA_CORE_ERR = str(_e)
 
 HK_RE = re.compile(r"(香港|Hong\s*Kong|\bHK\b|🇭🇰)", re.I)
+MAX_CREDENTIAL_IMPORT_BYTES = 30 * 1024 * 1024
 
 app = Flask(__name__)
 app.secret_key = SECRET
@@ -295,6 +300,7 @@ _job_lock = threading.Lock()
 _browser_control_lock = threading.Lock()
 _activity_lock = threading.Lock()
 _credential_migration_lock = threading.Lock()
+_credential_import_lock = threading.RLock()
 _job: Dict = {
     "running": False,
     "stop": False,
@@ -522,11 +528,13 @@ _cpa_state: Dict = {
     "ok": 0,
     "fail": 0,
     "running": False,
+    "active": False,
     "last_error": "",
     "last_ok_email": "",
 }
 _cpa_done: Set[str] = set()  # sso fingerprints already converted
 _cpa_inflight: Set[str] = set()
+_cpa_workspace_generation = 0
 
 
 def log_line(msg: str):
@@ -961,6 +969,193 @@ def archive_orphan_cpa(
     )
 
 
+class CredentialImportBusy(RuntimeError):
+    pass
+
+
+def _safe_import_source_name(filename: str) -> str:
+    basename = Path(str(filename or "").replace("/", os.sep)).name
+    safe = re.sub(r"[^\w.@+-]+", "_", basename, flags=re.UNICODE).strip("._")
+    return (safe[:120] or "credentials.txt")
+
+
+def _parse_credential_import(raw: bytes, filename: str) -> List[dict]:
+    if parse_uploaded_records is None:
+        raise RuntimeError("凭据解析组件不可用")
+    parsed = parse_uploaded_records(raw, filename=filename)
+    records: List[dict] = []
+    seen: Set[str] = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        email = str(item.get("email") or "").strip()
+        password = str(item.get("password") or "")
+        sso = normalize_sso(str(item.get("sso") or ""))
+        if not sso:
+            continue
+        if any("\n" in value or "\r" in value for value in (email, password, sso)):
+            raise ValueError("导入记录包含非法换行")
+        if "----" in email or "----" in password:
+            raise ValueError("导入记录字段格式无效")
+        fingerprint = sso_fingerprint(sso)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        records.append({"email": email, "password": password, "sso": sso})
+    return records
+
+
+def _write_import_staging(
+    layout: CredentialLayout, records: List[dict], batch_id: str
+) -> Path:
+    safe_batch = re.sub(r"[^A-Za-z0-9]+", "", str(batch_id or ""))[:32]
+    if not safe_batch:
+        raise ValueError("导入批次标识无效")
+    root = ensure_layout(layout).root.resolve()
+    staging_dir = (root / f".staging-{safe_batch}").resolve()
+    if staging_dir.parent != root:
+        raise ValueError("导入暂存路径无效")
+    staging_dir.mkdir(parents=False, exist_ok=False)
+    staged = staging_dir / "accounts.txt"
+    content = "".join(
+        f"{item['email']}----{item['password']}----{item['sso']}\n"
+        for item in records
+    )
+    try:
+        staged.write_text(content, encoding="utf-8")
+        if staged.read_text(encoding="utf-8") != content:
+            raise OSError("staging verification failed")
+        return staged
+    except Exception:
+        try:
+            staged.unlink(missing_ok=True)
+            staging_dir.rmdir()
+        except Exception:
+            pass
+        raise
+
+
+def _cleanup_import_staging(
+    layout: CredentialLayout, staged_account_file: Optional[Path]
+) -> None:
+    if staged_account_file is None:
+        return
+    root = layout.root.resolve()
+    staged = Path(staged_account_file).resolve()
+    staging_dir = staged.parent
+    if staging_dir.parent != root or not staging_dir.name.startswith(".staging-"):
+        return
+    try:
+        staged.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        staging_dir.rmdir()
+    except Exception:
+        pass
+
+
+def _credential_import_archive_sources(
+    layout: CredentialLayout,
+) -> List[Tuple[str, Path]]:
+    groups: List[Tuple[str, Path, Tuple[str, ...]]] = []
+    for directory in _account_read_directories():
+        groups.append(("sso", directory, ("accounts_*.txt",)))
+    for directory in _cpa_read_directories():
+        groups.append(
+            ("cpa", directory, ("xai-*.json", "index.json", "failed.jsonl"))
+        )
+
+    sources: List[Tuple[str, Path]] = []
+    seen: Set[Path] = set()
+    for category, directory, patterns in groups:
+        if not directory.is_dir():
+            continue
+        for pattern in patterns:
+            for source in sorted(directory.glob(pattern), key=lambda path: path.name):
+                resolved = source.resolve()
+                if not source.is_file() or resolved in seen:
+                    continue
+                try:
+                    resolved.relative_to(layout.archive_dir.resolve())
+                except ValueError:
+                    pass
+                else:
+                    continue
+                seen.add(resolved)
+                sources.append((category, source))
+    return sources
+
+
+def _begin_cpa_workspace_switch() -> Tuple[int, List[dict]]:
+    global _cpa_workspace_generation
+    with _cpa_lock:
+        if bool(_cpa_state.get("active")):
+            raise CredentialImportBusy("CPA 转换正在执行，完成后才能导入")
+        previous_generation = _cpa_workspace_generation
+        _cpa_workspace_generation += 1
+
+    drained: List[dict] = []
+    while True:
+        try:
+            item = _cpa_q.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            if item is not None:
+                drained.append(item)
+        finally:
+            _cpa_q.task_done()
+
+    with _cpa_lock:
+        for item in drained:
+            _cpa_inflight.discard(
+                item.get("fp") or sso_fingerprint(item.get("sso") or "")
+            )
+        _cpa_state["pending"] = max(
+            0, int(_cpa_state.get("pending") or 0) - len(drained)
+        )
+        _cpa_state["running"] = bool(_cpa_state.get("active"))
+    return previous_generation, drained
+
+
+def _restore_cpa_workspace_switch(
+    previous_generation: int, drained: List[dict]
+) -> None:
+    global _cpa_workspace_generation
+    with _cpa_lock:
+        _cpa_workspace_generation = previous_generation
+        for item in drained:
+            fp = item.get("fp") or sso_fingerprint(item.get("sso") or "")
+            if fp:
+                _cpa_inflight.add(fp)
+            _cpa_q.put(item)
+        _cpa_state["pending"] = int(_cpa_state.get("pending") or 0) + len(
+            drained
+        )
+        _cpa_state["running"] = bool(
+            _cpa_state.get("active") or _cpa_state.get("pending")
+        )
+
+
+def _reset_cpa_workspace_state() -> None:
+    global _cpa_done
+    with _cpa_lock:
+        _cpa_done = set()
+        _cpa_inflight.clear()
+        _cpa_state.update(
+            {
+                "pending": 0,
+                "ok": 0,
+                "fail": 0,
+                "running": False,
+                "active": False,
+                "last_error": "",
+                "last_ok_email": "",
+            }
+        )
+
+
 def cpa_stats() -> dict:
     with _cpa_lock:
         st = dict(_cpa_state)
@@ -988,21 +1183,24 @@ def enqueue_cpa_convert(
     if not sso:
         return False, "empty sso"
     fp = sso_fingerprint(sso)
-    with _cpa_lock:
-        if not force and (fp in _cpa_done or fp in _cpa_inflight):
-            return False, "already converted or queued"
-        _cpa_inflight.add(fp)
-        _cpa_state["pending"] = int(_cpa_state.get("pending") or 0) + 1
-    _cpa_q.put(
-        {
-            "email": email or "",
-            "sso": sso,
-            "password": password or "",
-            "source": source or "",
-            "fp": fp,
-            "force": force,
-        }
-    )
+    with _credential_import_lock:
+        with _cpa_lock:
+            if not force and (fp in _cpa_done or fp in _cpa_inflight):
+                return False, "already converted or queued"
+            generation = _cpa_workspace_generation
+            _cpa_inflight.add(fp)
+            _cpa_state["pending"] = int(_cpa_state.get("pending") or 0) + 1
+        _cpa_q.put(
+            {
+                "email": email or "",
+                "sso": sso,
+                "password": password or "",
+                "source": source or "",
+                "fp": fp,
+                "force": force,
+                "workspace_generation": generation,
+            }
+        )
     return True, "queued"
 
 
@@ -1026,18 +1224,19 @@ def enqueue_new_accounts(before: Set[str]) -> int:
 
 def enqueue_missing_accounts(limit: int = 500) -> int:
     """Queue accounts that have SSO but no CPA file yet."""
-    n = 0
-    for acc in unique_accounts():
-        if n >= limit:
-            break
-        ok, _ = enqueue_cpa_convert(
-            email=acc.get("email") or "",
-            sso=acc.get("sso") or "",
-            password=acc.get("password") or "",
-            source=acc.get("source") or "",
-        )
-        if ok:
-            n += 1
+    with _credential_import_lock:
+        n = 0
+        for acc in unique_accounts():
+            if n >= limit:
+                break
+            ok, _ = enqueue_cpa_convert(
+                email=acc.get("email") or "",
+                sso=acc.get("sso") or "",
+                password=acc.get("password") or "",
+                source=acc.get("source") or "",
+            )
+            if ok:
+                n += 1
     return n
 
 
@@ -1055,9 +1254,23 @@ def _cpa_worker_loop():
         email = item.get("email") or ""
         sso = item.get("sso") or ""
         fp = item.get("fp") or sso_fingerprint(sso)
+        try:
+            item_generation = int(item.get("workspace_generation") or 0)
+        except (TypeError, ValueError):
+            item_generation = 0
         with _cpa_lock:
-            _cpa_state["running"] = True
-            _cpa_state["pending"] = max(0, int(_cpa_state.get("pending") or 0) - 1)
+            if item_generation != _cpa_workspace_generation:
+                stale_workspace = True
+            else:
+                stale_workspace = False
+                _cpa_state["active"] = True
+                _cpa_state["running"] = True
+                _cpa_state["pending"] = max(
+                    0, int(_cpa_state.get("pending") or 0) - 1
+                )
+        if stale_workspace:
+            _cpa_q.task_done()
+            continue
         try:
             if convert_one is None:
                 raise RuntimeError(f"core missing: {_CPA_CORE_ERR}")
@@ -1124,6 +1337,7 @@ def _cpa_worker_loop():
             log_line(f"[CPA] FAIL {email or fp[:12]}: {err}")
         finally:
             with _cpa_lock:
+                _cpa_state["active"] = False
                 _cpa_state["running"] = not _cpa_q.empty()
             if CPA_DELAY > 0:
                 time.sleep(CPA_DELAY)
@@ -4969,6 +5183,148 @@ def _requested_credentials_layout(data: dict) -> Tuple[str, CredentialLayout]:
     return setting, CredentialLayout.from_config(
         BASE_DIR, {"credentials_dir": setting}
     )
+
+
+@app.post("/api/credentials/import")
+def api_import_credentials():
+    need = require_login()
+    if need:
+        return need
+    if not _credential_import_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "已有凭据导入正在进行"}), 409
+
+    layout: Optional[CredentialLayout] = None
+    staged: Optional[Path] = None
+    activity_acquired = False
+    migration_acquired = False
+    switch_snapshot: Optional[Tuple[int, List[dict]]] = None
+    try:
+        uploaded = request.files.get("file")
+        if uploaded is None:
+            raise ValueError("请选择 TXT 或 JSON 凭据文件")
+        source_name = _safe_import_source_name(uploaded.filename or "")
+        if Path(source_name).suffix.lower() not in {".txt", ".json"}:
+            raise ValueError("仅支持 TXT 或 JSON 凭据文件")
+        raw = uploaded.stream.read(MAX_CREDENTIAL_IMPORT_BYTES + 1)
+        if len(raw) > MAX_CREDENTIAL_IMPORT_BYTES:
+            return (
+                jsonify({"ok": False, "error": "凭据文件不能超过 30 MiB"}),
+                413,
+            )
+        records = _parse_credential_import(raw, source_name)
+        if not records:
+            raise ValueError("文件中没有可导入的 SSO 凭据")
+
+        batch_id = uuid.uuid4().hex
+        layout = current_credential_layout()
+        staged = _write_import_staging(layout, records, batch_id)
+
+        if not _activity_lock.acquire(blocking=False):
+            raise CredentialImportBusy("注册或邮箱活动正在切换，请稍后重试")
+        activity_acquired = True
+        if registration_is_running():
+            raise CredentialImportBusy("注册任务运行中，不能导入凭据")
+        if email_receive_test_is_running():
+            raise CredentialImportBusy("邮箱收件测试运行中，不能导入凭据")
+        if not _credential_migration_lock.acquire(blocking=False):
+            raise CredentialImportBusy("凭据迁移正在进行")
+        migration_acquired = True
+        if str(os.environ.get(CPA_DIR_ENV) or "").strip():
+            raise CredentialImportBusy(
+                "检测到 CPA_DIR 环境覆盖，请先取消后再导入"
+            )
+        if current_credential_layout().root != layout.root:
+            raise CredentialImportBusy("凭据目录已变化，请重新选择文件导入")
+
+        switch_snapshot = _begin_cpa_workspace_switch()
+        previous_generation, drained_items = switch_snapshot
+        live_name = (
+            f"accounts_import_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            f"_{batch_id[:8]}.txt"
+        )
+        live_file = layout.sso_dir / live_name
+        try:
+            activation = activate_credential_import(
+                layout,
+                staged,
+                live_file,
+                _credential_import_archive_sources(layout),
+                batch_id=batch_id,
+            )
+        except Exception:
+            _restore_cpa_workspace_switch(previous_generation, drained_items)
+            switch_snapshot = None
+            raise
+
+        _reset_cpa_workspace_state()
+        switch_snapshot = None
+        queued = 0
+        for record in records:
+            try:
+                ok, _reason = enqueue_cpa_convert(
+                    email=record["email"],
+                    sso=record["sso"],
+                    password=record["password"],
+                    source=source_name,
+                    force=True,
+                )
+            except Exception:
+                ok = False
+            if ok:
+                queued += 1
+
+        _cleanup_import_staging(layout, staged)
+        staged = None
+        log_line(
+            f"[*] 凭据批次已导入: {batch_id[:8]} · "
+            f"解析 {len(records)} · 入队 {queued} · 归档 {activation.archived}"
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "batch_id": batch_id,
+                "source_name": source_name,
+                "parsed": len(records),
+                "queued": queued,
+                "skipped": len(records) - queued,
+                "archived": activation.archived,
+                "drained": len(drained_items),
+            }
+        )
+    except CredentialImportBusy as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except CredentialImportError:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "凭据批次激活失败，原工作区已恢复",
+                }
+            ),
+            500,
+        )
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": f"凭据导入失败 ({type(exc).__name__})",
+                }
+            ),
+            500,
+        )
+    finally:
+        if switch_snapshot is not None:
+            _restore_cpa_workspace_switch(*switch_snapshot)
+        if migration_acquired:
+            _credential_migration_lock.release()
+        if activity_acquired:
+            _activity_lock.release()
+        if layout is not None:
+            _cleanup_import_staging(layout, staged)
+        _credential_import_lock.release()
 
 
 @app.get("/api/config/credentials")

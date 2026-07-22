@@ -218,7 +218,7 @@ def parse_uploaded_records(raw: bytes, filename: str = "") -> List[Dict[str, str
                 if isinstance(item, str):
                     tok = normalize_sso(item)
                     if tok:
-                        records.append({"email": "", "sso": tok})
+                        records.append({"email": "", "password": "", "sso": tok})
                 elif isinstance(item, dict):
                     tok = normalize_sso(
                         item.get("token") or item.get("sso") or item.get("raw") or ""
@@ -228,13 +228,20 @@ def parse_uploaded_records(raw: bytes, filename: str = "") -> List[Dict[str, str
                     email = str(
                         item.get("email") or item.get("note") or item.get("mail") or ""
                     ).strip()
-                    records.append({"email": email, "sso": tok})
+                    records.append(
+                        {
+                            "email": email,
+                            "password": str(item.get("password") or ""),
+                            "sso": tok,
+                        }
+                    )
         if not pool_like and (data.get("sso") or data.get("token")):
             tok = normalize_sso(data.get("sso") or data.get("token") or "")
             if tok:
                 records.append(
                     {
                         "email": str(data.get("email") or "").strip(),
+                        "password": str(data.get("password") or ""),
                         "sso": tok,
                     }
                 )
@@ -247,6 +254,7 @@ def parse_uploaded_records(raw: bytes, filename: str = "") -> List[Dict[str, str
                     records.append(
                         {
                             "email": str(item.get("email") or "").strip(),
+                            "password": str(item.get("password") or ""),
                             "sso": tok,
                         }
                     )
@@ -255,30 +263,38 @@ def parse_uploaded_records(raw: bytes, filename: str = "") -> List[Dict[str, str
             if isinstance(item, str):
                 tok = normalize_sso(item)
                 if tok:
-                    records.append({"email": "", "sso": tok})
+                    records.append({"email": "", "password": "", "sso": tok})
             elif isinstance(item, dict):
                 tok = normalize_sso(item.get("sso") or item.get("token") or "")
                 if tok:
                     records.append(
                         {
                             "email": str(item.get("email") or "").strip(),
+                            "password": str(item.get("password") or ""),
                             "sso": tok,
                         }
                     )
 
-    if not records:
+    if data is None and not records:
         for line in text.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             email = ""
+            password = ""
             if "----" in line:
                 parts = line.split("----")
                 email = parts[0].strip()
-                line = parts[-1].strip()
+                if len(parts) >= 3:
+                    password = parts[1].strip()
+                    line = "----".join(parts[2:]).strip()
+                else:
+                    line = parts[-1].strip()
             tok = normalize_sso(line)
             if tok:
-                records.append({"email": email, "sso": tok})
+                records.append(
+                    {"email": email, "password": password, "sso": tok}
+                )
 
     seen = set()
     out = []

@@ -7,7 +7,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 
 
 DEFAULT_CREDENTIALS_DIR = Path("data") / "credentials"
@@ -68,6 +68,17 @@ class CredentialMigrationError(RuntimeError):
     pass
 
 
+class CredentialImportError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class CredentialImportResult:
+    archived: int
+    archive_dir: Path
+    account_file: Path
+
+
 def normalize_credentials_setting(app_root: Path, value: str) -> str:
     layout = CredentialLayout.from_config(
         Path(app_root), {"credentials_dir": str(value or "").strip()}
@@ -91,6 +102,116 @@ def ensure_layout(layout: CredentialLayout) -> CredentialLayout:
             raise ValueError(f"凭据路径不是目录: {path}")
         path.mkdir(parents=True, exist_ok=True)
     return layout
+
+
+def _import_archive_destination(directory: Path, name: str) -> Path:
+    destination = directory / Path(name).name
+    if not destination.exists():
+        return destination
+    for sequence in range(2, 10000):
+        candidate = directory / f"{destination.stem}-{sequence}{destination.suffix}"
+        if not candidate.exists():
+            return candidate
+    raise CredentialImportError("无法为归档文件生成目标名称")
+
+
+def activate_credential_import(
+    layout: CredentialLayout,
+    staged_account_file: Path,
+    live_account_file: Path,
+    archive_sources: Iterable[tuple[str, Path]],
+    *,
+    batch_id: str,
+    timestamp: str | None = None,
+    move_file: Callable[[str, str], object] = shutil.move,
+    replace_file: Callable[[Path, Path], object] = os.replace,
+) -> CredentialImportResult:
+    """Archive the current SSO/CPA workspace and atomically activate one batch.
+
+    The caller must hold the application activity, migration, and CPA workspace
+    locks.  Only exact files supplied by the caller are moved; no directory is
+    recursively removed.
+    """
+
+    ensured = ensure_layout(layout)
+    root = ensured.root.resolve()
+    staged = Path(staged_account_file).resolve()
+    live = Path(live_account_file).resolve()
+    safe_batch = "".join(ch for ch in str(batch_id or "") if ch.isalnum())[:32]
+    if not safe_batch:
+        raise CredentialImportError("导入批次标识无效")
+
+    try:
+        staged.relative_to(root)
+        live.relative_to(ensured.sso_dir.resolve())
+    except ValueError as exc:
+        raise CredentialImportError("导入路径超出凭据目录") from exc
+    if staged.parent.parent != root or not staged.parent.name.startswith(".staging-"):
+        raise CredentialImportError("导入暂存路径无效")
+    if live.parent != ensured.sso_dir.resolve():
+        raise CredentialImportError("账号激活路径无效")
+    if not staged.is_file():
+        raise CredentialImportError("导入暂存文件不存在")
+
+    batch_name = (
+        f"{timestamp or datetime.now().strftime('%Y%m%d_%H%M%S')}_import_{safe_batch[:8]}"
+    )
+    archive_dir = (ensured.archive_dir / batch_name).resolve()
+    try:
+        archive_dir.relative_to(ensured.archive_dir.resolve())
+    except ValueError as exc:  # pragma: no cover - defensive path invariant
+        raise CredentialImportError("导入归档路径无效") from exc
+
+    journal: list[tuple[Path, Path]] = []
+    activated = False
+    try:
+        seen: set[Path] = set()
+        for raw_category, raw_source in archive_sources:
+            category = str(raw_category or "").strip().lower()
+            if category not in {"sso", "cpa"}:
+                raise CredentialImportError("导入归档分类无效")
+            source = Path(raw_source).resolve()
+            if source in seen or not source.is_file():
+                continue
+            if source == staged or source == live:
+                raise CredentialImportError("导入文件不能同时作为归档来源")
+            seen.add(source)
+            destination_dir = archive_dir / category
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            destination = _import_archive_destination(
+                destination_dir, source.name
+            )
+            move_file(str(source), str(destination))
+            journal.append((source, destination))
+
+        live.parent.mkdir(parents=True, exist_ok=True)
+        replace_file(staged, live)
+        activated = True
+        if not live.is_file():
+            raise CredentialImportError("导入账号文件激活失败")
+    except Exception as exc:
+        if activated and live.exists():
+            try:
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                move_file(str(live), str(staged))
+            except Exception:
+                pass
+        for source, destination in reversed(journal):
+            try:
+                if destination.exists() and not source.exists():
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    move_file(str(destination), str(source))
+            except Exception:
+                pass
+        if isinstance(exc, CredentialImportError):
+            raise
+        raise CredentialImportError("导入批次激活失败") from exc
+
+    return CredentialImportResult(
+        archived=len(journal),
+        archive_dir=archive_dir,
+        account_file=live,
+    )
 
 
 def create_worker_output_paths(
