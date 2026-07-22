@@ -414,8 +414,25 @@
     </section>
 
     <section id="section-logs" class="panel-section" data-section="logs" hidden>
-      <div class="section-heading"><div><p class="eyebrow">Live stream</p><h1>实时日志</h1><p>增量查看任务日志，支持暂停、过滤和断线续传。</p></div></div>
-      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">_</span><strong>日志流尚未连接</strong><p>进入该区域后会建立本地 SSE 连接。</p></div></div>
+      <div class="section-heading">
+        <div><p class="eyebrow">Live stream</p><h1>实时日志</h1><p>增量查看脱敏任务日志；暂停只冻结显示，不影响注册任务或事件接收。</p></div>
+        <div class="log-connection"><span class="connection-dot" aria-hidden="true"></span><strong id="logs-connection-status">尚未连接</strong><small id="logs-mode-detail">进入本页后建立 SSE</small></div>
+      </div>
+      <div class="inline-alert inline-alert--error" id="section-logs-error" role="alert" hidden></div>
+      <article class="surface-card log-console">
+        <div class="logs-toolbar">
+          <button class="button button--secondary" id="logs-pause" type="button" aria-pressed="false">暂停显示</button>
+          <label class="logs-check" for="logs-autoscroll"><input id="logs-autoscroll" type="checkbox" checked><span>自动滚动</span></label>
+          <label class="compact-field" for="logs-level"><span>级别</span><select id="logs-level"><option value="all">全部</option><option value="error">错误</option><option value="warning">警告</option><option value="success">成功</option><option value="system">系统</option></select></label>
+          <label class="search-field logs-search" for="logs-search"><span aria-hidden="true">⌕</span><input id="logs-search" type="search" placeholder="搜索当前日志" autocomplete="off"></label>
+          <button class="button button--ghost" id="logs-reconnect" type="button">重新连接</button>
+          <button class="button button--ghost" id="logs-clear" type="button">清空本地显示</button>
+        </div>
+        <div class="logs-meta"><span id="logs-count">0 条日志</span><span>浏览器最多保留 2000 条 · 不会写入本地存储</span></div>
+        <div class="logs-output" id="logs-output" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0">
+          <div class="logs-empty" id="logs-empty"><span aria-hidden="true">_</span><strong>等待日志事件</strong><p>SSE 不可用时会自动回退到任务状态轮询。</p></div>
+        </div>
+      </article>
     </section>
   </main>
 

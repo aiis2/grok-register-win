@@ -455,3 +455,80 @@ def test_v2_credentials_javascript_reuses_existing_safe_contracts():
     assert "formatBytes" in source
     assert "confirmAction" in source
     assert "setBusy('credentials'" in source
+
+
+def test_v2_logs_exposes_live_controls_and_accessible_output(isolated_v2_panel):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+
+    for element_id in (
+        "logs-connection-status",
+        "logs-pause",
+        "logs-autoscroll",
+        "logs-level",
+        "logs-search",
+        "logs-reconnect",
+        "logs-clear",
+        "logs-output",
+        "logs-count",
+    ):
+        assert f'id="{element_id}"' in html
+    assert 'role="log"' in html
+    assert 'aria-live="polite"' in html
+
+
+def test_v2_logs_uses_resumable_sse_deduplication_and_polling_fallback():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    assert "new EventSource" in source
+    assert "/api/logs/stream?after=" in source
+    assert "lastSequence" in source
+    assert "seenSequences" in source
+    assert "event.lastEventId" in source
+    assert "addEventListener('log'" in source
+    assert "startLogFallback" in source
+    assert "/api/job/status" in source
+    assert "fallbackTimer" in source
+
+
+def test_v2_logs_pause_filter_autoscroll_and_clear_are_display_only():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    for marker in (
+        "logs.paused",
+        "logs.autoScroll",
+        "logs.level",
+        "logs.query",
+        "renderLogs",
+        "clearLocalLogs",
+    ):
+        assert marker in source
+    clear_logic = source.split("function clearLocalLogs", 1)[1].split(
+        "function", 1
+    )[0]
+    assert "requestJson" not in clear_logic
+    assert "fetch" not in clear_logic
+
+
+def test_v2_local_storage_is_restricted_to_display_preferences():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    assert "DISPLAY_PREFERENCE_KEYS" in source
+    saver = source.split("function savePreference", 1)[1].split(
+        "function", 1
+    )[0]
+    assert "DISPLAY_PREFERENCE_KEYS.has(key)" in saver
+    preference_block = source.split("const DISPLAY_PREFERENCE_KEYS", 1)[1].split(
+        ");", 1
+    )[0].casefold()
+    for forbidden in (
+        "password",
+        "token",
+        "secret",
+        "credential",
+        "smtp",
+        "freemail",
+    ):
+        assert forbidden not in preference_block

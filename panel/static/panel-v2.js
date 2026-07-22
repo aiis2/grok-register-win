@@ -4,6 +4,18 @@
   const THEME_KEY = 'panel-v2-theme';
   const SECTION_KEY = 'panel-v2-section';
   const ACCOUNT_PAGE_SIZE_KEY = 'panel-v2-account-page-size';
+  const LOG_PAUSED_KEY = 'panel-v2-log-paused';
+  const LOG_AUTOSCROLL_KEY = 'panel-v2-log-autoscroll';
+  const LOG_LEVEL_KEY = 'panel-v2-log-level';
+  const DISPLAY_PREFERENCE_KEYS = new Set([
+    THEME_KEY,
+    SECTION_KEY,
+    ACCOUNT_PAGE_SIZE_KEY,
+    LOG_PAUSED_KEY,
+    LOG_AUTOSCROLL_KEY,
+    LOG_LEVEL_KEY,
+  ]);
+  const LOG_MAX_LINES = 2000;
   const DEFAULT_SECTION_HASH = '#overview';
   const THEMES = new Set(['system', 'light', 'dark']);
   const SECTIONS = new Set([
@@ -115,6 +127,7 @@
     pollTimer: null,
     confirmResolver: null,
     confirmFocus: null,
+    section: 'overview',
     accounts: {
       loaded: false,
       loading: false,
@@ -130,6 +143,20 @@
       controller: null,
       requestGeneration: 0,
       searchTimer: null,
+    },
+    logs: {
+      lines: [],
+      fallbackLines: [],
+      lastSequence: 0,
+      seenSequences: new Set(),
+      source: null,
+      fallbackTimer: null,
+      failures: 0,
+      mode: 'idle',
+      paused: readPreference(LOG_PAUSED_KEY, 'false') === 'true',
+      autoScroll: readPreference(LOG_AUTOSCROLL_KEY, 'true') !== 'false',
+      level: readPreference(LOG_LEVEL_KEY, 'all'),
+      query: '',
     },
   };
   const workerControlPending = new Set();
@@ -158,6 +185,7 @@
   }
 
   function savePreference(key, value) {
+    if (!DISPLAY_PREFERENCE_KEYS.has(key)) return;
     try {
       window.localStorage.setItem(key, value);
     } catch (_) {}
@@ -187,6 +215,7 @@
 
   function showSection(name, updateHash = false) {
     const next = SECTIONS.has(name) ? name : 'overview';
+    state.section = next;
     document.querySelectorAll('[data-section]').forEach((section) => {
       section.hidden = section.dataset.section !== next;
     });
@@ -202,6 +231,11 @@
       window.history.pushState(null, '', `#${next}`);
     }
     if (next === 'accounts') ensureAccountsLoaded();
+    if (next === 'logs') {
+      renderLogControls();
+      renderLogs();
+      ensureLogStream();
+    }
   }
 
   function setText(id, value) {
@@ -1293,6 +1327,229 @@
     }
   }
 
+  function classifyLogLine(line) {
+    const value = String(line || '').toLowerCase();
+    if (value.includes('[!]') || value.includes('traceback') || value.includes('exception')
+      || value.includes('error') || value.includes('failed') || value.includes('失败')) {
+      return 'error';
+    }
+    if (value.includes('[warn') || value.includes('warning') || value.includes('警告')) {
+      return 'warning';
+    }
+    if (value.includes('[+]') || value.includes('success') || value.includes('succeeded')
+      || value.includes('成功')) {
+      return 'success';
+    }
+    return 'system';
+  }
+
+  function activeLogLines() {
+    return state.logs.mode === 'fallback' ? state.logs.fallbackLines : state.logs.lines;
+  }
+
+  function filteredLogLines() {
+    const query = state.logs.query.toLowerCase();
+    return activeLogLines().filter((entry) => {
+      if (state.logs.level !== 'all' && entry.level !== state.logs.level) return false;
+      return !query || entry.line.toLowerCase().includes(query);
+    });
+  }
+
+  function renderLogControls() {
+    const allowedLevels = new Set(['all', 'error', 'warning', 'success', 'system']);
+    if (!allowedLevels.has(state.logs.level)) state.logs.level = 'all';
+    const pause = document.getElementById('logs-pause');
+    const autoScroll = document.getElementById('logs-autoscroll');
+    const level = document.getElementById('logs-level');
+    if (pause) {
+      pause.textContent = state.logs.paused ? '继续显示' : '暂停显示';
+      pause.setAttribute('aria-pressed', String(state.logs.paused));
+    }
+    if (autoScroll) autoScroll.checked = state.logs.autoScroll;
+    if (level) level.value = state.logs.level;
+  }
+
+  function setLogConnectionState(mode, detail = '') {
+    state.logs.mode = mode;
+    const labels = {
+      idle: '尚未连接',
+      connecting: '正在连接',
+      connected: '实时连接',
+      fallback: '轮询回退',
+      error: '连接失败',
+    };
+    const status = document.getElementById('logs-connection-status');
+    const shell = status?.closest('.log-connection');
+    if (shell) shell.dataset.state = mode;
+    setText('logs-connection-status', labels[mode] || mode);
+    setText('logs-mode-detail', detail || (mode === 'connected' ? 'SSE 增量接收中' : ''));
+  }
+
+  function renderLogs() {
+    const sourceLines = activeLogLines();
+    const visible = filteredLogLines();
+    const suffix = state.logs.paused ? ' · 显示已暂停' : '';
+    setText('logs-count', `${visible.length} / ${sourceLines.length} 条日志${suffix}`);
+    if (state.logs.paused) return;
+    const output = document.getElementById('logs-output');
+    if (!output) return;
+    if (!visible.length) {
+      const empty = createElement('div', 'logs-empty');
+      const icon = createElement('span', '', '_');
+      icon.setAttribute('aria-hidden', 'true');
+      empty.append(
+        icon,
+        createElement('strong', '', sourceLines.length ? '没有符合筛选条件的日志' : '等待日志事件'),
+        createElement('p', '', sourceLines.length
+          ? '调整级别或搜索关键词后重试。'
+          : 'SSE 不可用时会自动回退到任务状态轮询。'),
+      );
+      output.replaceChildren(empty);
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    visible.forEach((entry) => {
+      const row = createElement('div', 'log-line');
+      row.dataset.level = entry.level;
+      const sequence = createElement(
+        'span',
+        'log-line__sequence',
+        entry.sequence ? `#${entry.sequence}` : '·',
+      );
+      sequence.setAttribute('aria-hidden', 'true');
+      row.append(sequence, createElement('span', 'log-line__content', entry.line));
+      fragment.append(row);
+    });
+    output.replaceChildren(fragment);
+    if (state.logs.autoScroll) output.scrollTop = output.scrollHeight;
+  }
+
+  function appendLogEvent(sequence, line) {
+    const numericSequence = Number(sequence || 0);
+    const textLine = String(line || '');
+    if (!Number.isSafeInteger(numericSequence) || numericSequence <= 0 || !textLine) return;
+    if (state.logs.seenSequences.has(numericSequence)) return;
+    state.logs.seenSequences.add(numericSequence);
+    state.logs.lastSequence = Math.max(state.logs.lastSequence, numericSequence);
+    state.logs.lines.push({
+      sequence: numericSequence,
+      line: textLine,
+      level: classifyLogLine(textLine),
+    });
+    while (state.logs.lines.length > LOG_MAX_LINES) {
+      const removed = state.logs.lines.shift();
+      if (removed) state.logs.seenSequences.delete(removed.sequence);
+    }
+    if (state.section === 'logs') renderLogs();
+  }
+
+  function handleLogEvent(event) {
+    try {
+      const payload = JSON.parse(event.data || '{}');
+      const sequence = Number(payload.sequence || event.lastEventId || 0);
+      appendLogEvent(sequence, payload.line);
+    } catch (_) {
+      state.logs.failures += 1;
+    }
+  }
+
+  function closeLogSource() {
+    if (state.logs.source) {
+      state.logs.source.close();
+      state.logs.source = null;
+    }
+  }
+
+  function stopLogFallback() {
+    if (state.logs.fallbackTimer) {
+      window.clearInterval(state.logs.fallbackTimer);
+      state.logs.fallbackTimer = null;
+    }
+  }
+
+  async function pollLogFallback() {
+    try {
+      const payload = await requestJson('/api/job/status');
+      renderJob(payload);
+      const lines = Array.isArray(payload.logs) ? payload.logs.slice(-LOG_MAX_LINES) : [];
+      state.logs.fallbackLines = lines.map((line) => ({
+        sequence: null,
+        line: String(line || ''),
+        level: classifyLogLine(line),
+      }));
+      setInlineError('section-logs-error');
+      if (state.section === 'logs') renderLogs();
+    } catch (error) {
+      setLogConnectionState('error', 'SSE 与轮询均不可用');
+      setInlineError('section-logs-error', safeErrorMessage(error));
+    }
+  }
+
+  function startLogFallback(reason = '实时连接暂不可用') {
+    closeLogSource();
+    stopLogFallback();
+    setLogConnectionState('fallback', `${reason}；每 2 秒刷新`);
+    pollLogFallback().catch(() => {});
+    state.logs.fallbackTimer = window.setInterval(() => {
+      pollLogFallback().catch(() => {});
+    }, 2000);
+  }
+
+  function connectLogStream() {
+    closeLogSource();
+    stopLogFallback();
+    state.logs.failures = 0;
+    state.logs.fallbackLines = [];
+    setInlineError('section-logs-error');
+    if (typeof window.EventSource !== 'function') {
+      startLogFallback('当前浏览器不支持 SSE');
+      return;
+    }
+    setLogConnectionState('connecting', `从序号 ${state.logs.lastSequence} 继续`);
+    const stream = new EventSource(`/api/logs/stream?after=${state.logs.lastSequence}`);
+    state.logs.source = stream;
+    stream.onopen = () => {
+      if (state.logs.source !== stream) return;
+      state.logs.failures = 0;
+      setLogConnectionState('connected', 'SSE 增量接收中');
+      setInlineError('section-logs-error');
+    };
+    stream.addEventListener('log', (event) => {
+      if (state.logs.source !== stream) return;
+      handleLogEvent(event);
+    });
+    stream.onerror = () => {
+      if (state.logs.source !== stream) return;
+      state.logs.failures += 1;
+      setLogConnectionState('connecting', `连接重试 ${state.logs.failures}/3`);
+      if (state.logs.failures >= 3) startLogFallback('SSE 连续连接失败');
+    };
+  }
+
+  function ensureLogStream() {
+    if (state.logs.source || state.logs.fallbackTimer) return;
+    connectLogStream();
+  }
+
+  function reconnectLogStream() {
+    connectLogStream();
+  }
+
+  function clearLocalLogs() {
+    state.logs.lines = [];
+    state.logs.fallbackLines = [];
+    state.logs.seenSequences.clear();
+    renderLogs();
+    showToast('已清空当前浏览器中的日志显示');
+  }
+
+  function toggleLogPause() {
+    state.logs.paused = !state.logs.paused;
+    savePreference(LOG_PAUSED_KEY, String(state.logs.paused));
+    renderLogControls();
+    renderLogs();
+  }
+
   function registrationPayload() {
     return {
       count: Number(document.getElementById('register-count')?.value || 1),
@@ -1409,6 +1666,23 @@
     document.getElementById('credentials-save')?.addEventListener('click', saveCredentialDirectory);
     document.getElementById('credentials-migrate')?.addEventListener('click', migrateCredentialDirectory);
     document.getElementById('cpa-backfill')?.addEventListener('click', backfillCpa);
+    document.getElementById('logs-pause')?.addEventListener('click', toggleLogPause);
+    document.getElementById('logs-autoscroll')?.addEventListener('change', (event) => {
+      state.logs.autoScroll = Boolean(event.target.checked);
+      savePreference(LOG_AUTOSCROLL_KEY, String(state.logs.autoScroll));
+      if (state.logs.autoScroll) renderLogs();
+    });
+    document.getElementById('logs-level')?.addEventListener('change', (event) => {
+      state.logs.level = event.target.value || 'all';
+      savePreference(LOG_LEVEL_KEY, state.logs.level);
+      renderLogs();
+    });
+    document.getElementById('logs-search')?.addEventListener('input', (event) => {
+      state.logs.query = String(event.target.value || '').trim().toLowerCase();
+      renderLogs();
+    });
+    document.getElementById('logs-reconnect')?.addEventListener('click', reconnectLogStream);
+    document.getElementById('logs-clear')?.addEventListener('click', clearLocalLogs);
     document.getElementById('accounts-search')?.addEventListener('input', (event) => {
       window.clearTimeout(state.accounts.searchTimer);
       state.accounts.searchTimer = window.setTimeout(() => {
@@ -1457,7 +1731,10 @@
     document.getElementById('account-files-delete')?.addEventListener('click', deleteSelectedAccountFiles);
     document.getElementById('credential-import-form')?.addEventListener('submit', importCredentials);
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) loadJobStatus({ silent: true }).catch(() => {});
+      if (!document.hidden) {
+        loadJobStatus({ silent: true }).catch(() => {});
+        if (state.section === 'logs') ensureLogStream();
+      }
     });
   }
 
@@ -1474,6 +1751,10 @@
   }
 
   window.addEventListener('hashchange', () => showSection(requestedSection()));
+  window.addEventListener('pagehide', () => {
+    closeLogSource();
+    stopLogFallback();
+  });
   systemTheme.addEventListener?.('change', () => {
     if (document.documentElement.dataset.themePreference === 'system') {
       applyTheme('system', false);
