@@ -56,7 +56,7 @@ def test_v1_9_release_documents_hidden_window_and_sso_refresh(isolated_v2_panel)
         encoding="utf-8"
     )
 
-    assert "version-v1.9.0" in readme
+    assert "# v1.9.0" in release
     for phrase in (
         "aiis2",
         "Chrome_WidgetWin_1",
@@ -74,6 +74,36 @@ def test_v1_9_release_documents_hidden_window_and_sso_refresh(isolated_v2_panel)
     combined = f"{readme}\n{release}".casefold()
     assert "38.147.173.173" not in combined
     assert "mail.aiis2.shop" not in combined
+
+
+def test_v1_10_release_documents_combined_bounded_log_console(
+    isolated_v2_panel,
+):
+    root = Path(panel_app.__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    release = (root / "docs" / "releases" / "v1.10.0.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "version-v1.10.0" in readme
+    for phrase in (
+        "aiis2",
+        "注册与日志",
+        "2000",
+        "300",
+        "批量",
+        "#logs",
+        "Playwright",
+        "726ms",
+        "74ms",
+    ):
+        assert phrase in release
+    release_lower = release.casefold()
+    for forbidden in ("asz798838958", "lingxiaoyiyu-hub"):
+        assert forbidden not in release_lower
+    combined = f"{readme}\n{release}".casefold()
+    for forbidden in ("38.147.173.173", "mail.aiis2.shop"):
+        assert forbidden not in combined
 
 
 def test_v2_uses_only_local_assets_and_has_server_rendered_legacy_fallback(
