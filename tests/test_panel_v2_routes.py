@@ -85,7 +85,7 @@ def test_v1_10_release_documents_combined_bounded_log_console(
         encoding="utf-8"
     )
 
-    assert "version-v1.10.0" in readme
+    assert "version-v1.10.1" in readme
     for phrase in (
         "aiis2",
         "注册与日志",
@@ -104,6 +104,37 @@ def test_v1_10_release_documents_combined_bounded_log_console(
     combined = f"{readme}\n{release}".casefold()
     for forbidden in ("38.147.173.173", "mail.aiis2.shop"):
         assert forbidden not in combined
+
+
+def test_v1_10_1_release_documents_turnstile_recovery_and_soak_validation(
+    isolated_v2_panel,
+):
+    root = Path(panel_app.__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    release = (root / "docs" / "releases" / "v1.10.1.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "version-v1.10.1" in readme
+    for phrase in (
+        "aiis2",
+        "Chromium",
+        "Shadow DOM",
+        "Turnstile",
+        "1000",
+        "10 个并发槽",
+        "Playwright",
+        "SSO",
+        "Sub2API",
+        "381 passed",
+    ):
+        assert phrase in release
+    release_lower = release.casefold()
+    for forbidden in (
+        "asz798838958",
+        "lingxiaoyiyu-hub",
+    ):
+        assert forbidden not in release_lower
 
 
 def test_v2_uses_only_local_assets_and_has_server_rendered_legacy_fallback(
