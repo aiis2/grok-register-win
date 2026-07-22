@@ -1579,6 +1579,100 @@ def email_config_public(cfg: Optional[dict] = None) -> dict:
     }
 
 
+_EMAIL_V2_SECRET_FIELDS = (
+    "cfworker_admin_token",
+    "cfworker_custom_auth",
+    "cloudflare_admin_password",
+    "cloudflare_site_password",
+    "moemail_api_key",
+    "gptmail_api_key",
+    "duckmail_bearer",
+    "duckmail_api_key",
+    "maliapi_api_key",
+    "luckmail_api_key",
+    "skymail_token",
+    "cloudmail_admin_password",
+    "freemail_admin_token",
+    "freemail_password",
+    "opentrashmail_password",
+    "laoudo_auth",
+    "mail_test_smtp_password",
+)
+_EMAIL_V2_VALUE_FIELDS = (
+    "email_failover",
+    "cfworker_api_url",
+    "cfworker_domain",
+    "cfworker_subdomain",
+    "cloudflare_api_base",
+    "cloudflare_domain",
+    "moemail_api_url",
+    "gptmail_base_url",
+    "gptmail_domain",
+    "duckmail_api_url",
+    "duckmail_provider_url",
+    "duckmail_domain",
+    "maliapi_base_url",
+    "maliapi_domain",
+    "luckmail_base_url",
+    "luckmail_project_code",
+    "luckmail_domain",
+    "skymail_api_base",
+    "skymail_domain",
+    "cloudmail_api_base",
+    "cloudmail_admin_email",
+    "cloudmail_domain",
+    "freemail_api_url",
+    "freemail_username",
+    "freemail_domain",
+    "mail_test_sender_mode",
+    "mail_test_timeout_sec",
+    "mail_test_smtp_host",
+    "mail_test_smtp_port",
+    "mail_test_smtp_security",
+    "mail_test_smtp_username",
+    "mail_test_smtp_from",
+    "mail_test_direct_mx_enabled",
+    "opentrashmail_api_url",
+    "opentrashmail_domain",
+    "laoudo_email",
+    "laoudo_account_id",
+)
+
+
+def email_config_v2_public(cfg: Optional[dict] = None) -> dict:
+    """Return the editable email settings without returning stored secrets."""
+    raw = dict(cfg if isinstance(cfg, dict) else load_config())
+    public = email_config_public(raw)
+    values = {field: public.get(field) for field in _EMAIL_V2_VALUE_FIELDS}
+    # Environment fallback values are useful to the worker but must not be sent
+    # to the browser. Only explicitly stored non-secret values are editable.
+    values["freemail_api_url"] = str(raw.get("freemail_api_url") or "").strip()
+    values["freemail_username"] = str(raw.get("freemail_username") or "").strip()
+    configured = {
+        field: bool(str(public.get(field) or raw.get(field) or "").strip())
+        for field in _EMAIL_V2_SECRET_FIELDS
+    }
+    return {
+        "provider": public["provider"],
+        "choices": public["choices"],
+        "values": values,
+        "configured": configured,
+        "environment": {
+            "freemail_url_available": bool(
+                os.environ.get("MAIL_WEB_URL", "").strip()
+            ),
+            "freemail_username_available": bool(
+                os.environ.get("ADMIN_NAME", "").strip()
+            ),
+            "freemail_password_available": bool(
+                os.environ.get("ADMIN_PASSWORD", "").strip()
+            ),
+        },
+        "freemail_auth_source": public["freemail_auth_source"],
+        "hint": public["hint"],
+    }
+
+
 def apply_email_config_from_ui(data: dict) -> dict:
     """Merge panel email form into config.json and return public view."""
     cfg = load_config()
@@ -5484,6 +5578,14 @@ def api_get_email_config():
     if need:
         return need
     return jsonify({"ok": True, "email": email_config_public()})
+
+
+@app.get("/api/v2/config/email")
+def api_get_v2_email_config():
+    need = require_login()
+    if need:
+        return need
+    return jsonify({"ok": True, "email": email_config_v2_public()})
 
 
 @app.post("/api/config/email")
