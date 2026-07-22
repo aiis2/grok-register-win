@@ -5602,6 +5602,25 @@ def api_get_v2_email_config():
     return jsonify({"ok": True, "email": email_config_v2_public()})
 
 
+@app.post("/api/v2/config/email")
+def api_set_v2_email_config():
+    need = require_login()
+    if need:
+        return need
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        apply_email_config_from_ui(data)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify(
+        {
+            "ok": True,
+            "message": "邮箱设置已保存",
+            "email": email_config_v2_public(),
+        }
+    )
+
+
 @app.post("/api/config/email")
 def api_set_email_config():
     need = require_login()
@@ -5625,6 +5644,32 @@ def api_test_email_config():
         result = probe_cloudflare_temp_email(data)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify(result)
+
+
+@app.post("/api/v2/config/email/test")
+def api_test_v2_email_config():
+    need = require_login()
+    if need:
+        return need
+    data = request.get_json(force=True, silent=True) or {}
+    private_config = {}
+    try:
+        private_config = merge_email_test_config(data)
+        result = probe_cloudflare_temp_email(private_config)
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": sanitize_receive_test_error(
+                        exc,
+                        config=private_config or data,
+                    ),
+                }
+            ),
+            400,
+        )
     return jsonify(result)
 
 

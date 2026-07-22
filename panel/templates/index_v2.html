@@ -247,13 +247,170 @@
     </section>
 
     <section id="section-mail" class="panel-section" data-section="mail" hidden>
-      <div class="section-heading"><div><p class="eyebrow">Mail</p><h1>邮箱服务</h1><p>配置收件服务并执行连接和端到端验证码测试。</p></div></div>
-      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">✉</span><strong>邮箱配置安全加载</strong><p>已保存的密钥只显示配置状态，不会返回页面。</p></div></div>
+      <div class="section-heading">
+        <div><p class="eyebrow">Mail</p><h1>邮箱服务</h1><p>配置收件服务并执行连接和端到端验证码测试。</p></div>
+        <div class="heading-actions">
+          <button class="button button--ghost" id="email-connection-test" type="button" hidden data-busy-group="mail">测试连接</button>
+          <button class="button button--secondary" id="email-receive-test-open" type="button" data-busy-group="mail">测试收件</button>
+          <button class="button button--primary" id="email-save" type="button" data-busy-group="mail">保存设置</button>
+        </div>
+      </div>
+      <div class="inline-alert inline-alert--error" id="section-mail-error" role="alert" hidden></div>
+
+      <article class="surface-card mail-settings-card">
+        <div class="mail-provider-toolbar">
+          <label class="field" for="email-provider"><span>邮箱服务商</span><select id="email-provider" data-busy-group="mail"></select></label>
+          <label class="switch-field" for="email-failover"><input id="email-failover" type="checkbox" data-busy-group="mail"><span><strong>失败时自动换源</strong><small>当前服务商不可用时尝试备用源</small></span></label>
+          <div class="mail-security-note"><span aria-hidden="true">◇</span><p><strong>密钥不会回显</strong><br>已保存的密码和 Token 只显示配置状态；留空即保留。</p></div>
+        </div>
+
+        <div class="mail-provider-content">
+          <div class="mail-provider-panel" data-mail-provider="cfworker" hidden>
+            <div class="provider-intro"><h2>CF Worker / 自建域名</h2><p>使用自建 Worker 管理邮箱地址与收件内容。</p></div>
+            <div class="form-grid form-grid--three">
+              <label class="field"><span>API URL</span><input id="cfworker_api_url" type="url" data-mail-field></label>
+              <label class="field"><span>Admin Token</span><input id="cfworker_admin_token" type="password" autocomplete="new-password" data-mail-secret></label>
+              <label class="field"><span>域名</span><input id="cfworker_domain" type="text" data-mail-field></label>
+              <label class="field"><span>站点密码</span><input id="cfworker_custom_auth" type="password" autocomplete="new-password" data-mail-secret></label>
+              <label class="field"><span>子域名</span><input id="cfworker_subdomain" type="text" data-mail-field></label>
+            </div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="cloudflare_temp_email" hidden>
+            <div class="provider-intro"><h2>Cloudflare Temp Email</h2><p>管理员接口创建地址，地址 JWT 拉取和解析验证码邮件；连接测试不会创建邮箱。</p></div>
+            <div class="form-grid form-grid--two">
+              <label class="field"><span>API 根地址</span><input id="cloudflare_api_base" type="url" autocomplete="url" data-mail-field></label>
+              <label class="field"><span>管理员密码</span><input id="cloudflare_admin_password" type="password" autocomplete="new-password" data-mail-secret></label>
+              <label class="field"><span>域名</span><input id="cloudflare_domain" type="text" data-mail-field></label>
+              <label class="field"><span>站点访问密码</span><input id="cloudflare_site_password" type="password" autocomplete="new-password" data-mail-secret></label>
+            </div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="moemail" hidden>
+            <div class="provider-intro"><h2>MoeMail</h2><p>公共 API 可能受服务商风控，请优先使用自建服务。</p></div>
+            <div class="form-grid form-grid--two"><label class="field"><span>API URL</span><input id="moemail_api_url" type="url" data-mail-field></label><label class="field"><span>API Key</span><input id="moemail_api_key" type="password" autocomplete="new-password" data-mail-secret></label></div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="tempmail_lol" hidden>
+            <div class="provider-intro"><h2>TempMail.lol</h2><p>无需 API Key，自动生成邮箱并轮询收件；公共域名可能被拒收。</p></div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="duckmail" hidden>
+            <div class="provider-intro"><h2>DuckMail</h2><p>分别配置 Web 和 Provider API。</p></div>
+            <div class="form-grid form-grid--three">
+              <label class="field"><span>Web URL</span><input id="duckmail_api_url" type="url" data-mail-field></label>
+              <label class="field"><span>Provider URL</span><input id="duckmail_provider_url" type="url" data-mail-field></label>
+              <label class="field"><span>域名</span><input id="duckmail_domain" type="text" data-mail-field></label>
+              <label class="field"><span>Bearer</span><input id="duckmail_bearer" type="password" autocomplete="new-password" data-mail-secret></label>
+              <label class="field"><span>API Key</span><input id="duckmail_api_key" type="password" autocomplete="new-password" data-mail-secret></label>
+            </div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="gptmail" hidden>
+            <div class="provider-intro"><h2>GPTMail</h2><p>支持 API 创建和按域名生成地址。</p></div>
+            <div class="form-grid form-grid--three"><label class="field"><span>API URL</span><input id="gptmail_base_url" type="url" data-mail-field></label><label class="field"><span>API Key</span><input id="gptmail_api_key" type="password" autocomplete="new-password" data-mail-secret></label><label class="field"><span>域名</span><input id="gptmail_domain" type="text" data-mail-field></label></div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="maliapi" hidden>
+            <div class="provider-intro"><h2>YYDS / MaliAPI</h2><p>使用项目 API Key 创建和读取临时邮箱。</p></div>
+            <div class="form-grid form-grid--three"><label class="field"><span>API URL</span><input id="maliapi_base_url" type="url" data-mail-field></label><label class="field"><span>API Key</span><input id="maliapi_api_key" type="password" autocomplete="new-password" data-mail-secret></label><label class="field"><span>域名</span><input id="maliapi_domain" type="text" data-mail-field></label></div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="luckmail" hidden>
+            <div class="provider-intro"><h2>LuckMail</h2><p>按项目代码申请接码邮箱。</p></div>
+            <div class="form-grid form-grid--two"><label class="field"><span>平台地址</span><input id="luckmail_base_url" type="url" data-mail-field></label><label class="field"><span>API Key</span><input id="luckmail_api_key" type="password" autocomplete="new-password" data-mail-secret></label><label class="field"><span>项目代码</span><input id="luckmail_project_code" type="text" data-mail-field></label><label class="field"><span>域名</span><input id="luckmail_domain" type="text" data-mail-field></label></div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="skymail" hidden>
+            <div class="provider-intro"><h2>SkyMail</h2><p>使用 Token 访问 SkyMail API。</p></div>
+            <div class="form-grid form-grid--three"><label class="field"><span>API Base</span><input id="skymail_api_base" type="url" data-mail-field></label><label class="field"><span>Token</span><input id="skymail_token" type="password" autocomplete="new-password" data-mail-secret></label><label class="field"><span>域名</span><input id="skymail_domain" type="text" data-mail-field></label></div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="cloudmail" hidden>
+            <div class="provider-intro"><h2>CloudMail</h2><p>通过管理员账号创建和读取邮箱。</p></div>
+            <div class="form-grid form-grid--two"><label class="field"><span>API Base</span><input id="cloudmail_api_base" type="url" data-mail-field></label><label class="field"><span>管理员邮箱</span><input id="cloudmail_admin_email" type="email" data-mail-field></label><label class="field"><span>管理员密码</span><input id="cloudmail_admin_password" type="password" autocomplete="new-password" data-mail-secret></label><label class="field"><span>域名</span><input id="cloudmail_domain" type="text" data-mail-field></label></div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="freemail" hidden>
+            <div class="provider-intro"><h2>Freemail 自建</h2><p id="freemail-source-hint">可使用页面配置或 Windows 环境变量；环境变量内容不会返回页面。</p></div>
+            <div class="form-grid form-grid--three">
+              <label class="field"><span>API URL</span><input id="freemail_api_url" type="url" data-mail-field></label>
+              <label class="field"><span>Admin Token</span><input id="freemail_admin_token" type="password" autocomplete="new-password" data-mail-secret></label>
+              <label class="field"><span>管理员用户名</span><input id="freemail_username" type="text" autocomplete="username" data-mail-field></label>
+              <label class="field"><span>管理员密码</span><input id="freemail_password" type="password" autocomplete="new-password" data-mail-secret></label>
+              <label class="field"><span>域名</span><input id="freemail_domain" type="text" data-mail-field></label>
+              <label class="switch-field switch-field--inline"><input id="freemail_use_environment" type="checkbox"><span><strong>使用 Windows 环境变量</strong><small>保存时清除页面登录配置</small></span></label>
+            </div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="opentrashmail" hidden>
+            <div class="provider-intro"><h2>OpenTrashMail</h2><p>配置自建 API、域名和访问密码。</p></div>
+            <div class="form-grid form-grid--three"><label class="field"><span>API URL</span><input id="opentrashmail_api_url" type="url" data-mail-field></label><label class="field"><span>域名</span><input id="opentrashmail_domain" type="text" data-mail-field></label><label class="field"><span>密码</span><input id="opentrashmail_password" type="password" autocomplete="new-password" data-mail-secret></label></div>
+          </div>
+
+          <div class="mail-provider-panel" data-mail-provider="laoudo" hidden>
+            <div class="provider-intro"><h2>Laoudo 固定邮箱</h2><p>读取已存在的固定邮箱账号。</p></div>
+            <div class="form-grid form-grid--three"><label class="field"><span>Auth</span><input id="laoudo_auth" type="password" autocomplete="new-password" data-mail-secret></label><label class="field"><span>邮箱</span><input id="laoudo_email" type="email" data-mail-field></label><label class="field"><span>Account ID</span><input id="laoudo_account_id" type="text" data-mail-field></label></div>
+          </div>
+        </div>
+
+        <details class="advanced-settings" id="mail-advanced-settings">
+          <summary><span><strong>高级发件设置</strong><small>SMTP Relay、Direct MX 与收件等待时间</small></span><span aria-hidden="true">⌄</span></summary>
+          <div class="advanced-settings__body">
+            <div class="form-grid form-grid--three">
+              <label class="field"><span>发件策略</span><select id="mail-test-sender-mode" data-mail-field><option value="auto">自动：原生 → SMTP → Direct MX</option><option value="native">仅原生 API</option><option value="smtp">仅 SMTP Relay</option><option value="direct_mx">仅 Direct MX</option></select></label>
+              <label class="field"><span>收件等待（秒）</span><input id="mail-test-timeout-sec" type="number" min="15" max="300" value="90" data-mail-field></label>
+              <label class="field"><span>SMTP 主机</span><input id="mail-test-smtp-host" type="text" data-mail-field></label>
+              <label class="field"><span>SMTP 端口</span><input id="mail-test-smtp-port" type="number" min="1" max="65535" value="587" data-mail-field></label>
+              <label class="field"><span>SMTP 安全</span><select id="mail-test-smtp-security" data-mail-field><option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="plain">Plain</option></select></label>
+              <label class="field"><span>SMTP 用户名</span><input id="mail-test-smtp-username" type="text" autocomplete="username" data-mail-field></label>
+              <label class="field"><span>SMTP 密码</span><input id="mail-test-smtp-password" type="password" autocomplete="new-password" data-mail-secret></label>
+              <label class="field"><span>SMTP 发件地址</span><input id="mail-test-smtp-from" type="email" data-mail-field></label>
+              <label class="switch-field switch-field--inline"><input id="mail-test-direct-mx-enabled" type="checkbox" data-mail-field><span><strong>启用 Direct MX</strong><small>匿名投递可能被拒绝</small></span></label>
+            </div>
+            <p class="form-note">Direct MX 默认关闭。本机网络或收件服务器可能封锁 25 端口，且无 DKIM/SPF 的投递可能被拒。</p>
+          </div>
+        </details>
+        <div class="mail-hint" id="email-hint">邮箱配置正在安全加载…</div>
+      </article>
     </section>
 
     <section id="section-credentials" class="panel-section" data-section="credentials" hidden>
-      <div class="section-heading"><div><p class="eyebrow">Credentials</p><h1>凭据存储</h1><p>查看目录容量、迁移账号工作区并管理 CPA 转换。</p></div></div>
-      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">◇</span><strong>凭据状态准备加载</strong><p>迁移和替换操作会继续使用后端互斥保护。</p></div></div>
+      <div class="section-heading"><div><p class="eyebrow">Credentials</p><h1>凭据存储</h1><p>查看目录容量、迁移账号工作区并管理 CPA 转换。</p></div><a class="button button--secondary" href="#accounts">导入账号凭据</a></div>
+      <div class="inline-alert inline-alert--error" id="section-credentials-error" role="alert" hidden></div>
+      <div class="credential-metrics">
+        <article><span>SSO 文件</span><strong id="credentials-sso-files">0</strong></article>
+        <article><span>邮箱文件</span><strong id="credentials-mail-files">0</strong></article>
+        <article><span>CPA 文件</span><strong id="credentials-cpa-files">0</strong></article>
+        <article><span>总文件</span><strong id="credentials-total-files">0</strong><small id="credentials-total-bytes">0 B</small></article>
+      </div>
+      <div class="credentials-grid">
+        <article class="surface-card">
+          <div class="card-heading"><div><span class="eyebrow">Workspace</span><h2>存储目录</h2></div><span class="status-label" id="credentials-writable">检查中</span></div>
+          <div class="form-stack">
+            <label class="field" for="credentials-dir"><span>凭据根目录</span><input id="credentials-dir" type="text" data-busy-group="credentials"><small>相对路径以应用目录为基准，也支持绝对路径</small></label>
+            <div class="resolved-path"><span>当前解析路径</span><code id="credentials-resolved-path">—</code></div>
+            <div class="workspace-warning"><strong id="credentials-legacy-files">历史位置待迁移：0 个文件</strong><p>迁移按复制、SHA-256 校验、配置切换、删除来源执行；同名异内容文件会自动改名。</p></div>
+            <div class="form-actions">
+              <button class="button button--secondary" id="credentials-save" type="button" data-busy-group="credentials">保存空目录</button>
+              <button class="button button--primary" id="credentials-migrate" type="button" data-busy-group="credentials">迁移并切换</button>
+            </div>
+          </div>
+        </article>
+        <article class="surface-card">
+          <div class="card-heading"><div><span class="eyebrow">OAuth queue</span><h2>CPA 转换</h2></div><span class="status-label" id="cpa-status">等待加载</span></div>
+          <dl class="status-list">
+            <div><dt>已完成</dt><dd id="cpa-done">0</dd></div>
+            <div><dt>等待队列</dt><dd id="cpa-pending">0</dd></div>
+            <div><dt>转换失败</dt><dd class="status-danger" id="cpa-fail">0</dd></div>
+            <div><dt>最近账号</dt><dd id="cpa-last-email">—</dd></div>
+          </dl>
+          <div class="form-stack cpa-actions">
+            <label class="field" for="cpa-backfill-limit"><span>补转上限</span><input id="cpa-backfill-limit" type="number" min="1" max="1000" value="200" data-busy-group="credentials"></label>
+            <button class="button button--secondary" id="cpa-backfill" type="button" data-busy-group="credentials">扫描并补转缺失 CPA</button>
+          </div>
+        </article>
+      </div>
     </section>
 
     <section id="section-logs" class="panel-section" data-section="logs" hidden>
@@ -272,6 +429,17 @@
         <button class="button button--danger" id="confirm-accept" value="accept">确认</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="email-receive-dialog" class="email-receive-dialog" aria-labelledby="email-receive-title">
+    <div class="email-receive-shell">
+      <div class="email-receive-head"><div><p class="eyebrow">End-to-end check</p><h2 id="email-receive-title">邮箱收件验证</h2><p>生成一次性邮箱，发送 Grok 格式测试验证码，再复用当前适配器读取并精确匹配。</p></div><button class="button button--ghost" id="email-receive-close" type="button" aria-label="关闭">关闭</button></div>
+      <div class="email-receive-facts"><div><span>邮箱源</span><strong id="email-receive-provider">—</strong></div><div><span>发件策略</span><strong id="email-receive-sender">能力探测中</strong></div><div><span>测试邮箱</span><strong id="email-receive-address">尚未创建</strong></div></div>
+      <ol class="email-receive-timeline" id="email-receive-timeline" aria-label="测试进度"></ol>
+      <div class="email-receive-message" id="email-receive-message" role="status" aria-live="polite">正在检查可用发件方式…</div>
+      <div class="email-receive-timing" id="email-receive-timing">尚未开始</div>
+      <div class="email-receive-actions"><button class="button button--primary" id="email-receive-start" type="button" disabled>发送验证码并测试</button><button class="button button--danger" id="email-receive-cancel" type="button" disabled>取消测试</button></div>
+    </div>
   </dialog>
 
   <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>

@@ -14,12 +14,103 @@
     'credentials',
     'logs',
   ]);
+  const EMAIL_VALUE_FIELDS = [
+    'cfworker_api_url',
+    'cfworker_domain',
+    'cfworker_subdomain',
+    'cloudflare_api_base',
+    'cloudflare_domain',
+    'moemail_api_url',
+    'gptmail_base_url',
+    'gptmail_domain',
+    'duckmail_api_url',
+    'duckmail_provider_url',
+    'duckmail_domain',
+    'maliapi_base_url',
+    'maliapi_domain',
+    'luckmail_base_url',
+    'luckmail_project_code',
+    'luckmail_domain',
+    'skymail_api_base',
+    'skymail_domain',
+    'cloudmail_api_base',
+    'cloudmail_admin_email',
+    'cloudmail_domain',
+    'freemail_api_url',
+    'freemail_username',
+    'freemail_domain',
+    'mail_test_sender_mode',
+    'mail_test_timeout_sec',
+    'mail_test_smtp_host',
+    'mail_test_smtp_port',
+    'mail_test_smtp_security',
+    'mail_test_smtp_username',
+    'mail_test_smtp_from',
+    'mail_test_direct_mx_enabled',
+    'opentrashmail_api_url',
+    'opentrashmail_domain',
+    'laoudo_email',
+    'laoudo_account_id',
+  ];
+  const EMAIL_SECRET_FIELDS = [
+    'cfworker_admin_token',
+    'cfworker_custom_auth',
+    'cloudflare_admin_password',
+    'cloudflare_site_password',
+    'moemail_api_key',
+    'gptmail_api_key',
+    'duckmail_bearer',
+    'duckmail_api_key',
+    'maliapi_api_key',
+    'luckmail_api_key',
+    'skymail_token',
+    'cloudmail_admin_password',
+    'freemail_admin_token',
+    'freemail_password',
+    'opentrashmail_password',
+    'laoudo_auth',
+    'mail_test_smtp_password',
+  ];
+  const EMAIL_FIELD_IDS = {
+    mail_test_sender_mode: 'mail-test-sender-mode',
+    mail_test_timeout_sec: 'mail-test-timeout-sec',
+    mail_test_smtp_host: 'mail-test-smtp-host',
+    mail_test_smtp_port: 'mail-test-smtp-port',
+    mail_test_smtp_security: 'mail-test-smtp-security',
+    mail_test_smtp_username: 'mail-test-smtp-username',
+    mail_test_smtp_password: 'mail-test-smtp-password',
+    mail_test_smtp_from: 'mail-test-smtp-from',
+    mail_test_direct_mx_enabled: 'mail-test-direct-mx-enabled',
+  };
+  const EMAIL_BOOLEAN_FIELDS = new Set(['mail_test_direct_mx_enabled']);
+  const EMAIL_NUMBER_FIELDS = new Set(['mail_test_timeout_sec', 'mail_test_smtp_port']);
+  const EMAIL_RECEIVE_STAGES = [
+    ['checking', '检查配置'],
+    ['creating', '创建邮箱'],
+    ['snapshotting', '收件快照'],
+    ['sending', '发送测试信'],
+    ['waiting', '等待收件'],
+    ['verifying', '核对验证码'],
+    ['cleaning', '清理邮箱'],
+    ['succeeded', '验证成功'],
+  ];
+  const EMAIL_RECEIVE_TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
+  const EMAIL_RECEIVE_SESSION_KEY = 'panel-v2-email-receive-test-id';
+  const restoredEmailTestId = readSessionValue(EMAIL_RECEIVE_SESSION_KEY);
   const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
   const state = {
     job: null,
     browser: null,
     credentials: null,
+    cpa: null,
     email: null,
+    emailReceive: {
+      testId: restoredEmailTestId,
+      pollTimer: null,
+      running: Boolean(restoredEmailTestId),
+      capabilityReady: false,
+      cancelRequested: false,
+    },
     busy: new Set(),
     pollTimer: null,
     confirmResolver: null,
@@ -49,6 +140,21 @@
     } catch (_) {
       return fallback;
     }
+  }
+
+  function readSessionValue(key) {
+    try {
+      return window.sessionStorage.getItem(key) || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function saveSessionValue(key, value) {
+    try {
+      if (value) window.sessionStorage.setItem(key, value);
+      else window.sessionStorage.removeItem(key);
+    } catch (_) {}
   }
 
   function savePreference(key, value) {
@@ -164,6 +270,8 @@
     });
     if (group === 'registration') syncRegistrationControls();
     if (group === 'accounts') syncAccountControls();
+    if (group === 'mail') syncMailControls();
+    if (group === 'credentials') syncCredentialControls();
   }
 
   function confirmAction({ title, message, acceptLabel = '确认' }) {
@@ -211,6 +319,7 @@
   function syncRegistrationControls() {
     const running = Boolean(state.job?.running);
     const busy = state.busy.has('registration');
+    const receiveTestRunning = state.emailReceive.running;
     const engine = document.getElementById('browser-engine')?.value || 'chromium';
     for (const id of ['register-count', 'register-concurrency', 'browser-engine']) {
       const control = document.getElementById(id);
@@ -222,7 +331,7 @@
     const start = document.getElementById('start-registration');
     const stop = document.getElementById('stop-registration');
     if (save) save.disabled = running || busy;
-    if (start) start.disabled = running || busy;
+    if (start) start.disabled = running || busy || receiveTestRunning;
     if (stop) stop.disabled = !running || busy;
   }
 
@@ -566,6 +675,7 @@
     const job = payload?.job || {};
     const cpa = payload?.cpa || {};
     state.job = job;
+    renderCpaStatus(cpa);
     const running = Boolean(job.running);
     const count = Number(job.count || 0);
     const current = Math.min(Number(job.current_round || 0), count || Number(job.current_round || 0));
@@ -609,6 +719,7 @@
       : (job.finished_at ? `任务已结束：成功 ${success}，失败 ${fail}。` : '等待启动注册任务。'));
     renderWorkers(Array.isArray(job.workers) ? job.workers : []);
     syncRegistrationControls();
+    syncMailControls();
   }
 
   async function loadJobStatus({ silent = false } = {}) {
@@ -634,17 +745,552 @@
     return payload;
   }
 
-  async function loadCredentialSummary() {
-    const payload = await requestJson('/api/config/credentials');
+  function formatBytes(value) {
+    const bytes = Math.max(0, Number(value || 0));
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unit = 'B';
+    for (const next of units) {
+      size /= 1024;
+      unit = next;
+      if (size < 1024) break;
+    }
+    const digits = size >= 10 ? 1 : 2;
+    return `${Number(size.toFixed(digits))} ${unit}`;
+  }
+
+  function renderCredentialSummary(payload = {}) {
     state.credentials = payload;
-    if (!state.job) setText('metric-cpa', payload.stats?.cpa_files || 0);
+    const stats = payload.stats || {};
+    setText('credentials-sso-files', Number(stats.sso_files || 0));
+    setText('credentials-mail-files', Number(stats.mail_files || 0));
+    setText('credentials-cpa-files', Number(stats.cpa_files || 0));
+    setText('credentials-total-files', Number(stats.total_files || 0));
+    setText('credentials-total-bytes', formatBytes(stats.total_bytes));
+    setText('credentials-resolved-path', payload.resolved_path || '—');
+    setText('credentials-legacy-files', `历史位置待迁移：${Number(payload.legacy_files || 0)} 个文件`);
+    const pathInput = document.getElementById('credentials-dir');
+    if (pathInput && document.activeElement !== pathInput) {
+      pathInput.value = payload.configured || 'data/credentials';
+    }
+    const writable = document.getElementById('credentials-writable');
+    if (writable) {
+      writable.textContent = payload.writable ? '可写' : '不可写';
+      writable.classList.toggle('status-success', Boolean(payload.writable));
+      writable.classList.toggle('status-danger', !payload.writable);
+    }
+    if (!state.job) setText('metric-cpa', stats.cpa_files || 0);
+    syncCredentialControls();
+  }
+
+  async function loadCredentialSummary() {
+    try {
+      const payload = await requestJson('/api/config/credentials');
+      renderCredentialSummary(payload);
+      setInlineError('section-credentials-error');
+      return payload;
+    } catch (error) {
+      setInlineError('section-credentials-error', safeErrorMessage(error));
+      throw error;
+    }
+  }
+
+  function renderCpaStatus(cpa = {}) {
+    state.cpa = cpa;
+    const status = document.getElementById('cpa-status');
+    if (status) {
+      let label = '就绪';
+      let tone = 'status-success';
+      if (cpa.core_ok === false) {
+        label = '转换核心不可用';
+        tone = 'status-danger';
+      } else if (cpa.running || Number(cpa.pending || 0) > 0) {
+        label = '转换中';
+        tone = '';
+      } else if (Number(cpa.fail || 0) > 0) {
+        label = '存在失败';
+        tone = 'status-danger';
+      }
+      status.textContent = label;
+      status.classList.toggle('status-success', tone === 'status-success');
+      status.classList.toggle('status-danger', tone === 'status-danger');
+    }
+    setText('cpa-done', Number(cpa.done ?? cpa.files ?? 0));
+    setText('cpa-pending', Number(cpa.pending || 0));
+    setText('cpa-fail', Number(cpa.fail || 0));
+    setText('cpa-last-email', cpa.last_ok_email || '—');
+    syncCredentialControls();
+  }
+
+  async function loadCpaStatus() {
+    const payload = await requestJson('/api/cpa/status');
+    renderCpaStatus(payload.cpa || {});
     return payload;
   }
 
+  function syncCredentialControls() {
+    const busy = state.busy.has('credentials');
+    const blocked = Boolean(state.job?.running)
+      || Boolean(state.cpa?.running)
+      || Number(state.cpa?.pending || 0) > 0;
+    const pathInput = document.getElementById('credentials-dir');
+    const save = document.getElementById('credentials-save');
+    const migrate = document.getElementById('credentials-migrate');
+    const backfill = document.getElementById('cpa-backfill');
+    const limit = document.getElementById('cpa-backfill-limit');
+    if (pathInput) pathInput.disabled = busy || blocked;
+    if (save) save.disabled = busy || blocked;
+    if (migrate) migrate.disabled = busy || blocked;
+    if (limit) limit.disabled = busy || Boolean(state.job?.running);
+    if (backfill) backfill.disabled = busy || Boolean(state.job?.running) || state.cpa?.core_ok === false;
+  }
+
+  function requestedCredentialPath() {
+    return String(document.getElementById('credentials-dir')?.value || '').trim();
+  }
+
+  async function saveCredentialDirectory() {
+    const credentialsDir = requestedCredentialPath();
+    if (!credentialsDir) {
+      setInlineError('section-credentials-error', '请输入凭据根目录');
+      document.getElementById('credentials-dir')?.focus();
+      return;
+    }
+    setBusy('credentials', true);
+    setInlineError('section-credentials-error');
+    try {
+      const payload = await requestJson('/api/config/credentials', {
+        method: 'POST',
+        body: { credentials_dir: credentialsDir },
+      });
+      renderCredentialSummary(payload);
+      showToast('凭据目录已保存');
+    } catch (error) {
+      setInlineError('section-credentials-error', safeErrorMessage(error));
+    } finally {
+      setBusy('credentials', false);
+    }
+  }
+
+  async function migrateCredentialDirectory() {
+    const credentialsDir = requestedCredentialPath();
+    if (!credentialsDir) {
+      setInlineError('section-credentials-error', '请输入目标凭据根目录');
+      document.getElementById('credentials-dir')?.focus();
+      return;
+    }
+    const accepted = await confirmAction({
+      title: '迁移全部账号凭据并切换目录？',
+      message: `将当前 SSO、邮箱和 CPA 凭据一起迁移到 ${credentialsDir}。文件会先复制并校验，再切换配置。`,
+      acceptLabel: '迁移并切换',
+    });
+    if (!accepted) return;
+    setBusy('credentials', true);
+    setInlineError('section-credentials-error');
+    try {
+      const payload = await requestJson('/api/config/credentials/migrate', {
+        method: 'POST',
+        body: { credentials_dir: credentialsDir },
+      });
+      renderCredentialSummary(payload);
+      const migration = payload.migration || {};
+      showToast(`迁移完成：复制 ${Number(migration.copied || 0)}，移除来源 ${Number(migration.removed || 0)}`);
+      state.accounts.loaded = false;
+      await Promise.allSettled([
+        loadCpaStatus(),
+        loadJobStatus({ silent: true }),
+        loadAccounts(),
+      ]);
+    } catch (error) {
+      setInlineError('section-credentials-error', safeErrorMessage(error));
+    } finally {
+      setBusy('credentials', false);
+    }
+  }
+
+  async function backfillCpa() {
+    const limitInput = document.getElementById('cpa-backfill-limit');
+    if (!limitInput?.reportValidity()) return;
+    const limit = Math.max(1, Math.min(1000, Number(limitInput.value || 200)));
+    setBusy('credentials', true);
+    setInlineError('section-credentials-error');
+    try {
+      const payload = await requestJson('/api/cpa/backfill', {
+        method: 'POST',
+        body: { limit },
+      });
+      showToast(payload.message || `已入队 ${Number(payload.queued || 0)} 个待转换账号`);
+      await Promise.allSettled([loadCpaStatus(), loadJobStatus({ silent: true })]);
+      window.setTimeout(() => loadCpaStatus().catch(() => {}), 1200);
+    } catch (error) {
+      setInlineError('section-credentials-error', safeErrorMessage(error));
+    } finally {
+      setBusy('credentials', false);
+    }
+  }
+
+  function emailElement(field) {
+    return document.getElementById(EMAIL_FIELD_IDS[field] || field);
+  }
+
+  function showSelectedMailProvider() {
+    const provider = document.getElementById('email-provider')?.value || 'cfworker';
+    document.querySelectorAll('[data-mail-provider]').forEach((panel) => {
+      panel.hidden = panel.dataset.mailProvider !== provider;
+    });
+    const connection = document.getElementById('email-connection-test');
+    if (connection) connection.hidden = provider !== 'cloudflare_temp_email';
+    syncMailControls();
+  }
+
+  function renderEmailConfig(email = {}) {
+    state.email = email;
+    const providerSelect = document.getElementById('email-provider');
+    const choices = Array.isArray(email.choices) ? email.choices : [];
+    if (providerSelect) {
+      const options = choices.map((choice) => {
+        const option = createElement('option', '', choice.label || choice.id || '未知邮箱源');
+        option.value = choice.id || '';
+        return option;
+      });
+      providerSelect.replaceChildren(...options);
+      providerSelect.value = email.provider || choices[0]?.id || 'cfworker';
+    }
+    const values = email.values || {};
+    const failover = document.getElementById('email-failover');
+    if (failover) failover.checked = Boolean(values.email_failover);
+    EMAIL_VALUE_FIELDS.forEach((field) => {
+      const input = emailElement(field);
+      if (!input) return;
+      if (EMAIL_BOOLEAN_FIELDS.has(field)) input.checked = Boolean(values[field]);
+      else input.value = values[field] ?? '';
+    });
+    const useEnvironment = document.getElementById('freemail_use_environment');
+    if (useEnvironment) useEnvironment.checked = email.freemail_auth_source === 'environment';
+    const configured = email.configured || {};
+    EMAIL_SECRET_FIELDS.forEach((field) => {
+      const input = emailElement(field);
+      if (!input) return;
+      input.value = '';
+      input.placeholder = configured[field] ? '已保存；留空不修改' : '未配置';
+    });
+    const environment = email.environment || {};
+    const availableCount = [
+      environment.freemail_url_available,
+      environment.freemail_username_available,
+      environment.freemail_password_available,
+    ].filter(Boolean).length;
+    const sourceLabels = {
+      saved_token: '页面 Admin Token',
+      saved_login: '页面账号密码',
+      environment: 'Windows 环境变量',
+      none: '未配置',
+    };
+    setText(
+      'freemail-source-hint',
+      `当前认证来源：${sourceLabels[email.freemail_auth_source] || '未知'}；环境变量就绪 ${availableCount}/3。环境变量内容不会返回页面。`,
+    );
+    setText('email-hint', email.hint || '邮箱配置已安全加载；密钥输入不会回显。');
+    showSelectedMailProvider();
+  }
+
   async function loadEmailSummary() {
-    const payload = await requestJson('/api/v2/config/email');
-    state.email = payload.email;
+    try {
+      const payload = await requestJson('/api/v2/config/email');
+      renderEmailConfig(payload.email || {});
+      setInlineError('section-mail-error');
+      return payload;
+    } catch (error) {
+      setInlineError('section-mail-error', safeErrorMessage(error));
+      throw error;
+    }
+  }
+
+  function buildEmailPayload() {
+    const payload = {
+      provider: document.getElementById('email-provider')?.value || 'cfworker',
+      email_failover: Boolean(document.getElementById('email-failover')?.checked),
+      freemail_use_environment: Boolean(document.getElementById('freemail_use_environment')?.checked),
+    };
+    EMAIL_VALUE_FIELDS.forEach((field) => {
+      const input = emailElement(field);
+      if (!input) return;
+      if (EMAIL_BOOLEAN_FIELDS.has(field)) {
+        payload[field] = Boolean(input.checked);
+      } else if (EMAIL_NUMBER_FIELDS.has(field)) {
+        payload[field] = Number(input.value);
+      } else {
+        payload[field] = String(input.value || '').trim();
+      }
+    });
+    EMAIL_SECRET_FIELDS.forEach((field) => {
+      const value = String(emailElement(field)?.value || '').trim();
+      if (value) payload[field] = value;
+    });
     return payload;
+  }
+
+  async function saveEmailConfig() {
+    setBusy('mail', true);
+    setInlineError('section-mail-error');
+    try {
+      const payload = await requestJson('/api/v2/config/email', {
+        method: 'POST',
+        body: buildEmailPayload(),
+      });
+      renderEmailConfig(payload.email || {});
+      showToast(payload.message || '邮箱设置已保存');
+    } catch (error) {
+      setInlineError('section-mail-error', safeErrorMessage(error));
+    } finally {
+      setBusy('mail', false);
+    }
+  }
+
+  async function testEmailConnection() {
+    setBusy('mail', true);
+    setInlineError('section-mail-error');
+    try {
+      const payload = await requestJson('/api/v2/config/email/test', {
+        method: 'POST',
+        body: buildEmailPayload(),
+      });
+      const message = payload.message || 'Cloudflare Temp Email 连接成功';
+      setText('email-hint', message);
+      showToast(message);
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      setInlineError('section-mail-error', message);
+      setText('email-hint', `连接失败：${message}`);
+    } finally {
+      setBusy('mail', false);
+    }
+  }
+
+  function syncMailControls(receiveState = null) {
+    if (receiveState) {
+      state.emailReceive.running = Boolean(receiveState.running);
+      state.emailReceive.cancelRequested = Boolean(receiveState.cancel_requested);
+    }
+    const busy = state.busy.has('mail');
+    const running = state.emailReceive.running;
+    const registrationRunning = Boolean(state.job?.running);
+    document.querySelectorAll('[data-mail-field], [data-mail-secret], #email-provider, #email-failover, #freemail_use_environment').forEach((control) => {
+      control.disabled = busy || running;
+    });
+    const save = document.getElementById('email-save');
+    const connection = document.getElementById('email-connection-test');
+    const open = document.getElementById('email-receive-test-open');
+    const start = document.getElementById('email-receive-start');
+    const cancel = document.getElementById('email-receive-cancel');
+    if (save) save.disabled = busy || running;
+    if (connection) connection.disabled = busy || running;
+    if (open) {
+      open.disabled = busy || (registrationRunning && !running);
+      open.textContent = running ? '查看测试进度' : '测试收件';
+    }
+    if (start) start.disabled = busy || running || registrationRunning || !state.emailReceive.capabilityReady;
+    if (cancel) cancel.disabled = busy || !running || state.emailReceive.cancelRequested;
+    syncRegistrationControls();
+  }
+
+  function setEmailReceiveMessage(message, tone = '') {
+    const element = document.getElementById('email-receive-message');
+    if (!element) return;
+    element.textContent = String(message || '');
+    if (tone) element.dataset.tone = tone;
+    else delete element.dataset.tone;
+  }
+
+  function renderEmailReceiveTimeline(status = 'checking', errorStage = '') {
+    const timeline = document.getElementById('email-receive-timeline');
+    if (!timeline) return;
+    const effective = EMAIL_RECEIVE_TERMINAL.has(status) && status !== 'succeeded'
+      ? (errorStage || 'checking')
+      : status;
+    const activeIndex = Math.max(0, EMAIL_RECEIVE_STAGES.findIndex(([stage]) => stage === effective));
+    const items = EMAIL_RECEIVE_STAGES.map(([stage, label], index) => {
+      const item = createElement('li', '', label);
+      item.dataset.stage = stage;
+      if (status === 'succeeded' || index < activeIndex) item.dataset.state = 'done';
+      if (status === 'succeeded' && stage === 'succeeded') item.dataset.state = 'current';
+      if (index === activeIndex && status !== 'succeeded') {
+        item.dataset.state = EMAIL_RECEIVE_TERMINAL.has(status) ? 'failed' : 'current';
+        item.setAttribute('aria-current', 'step');
+      }
+      return item;
+    });
+    timeline.replaceChildren(...items);
+  }
+
+  function renderEmailReceiveTest(test = {}) {
+    const status = String(test.status || 'checking');
+    setText('email-receive-provider', test.provider || '—');
+    setText('email-receive-sender', test.sender_mode || '选择中');
+    setText('email-receive-address', test.email || '尚未创建');
+    renderEmailReceiveTimeline(status, test.error_stage || '');
+    const timings = [];
+    if (test.total_sec !== null && test.total_sec !== undefined) {
+      timings.push(`总耗时 ${Number(test.total_sec).toFixed(1)} 秒`);
+    }
+    if (test.receive_sec !== null && test.receive_sec !== undefined) {
+      timings.push(`收件等待 ${Number(test.receive_sec).toFixed(1)} 秒`);
+    }
+    if (test.cleanup && test.cleanup !== 'not_needed') timings.push(`清理 ${test.cleanup}`);
+    setText('email-receive-timing', timings.join(' · ') || '测试进行中');
+    if (status === 'succeeded') {
+      const warnings = Array.isArray(test.warnings) && test.warnings.length
+        ? `\n警告：${test.warnings.join('；')}`
+        : '';
+      setEmailReceiveMessage(`收件验证成功。邮箱源、发件链路与验证码读取均可用。${warnings}`, 'success');
+    } else if (status === 'failed') {
+      setEmailReceiveMessage(`失败阶段 ${test.error_stage || status}：${test.error || '邮箱收件测试失败'}`, 'error');
+    } else if (status === 'cancelled') {
+      setEmailReceiveMessage(`测试已取消${test.error_stage ? `（阶段 ${test.error_stage}）` : ''}`, 'error');
+    } else {
+      const stage = EMAIL_RECEIVE_STAGES.find(([name]) => name === status);
+      setEmailReceiveMessage(`${stage?.[1] || status}… 关闭窗口不会取消服务端测试。`);
+    }
+    state.emailReceive.capabilityReady = EMAIL_RECEIVE_TERMINAL.has(status)
+      || state.emailReceive.capabilityReady;
+    syncMailControls(test);
+  }
+
+  function stopEmailReceivePolling() {
+    if (state.emailReceive.pollTimer) {
+      window.clearTimeout(state.emailReceive.pollTimer);
+      state.emailReceive.pollTimer = null;
+    }
+  }
+
+  function closeEmailReceiveDialog() {
+    stopEmailReceivePolling();
+    const dialog = document.getElementById('email-receive-dialog');
+    if (dialog?.open) dialog.close();
+  }
+
+  function scheduleEmailReceivePoll(delay = 1000) {
+    stopEmailReceivePolling();
+    const dialog = document.getElementById('email-receive-dialog');
+    if (!dialog?.open || !state.emailReceive.testId) return;
+    state.emailReceive.pollTimer = window.setTimeout(() => {
+      pollEmailReceiveTest().catch(() => {});
+    }, delay);
+  }
+
+  async function openEmailReceiveTest() {
+    const dialog = document.getElementById('email-receive-dialog');
+    if (!dialog) return;
+    if (!dialog.open) dialog.showModal();
+    if (state.emailReceive.testId) {
+      state.emailReceive.capabilityReady = true;
+      await pollEmailReceiveTest();
+      return;
+    }
+    state.emailReceive.capabilityReady = false;
+    state.emailReceive.cancelRequested = false;
+    renderEmailReceiveTimeline('checking');
+    setText('email-receive-provider', document.getElementById('email-provider')?.value || '—');
+    setText('email-receive-sender', '能力探测中');
+    setText('email-receive-address', '尚未创建');
+    setText('email-receive-timing', '尚未开始');
+    setEmailReceiveMessage('正在主动检查当前配置支持的发件方式…');
+    setBusy('mail', true);
+    try {
+      const payload = await requestJson('/api/config/email/test-capabilities', {
+        method: 'POST',
+        body: buildEmailPayload(),
+      });
+      const capabilities = Array.isArray(payload.capabilities) ? payload.capabilities : [];
+      state.emailReceive.capabilityReady = capabilities.some((item) => item.available);
+      setText('email-receive-provider', payload.provider || '—');
+      setText('email-receive-sender', payload.selected_mode || '无可用策略');
+      const modeLabels = { native: '原生 API', smtp: 'SMTP Relay', direct_mx: 'Direct MX' };
+      const descriptions = capabilities.map((item) => {
+        const label = modeLabels[item.mode] || item.mode || '未知方式';
+        if (item.available) return `${label}：可用${item.reason ? `（${item.reason}）` : ''}`;
+        return `${label}：${item.reason || '不可用'}`;
+      });
+      const action = state.emailReceive.capabilityReady
+        ? '点击“发送验证码并测试”开始。'
+        : '请先补全一种可用发件方式。';
+      setEmailReceiveMessage([...descriptions, action].join('\n'), state.emailReceive.capabilityReady ? '' : 'error');
+    } catch (error) {
+      state.emailReceive.capabilityReady = false;
+      setEmailReceiveMessage(`能力检查失败：${safeErrorMessage(error)}`, 'error');
+    } finally {
+      setBusy('mail', false);
+    }
+  }
+
+  async function startEmailReceiveTest() {
+    if (state.emailReceive.running) return;
+    state.emailReceive.cancelRequested = false;
+    setBusy('mail', true);
+    setEmailReceiveMessage('正在创建邮箱收件测试…');
+    try {
+      const payload = await requestJson('/api/config/email/receive-test', {
+        method: 'POST',
+        body: buildEmailPayload(),
+      });
+      const test = payload.test || {};
+      state.emailReceive.testId = test.test_id || '';
+      state.emailReceive.running = Boolean(test.running ?? state.emailReceive.testId);
+      saveSessionValue(EMAIL_RECEIVE_SESSION_KEY, state.emailReceive.testId);
+      renderEmailReceiveTest(test);
+      scheduleEmailReceivePoll(500);
+    } catch (error) {
+      state.emailReceive.running = false;
+      setEmailReceiveMessage(`启动失败：${safeErrorMessage(error)}`, 'error');
+    } finally {
+      setBusy('mail', false);
+    }
+  }
+
+  async function pollEmailReceiveTest() {
+    stopEmailReceivePolling();
+    const testId = state.emailReceive.testId;
+    if (!testId) return;
+    try {
+      const payload = await requestJson(`/api/config/email/receive-test/${encodeURIComponent(testId)}`);
+      const test = payload.test || {};
+      renderEmailReceiveTest(test);
+      const terminal = EMAIL_RECEIVE_TERMINAL.has(String(test.status || ''));
+      if (terminal) {
+        state.emailReceive.running = false;
+        state.emailReceive.testId = '';
+        saveSessionValue(EMAIL_RECEIVE_SESSION_KEY, '');
+        syncMailControls(test);
+        return;
+      }
+      scheduleEmailReceivePoll();
+    } catch (error) {
+      state.emailReceive.running = false;
+      state.emailReceive.testId = '';
+      saveSessionValue(EMAIL_RECEIVE_SESSION_KEY, '');
+      setEmailReceiveMessage(`读取测试状态失败：${safeErrorMessage(error)}`, 'error');
+      syncMailControls();
+    }
+  }
+
+  async function cancelEmailReceiveTest() {
+    const testId = state.emailReceive.testId;
+    if (!testId || state.emailReceive.cancelRequested) return;
+    state.emailReceive.cancelRequested = true;
+    syncMailControls();
+    try {
+      const payload = await requestJson(`/api/config/email/receive-test/${encodeURIComponent(testId)}/cancel`, {
+        method: 'POST',
+      });
+      renderEmailReceiveTest(payload.test || {});
+      setEmailReceiveMessage('已请求取消，正在安全清理测试邮箱…');
+      scheduleEmailReceivePoll(300);
+    } catch (error) {
+      state.emailReceive.cancelRequested = false;
+      setEmailReceiveMessage(`取消失败：${safeErrorMessage(error)}`, 'error');
+      syncMailControls();
+    }
   }
 
   function registrationPayload() {
@@ -722,6 +1368,7 @@
       loadBrowserConfig(),
       loadCredentialSummary(),
       loadEmailSummary(),
+      loadCpaStatus(),
     ]);
     const failures = results.filter((result) => result.status === 'rejected');
     if (failures.length) showToast(`有 ${failures.length} 项状态暂时无法加载`, 'error');
@@ -729,6 +1376,9 @@
       state.pollTimer = window.setInterval(() => {
         loadJobStatus({ silent: true }).catch(() => {});
       }, 2000);
+    }
+    if (state.emailReceive.testId) {
+      pollEmailReceiveTest().catch(() => {});
     }
   }
 
@@ -743,6 +1393,22 @@
     document.getElementById('stop-registration')?.addEventListener('click', stopRegistration);
     document.getElementById('save-browser-settings')?.addEventListener('click', saveBrowserSettings);
     document.getElementById('browser-engine')?.addEventListener('change', syncRegistrationControls);
+    document.getElementById('email-provider')?.addEventListener('change', showSelectedMailProvider);
+    document.getElementById('email-save')?.addEventListener('click', saveEmailConfig);
+    document.getElementById('email-connection-test')?.addEventListener('click', testEmailConnection);
+    document.getElementById('email-receive-test-open')?.addEventListener('click', openEmailReceiveTest);
+    document.getElementById('email-receive-start')?.addEventListener('click', startEmailReceiveTest);
+    document.getElementById('email-receive-cancel')?.addEventListener('click', cancelEmailReceiveTest);
+    document.getElementById('email-receive-close')?.addEventListener('click', closeEmailReceiveDialog);
+    const emailReceiveDialog = document.getElementById('email-receive-dialog');
+    emailReceiveDialog?.addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeEmailReceiveDialog();
+    });
+    emailReceiveDialog?.addEventListener('close', stopEmailReceivePolling);
+    document.getElementById('credentials-save')?.addEventListener('click', saveCredentialDirectory);
+    document.getElementById('credentials-migrate')?.addEventListener('click', migrateCredentialDirectory);
+    document.getElementById('cpa-backfill')?.addEventListener('click', backfillCpa);
     document.getElementById('accounts-search')?.addEventListener('input', (event) => {
       window.clearTimeout(state.accounts.searchTimer);
       state.accounts.searchTimer = window.setTimeout(() => {

@@ -310,3 +310,148 @@ def test_v2_credential_import_captures_file_before_disabling_form_controls():
     )[0]
 
     assert importer.index("new FormData") < importer.index("setBusy('accounts', true)")
+
+
+def test_v2_mail_contains_every_supported_provider_and_common_actions(
+    isolated_v2_panel,
+):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+
+    for provider in (
+        "cfworker",
+        "cloudflare_temp_email",
+        "moemail",
+        "tempmail_lol",
+        "duckmail",
+        "gptmail",
+        "maliapi",
+        "luckmail",
+        "skymail",
+        "cloudmail",
+        "freemail",
+        "opentrashmail",
+        "laoudo",
+    ):
+        assert f'data-mail-provider="{provider}"' in html
+    for control_id in (
+        "email-provider",
+        "email-failover",
+        "email-save",
+        "email-connection-test",
+        "email-receive-test-open",
+        "mail-test-sender-mode",
+        "mail-test-timeout-sec",
+        "mail-test-smtp-host",
+        "mail-test-smtp-port",
+        "mail-test-smtp-security",
+        "mail-test-smtp-username",
+        "mail-test-smtp-password",
+        "mail-test-smtp-from",
+        "mail-test-direct-mx-enabled",
+    ):
+        assert f'id="{control_id}"' in html
+
+
+def test_v2_mail_includes_all_current_provider_configuration_fields(
+    isolated_v2_panel,
+):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+    fields = (
+        "cfworker_api_url", "cfworker_admin_token", "cfworker_domain",
+        "cfworker_custom_auth", "cfworker_subdomain", "cloudflare_api_base",
+        "cloudflare_admin_password", "cloudflare_domain", "cloudflare_site_password",
+        "moemail_api_url", "moemail_api_key", "duckmail_api_url",
+        "duckmail_provider_url", "duckmail_bearer", "duckmail_api_key",
+        "duckmail_domain", "gptmail_base_url", "gptmail_api_key", "gptmail_domain",
+        "maliapi_base_url", "maliapi_api_key", "maliapi_domain",
+        "luckmail_base_url", "luckmail_api_key", "luckmail_project_code",
+        "luckmail_domain", "skymail_api_base", "skymail_token", "skymail_domain",
+        "cloudmail_api_base", "cloudmail_admin_email", "cloudmail_admin_password",
+        "cloudmail_domain", "freemail_api_url", "freemail_admin_token",
+        "freemail_username", "freemail_password", "freemail_domain",
+        "freemail_use_environment", "opentrashmail_api_url", "opentrashmail_domain",
+        "opentrashmail_password", "laoudo_auth", "laoudo_email", "laoudo_account_id",
+    )
+
+    for field in fields:
+        assert f'id="{field}"' in html
+    assert 'value="template-secret-canary"' not in html
+    assert 'value="template-freemail-secret-canary"' not in html
+
+
+def test_v2_mail_uses_redacted_save_and_complete_receive_test_contracts():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    for endpoint in (
+        "/api/v2/config/email",
+        "/api/v2/config/email/test",
+        "/api/config/email/test-capabilities",
+        "/api/config/email/receive-test",
+        "/cancel",
+    ):
+        assert endpoint in source
+    assert "EMAIL_SECRET_FIELDS" in source
+    builder = source.split("function buildEmailPayload", 1)[1].split(
+        "async function saveEmailConfig", 1
+    )[0]
+    assert "if (value) payload[field] = value" in builder
+    assert "localStorage" not in builder
+
+
+def test_v2_mail_receive_test_uses_accessible_progress_dialog(isolated_v2_panel):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+
+    assert '<dialog id="email-receive-dialog"' in html
+    assert 'aria-labelledby="email-receive-title"' in html
+    for element_id in (
+        "email-receive-provider",
+        "email-receive-sender",
+        "email-receive-address",
+        "email-receive-timeline",
+        "email-receive-message",
+        "email-receive-start",
+        "email-receive-cancel",
+        "email-receive-close",
+    ):
+        assert f'id="{element_id}"' in html
+
+
+def test_v2_credentials_exposes_storage_migration_and_cpa_controls(
+    isolated_v2_panel,
+):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+
+    for element_id in (
+        "credentials-dir",
+        "credentials-save",
+        "credentials-migrate",
+        "credentials-resolved-path",
+        "credentials-writable",
+        "credentials-sso-files",
+        "credentials-mail-files",
+        "credentials-cpa-files",
+        "credentials-total-files",
+        "credentials-total-bytes",
+        "credentials-legacy-files",
+        "cpa-status",
+        "cpa-backfill-limit",
+        "cpa-backfill",
+    ):
+        assert f'id="{element_id}"' in html
+
+
+def test_v2_credentials_javascript_reuses_existing_safe_contracts():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    for endpoint in (
+        "/api/config/credentials",
+        "/api/config/credentials/migrate",
+        "/api/cpa/status",
+        "/api/cpa/backfill",
+    ):
+        assert endpoint in source
+    assert "formatBytes" in source
+    assert "confirmAction" in source
+    assert "setBusy('credentials'" in source

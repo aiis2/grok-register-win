@@ -137,3 +137,76 @@ def test_v2_email_config_uses_existing_api_login_guard(
 
     assert response.status_code == 401
     assert response.get_json() == {"ok": False, "error": "unauthorized"}
+
+
+def test_v2_email_save_retains_omitted_secret_and_returns_redacted_projection(
+    isolated_email_config,
+):
+    secret = "saved-secret-must-not-return"
+    isolated_email_config.write_text(
+        json.dumps(
+            {
+                "email_provider": "gptmail",
+                "gptmail_base_url": "https://old.example.test",
+                "gptmail_api_key": secret,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/v2/config/email",
+        json={
+            "provider": "gptmail",
+            "email_failover": True,
+            "gptmail_base_url": "https://new.example.test",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["email"]["values"]["gptmail_base_url"] == (
+        "https://new.example.test"
+    )
+    assert payload["email"]["configured"]["gptmail_api_key"] is True
+    assert secret not in response.get_data(as_text=True)
+    saved = json.loads(isolated_email_config.read_text(encoding="utf-8"))
+    assert saved["gptmail_api_key"] == secret
+
+
+def test_v2_cloudflare_connection_test_uses_saved_secret_without_returning_it(
+    isolated_email_config, monkeypatch
+):
+    secret = "cloudflare-connection-secret-canary"
+    isolated_email_config.write_text(
+        json.dumps(
+            {
+                "email_provider": "cloudflare_temp_email",
+                "cloudflare_api_base": "https://mail.example.test",
+                "cloudflare_admin_password": secret,
+                "cloudflare_domain": "example.test",
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_probe(config):
+        captured.update(config)
+        return {"ok": True, "message": "连接成功"}
+
+    monkeypatch.setattr(panel_app, "probe_cloudflare_temp_email", fake_probe)
+
+    response = panel_app.app.test_client().post(
+        "/api/v2/config/email/test",
+        json={
+            "provider": "cloudflare_temp_email",
+            "cloudflare_api_base": "https://mail.example.test",
+            "cloudflare_domain": "example.test",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["cloudflare_admin_password"] == secret
+    assert secret not in response.get_data(as_text=True)
