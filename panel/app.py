@@ -4785,7 +4785,7 @@ def index():
     need = require_login()
     if need:
         return need
-    if request.args.get("ui", "").strip().lower() == "modern":
+    if request.args.get("ui", "").strip().lower() != "legacy":
         return render_template("index_v2.html")
     files_meta = []
     total = 0

@@ -31,7 +31,7 @@ def isolated_v2_panel(tmp_path, monkeypatch):
     return app_root
 
 
-def test_modern_query_renders_v2_while_default_and_legacy_stay_classic(
+def test_default_and_modern_render_v2_while_legacy_stays_classic(
     isolated_v2_panel,
 ):
     client = panel_app.app.test_client()
@@ -42,10 +42,10 @@ def test_modern_query_renders_v2_while_default_and_legacy_stay_classic(
     legacy_html = client.get("/?ui=legacy").get_data(as_text=True)
 
     assert modern_response.status_code == 200
+    assert 'data-panel-version="2"' in default_html
     assert 'data-panel-version="2"' in modern_html
-    assert 'data-panel-version="2"' not in default_html
     assert 'data-panel-version="2"' not in legacy_html
-    assert 'id="register_concurrency"' in default_html
+    assert 'id="register-concurrency"' in default_html
     assert 'id="register_concurrency"' in legacy_html
 
 

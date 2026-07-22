@@ -118,8 +118,8 @@ def test_documentation_describes_hidden_headed_release():
         assert phrase in release
 
 
-def test_index_renders_saved_registration_concurrency(isolated_config):
-    response = panel_app.app.test_client().get("/")
+def test_legacy_index_renders_saved_registration_concurrency(isolated_config):
+    response = panel_app.app.test_client().get("/?ui=legacy")
 
     assert response.status_code == 200
     html = response.get_data(as_text=True)
