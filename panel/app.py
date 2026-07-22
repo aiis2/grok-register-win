@@ -1344,9 +1344,7 @@ def _cpa_worker_loop():
                 if old_fp and old_fp != fp:
                     fname = f"xai-{cpa_safe_filename(email_out)}-{fp[:8]}.json"
                     path = cpa_paths.directory / fname
-            path.write_text(
-                json.dumps(entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
+            _write_json_atomic(path, entry)
             save_cpa_index_item(
                 fp,
                 {
