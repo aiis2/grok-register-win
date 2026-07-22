@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN" data-panel-version="2" data-theme="light" data-theme-preference="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Grok Register · 控制台</title>
+  <script>
+    (() => {
+      const key = 'panel-v2-theme';
+      const allowed = ['system', 'light', 'dark'];
+      let preference = 'system';
+      try {
+        const saved = localStorage.getItem(key);
+        if (allowed.includes(saved)) preference = saved;
+      } catch (_) {}
+      const resolved = preference === 'system'
+        ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        : preference;
+      document.documentElement.dataset.theme = resolved;
+      document.documentElement.dataset.themePreference = preference;
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/panel-v2.css">
+</head>
+<body>
+  <a class="skip-link" href="#panel-main">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="#overview" aria-label="Grok Register 概览">
+        <span class="brand__mark" aria-hidden="true">GR</span>
+        <span class="brand__copy">
+          <strong>Grok Register</strong>
+          <small>本地注册控制台</small>
+        </span>
+      </a>
+
+      <div class="topbar__actions">
+        <span class="task-chip" id="global-task-status" data-state="idle">
+          <span class="task-chip__dot" aria-hidden="true"></span>
+          <span id="global-task-label">任务空闲</span>
+        </span>
+        <label class="theme-control" for="theme-toggle">
+          <span>主题</span>
+          <select id="theme-toggle" aria-label="界面主题">
+            <option value="system">跟随系统</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
+        <a class="button button--ghost" href="/?ui=legacy">经典界面</a>
+      </div>
+    </div>
+
+    <nav class="section-nav" aria-label="主导航">
+      <div class="section-nav__inner">
+        <a href="#overview" data-section-link="overview">概览</a>
+        <a href="#register" data-section-link="register">注册</a>
+        <a href="#accounts" data-section-link="accounts">账号</a>
+        <a href="#mail" data-section-link="mail">邮箱</a>
+        <a href="#credentials" data-section-link="credentials">凭据</a>
+        <a href="#logs" data-section-link="logs">日志</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="panel-main" class="app-shell" tabindex="-1">
+    <section id="section-overview" class="panel-section" data-section="overview">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Workspace</p>
+          <h1>运行概览</h1>
+          <p>快速确认注册状态、账号产出和凭据转换进度。</p>
+        </div>
+        <a class="button button--primary" href="#register">开始一轮注册</a>
+      </div>
+      <div class="metric-grid" aria-label="运行指标">
+        <article class="metric-card"><span>任务状态</span><strong id="metric-job-state">空闲</strong><small>等待启动</small></article>
+        <article class="metric-card"><span>成功 / 失败</span><strong id="metric-outcomes">0 / 0</strong><small>当前任务</small></article>
+        <article class="metric-card"><span>有效并发</span><strong id="metric-concurrency">0</strong><small>独立浏览器</small></article>
+        <article class="metric-card"><span>CPA 凭据</span><strong id="metric-cpa">0</strong><small>可用账号</small></article>
+      </div>
+      <div class="content-grid content-grid--overview">
+        <article class="surface-card">
+          <div class="card-heading"><div><span class="eyebrow">Progress</span><h2>当前进度</h2></div></div>
+          <div class="empty-state" id="overview-progress-empty"><span aria-hidden="true">◎</span><strong>尚未运行任务</strong><p>进入注册页设置轮数、并发和浏览器模式。</p></div>
+        </article>
+        <article class="surface-card">
+          <div class="card-heading"><div><span class="eyebrow">Attention</span><h2>最近异常</h2></div><a href="#logs">查看日志</a></div>
+          <div class="empty-state empty-state--compact" id="overview-error-empty"><strong>没有待处理异常</strong><p>任务错误会在这里显示脱敏摘要。</p></div>
+        </article>
+      </div>
+    </section>
+
+    <section id="section-register" class="panel-section" data-section="register" hidden>
+      <div class="section-heading"><div><p class="eyebrow">Registration</p><h1>注册任务</h1><p>配置任务并管理每个并发槽的独立浏览器。</p></div></div>
+      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">↗</span><strong>注册控制即将就绪</strong><p>该区域会接入现有任务、浏览器和 Worker API。</p></div></div>
+    </section>
+
+    <section id="section-accounts" class="panel-section" data-section="accounts" hidden>
+      <div class="section-heading"><div><p class="eyebrow">Accounts</p><h1>账号工作区</h1><p>按邮箱、来源和凭据状态检索账号，管理批次文件。</p></div></div>
+      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">⌕</span><strong>账号目录按需加载</strong><p>进入该区域后才会请求安全分页接口。</p></div></div>
+    </section>
+
+    <section id="section-mail" class="panel-section" data-section="mail" hidden>
+      <div class="section-heading"><div><p class="eyebrow">Mail</p><h1>邮箱服务</h1><p>配置收件服务并执行连接和端到端验证码测试。</p></div></div>
+      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">✉</span><strong>邮箱配置安全加载</strong><p>已保存的密钥只显示配置状态，不会返回页面。</p></div></div>
+    </section>
+
+    <section id="section-credentials" class="panel-section" data-section="credentials" hidden>
+      <div class="section-heading"><div><p class="eyebrow">Credentials</p><h1>凭据存储</h1><p>查看目录容量、迁移账号工作区并管理 CPA 转换。</p></div></div>
+      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">◇</span><strong>凭据状态准备加载</strong><p>迁移和替换操作会继续使用后端互斥保护。</p></div></div>
+    </section>
+
+    <section id="section-logs" class="panel-section" data-section="logs" hidden>
+      <div class="section-heading"><div><p class="eyebrow">Live stream</p><h1>实时日志</h1><p>增量查看任务日志，支持暂停、过滤和断线续传。</p></div></div>
+      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">_</span><strong>日志流尚未连接</strong><p>进入该区域后会建立本地 SSE 连接。</p></div></div>
+    </section>
+  </main>
+
+  <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <noscript>
+    <div class="noscript-banner">新版界面需要 JavaScript。<a href="/?ui=legacy">切换到经典界面</a></div>
+  </noscript>
+
+  <footer class="page-footer">
+    <span>本地面板 · 配置不会上传</span>
+    <a href="/?ui=legacy">切换到经典界面</a>
+  </footer>
+  <script src="/static/panel-v2.js" defer></script>
+</body>
+</html>

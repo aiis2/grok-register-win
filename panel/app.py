@@ -48,6 +48,7 @@ from flask import (
     Response,
     jsonify,
     redirect,
+    render_template,
     render_template_string,
     request,
     send_file,
@@ -4784,6 +4785,8 @@ def index():
     need = require_login()
     if need:
         return need
+    if request.args.get("ui", "").strip().lower() == "modern":
+        return render_template("index_v2.html")
     files_meta = []
     total = 0
     for p in list_account_files():
