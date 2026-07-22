@@ -321,6 +321,52 @@ def test_find_window_selects_only_chrome_top_level_window_for_exact_pid():
     assert controller.find_window_for_pid(7777) == 0
 
 
+def test_find_window_prefers_real_chromium_main_window_over_internal_window():
+    api = FakeWindowApi(
+        hwnd_pid={701: 9001, 702: 9001, 703: 7777},
+        class_names={
+            701: "Chrome_WidgetWin_0",
+            702: "Chrome_WidgetWin_1",
+            703: "Chrome_WidgetWin_1",
+        },
+        visible={701: False, 702: True, 703: True},
+        ex_styles={701: WS_EX_TOOLWINDOW, 702: 0, 703: 0},
+        windows=[701, 703, 702],
+        window_rects={
+            701: (0, 0, 0, 0),
+            702: (-32000, -32000, -31801, -31966),
+            703: (0, 0, 900, 700),
+        },
+    )
+    controller = WindowsBrowserWindowController(api=api)
+
+    assert controller.find_window_for_pid(9001) == 702
+
+
+def test_find_window_falls_back_to_largest_visible_non_tool_chromium_window():
+    api = FakeWindowApi(
+        hwnd_pid={701: 9001, 702: 9001, 703: 9001, 704: 7777},
+        class_names={
+            701: "Chrome_WidgetWin_0",
+            702: "Chrome_WidgetWin_2",
+            703: "Chrome_WidgetWin_3",
+            704: "Chrome_WidgetWin_1",
+        },
+        visible={701: False, 702: True, 703: True, 704: True},
+        ex_styles={701: WS_EX_TOOLWINDOW, 702: 0, 703: 0, 704: 0},
+        windows=[701, 702, 704, 703],
+        window_rects={
+            701: (0, 0, 0, 0),
+            702: (0, 0, 400, 300),
+            703: (0, 0, 900, 700),
+            704: (0, 0, 1200, 900),
+        },
+    )
+    controller = WindowsBrowserWindowController(api=api)
+
+    assert controller.find_window_for_pid(9001) == 703
+
+
 class FakeProcess:
     def __init__(self, pid=9300):
         self.pid = pid

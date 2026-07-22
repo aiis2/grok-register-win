@@ -707,21 +707,45 @@ class WindowsBrowserWindowController:
             )
         return None
 
-    def find_window_for_pid(self, pid: int) -> int:
+    def find_windows_for_pid(self, pid: int) -> list[int]:
         owner_pid = int(pid or 0)
         if not owner_pid:
-            return 0
+            return []
+        candidates: list[tuple[tuple[int, int, int, int], int]] = []
         for hwnd in self.api.enum_windows():
             try:
-                if (
-                    self.api.is_window(hwnd)
-                    and self.api.window_pid(hwnd) == owner_pid
-                    and self.api.class_name(hwnd).startswith("Chrome_WidgetWin_")
-                ):
-                    return int(hwnd)
+                if not self.api.is_window(hwnd):
+                    continue
+                if self.api.window_pid(hwnd) != owner_pid:
+                    continue
+                class_name = self.api.class_name(hwnd)
+                if not class_name.startswith("Chrome_WidgetWin_"):
+                    continue
+                style = self.api.get_ex_style(hwnd)
+                visible = bool(self.api.is_window_visible(hwnd))
+                tool_window = bool(style & WS_EX_TOOLWINDOW)
+                left, top, right, bottom = self.api.window_rect(hwnd)
+                area = max(0, int(right) - int(left)) * max(
+                    0, int(bottom) - int(top)
+                )
+                is_main_window = class_name == "Chrome_WidgetWin_1"
+                if not is_main_window and (not visible or tool_window or area <= 0):
+                    continue
+                rank = (
+                    0 if is_main_window else 1,
+                    0 if visible and not tool_window else 1,
+                    -area,
+                    int(hwnd),
+                )
+                candidates.append((rank, int(hwnd)))
             except Exception:
                 continue
-        return 0
+        candidates.sort(key=lambda item: item[0])
+        return [hwnd for _rank, hwnd in candidates]
+
+    def find_window_for_pid(self, pid: int) -> int:
+        candidates = self.find_windows_for_pid(pid)
+        return candidates[0] if candidates else 0
 
     def hide(self, ref: BrowserWindowRef) -> WindowControlResult:
         invalid = self._validate(ref)
