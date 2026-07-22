@@ -1208,8 +1208,10 @@ def enqueue_cpa_convert(
     fp = sso_fingerprint(sso)
     with _credential_import_lock:
         with _cpa_lock:
-            if not force and (fp in _cpa_done or fp in _cpa_inflight):
-                return False, "already converted or queued"
+            if fp in _cpa_inflight:
+                return False, "already queued"
+            if not force and fp in _cpa_done:
+                return False, "already converted"
             generation = _cpa_workspace_generation
             _cpa_inflight.add(fp)
             _cpa_state["pending"] = int(_cpa_state.get("pending") or 0) + 1
@@ -1257,6 +1259,32 @@ def enqueue_missing_accounts(limit: int = 500) -> int:
                 sso=acc.get("sso") or "",
                 password=acc.get("password") or "",
                 source=acc.get("source") or "",
+            )
+            if ok:
+                n += 1
+    return n
+
+
+def enqueue_all_sso_refresh(limit: int = 10000) -> int:
+    """Queue a fresh CPA exchange for each available Web SSO credential."""
+    try:
+        safe_limit = max(1, min(int(limit), 10000))
+    except (TypeError, ValueError):
+        safe_limit = 10000
+    with _credential_import_lock:
+        n = 0
+        for acc in unique_accounts():
+            if n >= safe_limit:
+                break
+            sso = normalize_sso(acc.get("sso") or "")
+            if not sso:
+                continue
+            ok, _ = enqueue_cpa_convert(
+                email=acc.get("email") or "",
+                sso=sso,
+                password=acc.get("password") or "",
+                source=acc.get("source") or "",
+                force=True,
             )
             if ok:
                 n += 1
