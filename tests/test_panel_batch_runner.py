@@ -615,6 +615,91 @@ def test_worker_assignments_run_at_the_same_time_and_keep_all_results():
     ) == list(range(1, 7))
 
 
+def test_thousand_round_ten_worker_soak_bounds_logs_and_keeps_all_results(
+    tmp_path, monkeypatch
+):
+    fresh_job = {
+        "running": False,
+        "stop": False,
+        "status": "idle",
+        "success": 0,
+        "fail": 0,
+        "outcomes": {},
+        "workers": {},
+        "log_path": str(tmp_path / "soak.log"),
+    }
+    monkeypatch.setattr(panel_app, "_job", fresh_job)
+    monkeypatch.setattr(panel_app, "_logs", panel_app.deque(maxlen=2000))
+    monkeypatch.setattr(
+        panel_app, "_log_events", panel_app.SequencedLogBuffer(maxlen=2000)
+    )
+    monkeypatch.setattr(panel_app, "_procs", {})
+    monkeypatch.setattr(panel_app, "_terminated_processes", set())
+    monkeypatch.setattr(panel_app, "resolve_proxy_url", lambda: "http://127.0.0.1:7897")
+    monkeypatch.setattr(panel_app, "clash_exit_ip", lambda: "synthetic-soak")
+    monkeypatch.setattr(panel_app, "load_config", lambda: {})
+    monkeypatch.setattr(panel_app, "save_config", lambda _cfg: None)
+    monkeypatch.setattr(panel_app, "terminate_all_worker_processes", lambda: None)
+
+    barrier = threading.Barrier(10)
+    active_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    def fake_run_worker_assignment(assignment, *, total):
+        nonlocal active, peak_active
+        assert total == 1000
+        with active_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        barrier.wait(timeout=5)
+        outcomes = []
+        for index in range(
+            assignment.start_index,
+            assignment.start_index + assignment.batch_count,
+        ):
+            panel_app.log_line(f"[SOAK][W{assignment.worker_id}] round={index} start")
+            panel_app.log_line(f"[SOAK][W{assignment.worker_id}] round={index} progress")
+            assert panel_app.record_job_result(
+                index, "success", worker_id=assignment.worker_id
+            )
+            panel_app.log_line(f"[SOAK][W{assignment.worker_id}] round={index} success")
+            outcomes.append((index, "success"))
+        with panel_app._job_lock:
+            panel_app._job["workers"][str(assignment.worker_id)]["status"] = "completed"
+        with active_lock:
+            active -= 1
+        return {
+            "worker_id": assignment.worker_id,
+            "outcomes": outcomes,
+            "stopped": False,
+            "timed_out": False,
+            "fatal": False,
+        }
+
+    monkeypatch.setattr(
+        panel_app, "run_worker_assignment", fake_run_worker_assignment
+    )
+
+    panel_app.job_worker(1000, concurrency=10)
+
+    assert peak_active == 10
+    assert panel_app._job["running"] is False
+    assert panel_app._job["status"] == "idle"
+    assert panel_app._job["success"] == 1000
+    assert panel_app._job["fail"] == 0
+    assert sorted(int(index) for index in panel_app._job["outcomes"]) == list(
+        range(1, 1001)
+    )
+    assert len(panel_app._logs) == 2000
+    assert len(panel_app._log_events.after(0)) == 2000
+    assert panel_app._log_events.latest_sequence >= 3000
+    assert all(
+        worker["status"] == "completed"
+        for worker in panel_app._job["workers"].values()
+    )
+
+
 def test_worker_process_registry_tracks_unique_pids_and_stops_each_once(monkeypatch):
     monkeypatch.setattr(panel_app, "_procs", {})
     monkeypatch.setitem(panel_app._job, "workers", {})
