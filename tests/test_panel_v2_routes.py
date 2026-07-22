@@ -520,6 +520,47 @@ def test_v2_logs_exposes_live_controls_and_accessible_output(isolated_v2_panel):
     assert 'aria-live="polite"' in html
 
 
+def test_v2_combines_registration_and_logs_in_one_navigation_section(
+    isolated_v2_panel,
+):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+
+    assert 'data-section-link="register">注册与日志</a>' in html
+    assert 'data-section-link="logs"' not in html
+    assert 'id="section-logs"' not in html
+    register_section = html.split('id="section-register"', 1)[1].split(
+        "</section>", 1
+    )[0]
+    assert register_section.index('id="registration-form"') < register_section.index(
+        'id="logs-output"'
+    )
+    assert 'id="registration-log-console"' in register_section
+    assert 'id="logs-load-older"' in register_section
+    assert 'id="logs-show-latest"' in register_section
+
+
+def test_v2_log_rendering_is_bounded_scheduled_and_backwards_compatible():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    for marker in (
+        "const LOG_VISIBLE_STEP = 300",
+        "const LOG_RENDER_INTERVAL_MS = 100",
+        "const LOG_SEARCH_DEBOUNCE_MS = 180",
+        "function scheduleLogRender",
+        "function loadOlderLogs",
+        "function showLatestLogs",
+        "requested === 'logs'",
+    ):
+        assert marker in source
+
+    append_logic = source.split("function appendLogEvent", 1)[1].split(
+        "function handleLogEvent", 1
+    )[0]
+    assert "scheduleLogRender" in append_logic
+    assert "renderLogs()" not in append_logic
+
+
 def test_v2_logs_uses_resumable_sse_deduplication_and_polling_fallback():
     root = Path(panel_app.__file__).resolve().parent
     source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
