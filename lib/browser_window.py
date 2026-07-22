@@ -298,6 +298,7 @@ def bootstrap_hidden_chromium(
     executable_resolver=None,
     startupinfo_builder=None,
     timeout: float = 10.0,
+    settle_time: float = 0.25,
     monotonic=time.monotonic,
     sleep=time.sleep,
 ) -> HiddenLaunchResult:
@@ -381,18 +382,59 @@ def bootstrap_hidden_chromium(
             raise RuntimeError("Target.createTarget returned no target id")
 
         hwnd = 0
-        while monotonic() < deadline:
-            hwnd = int(controller.find_window_for_pid(launcher_pid) or 0)
-            if hwnd:
+        hidden_hwnds: set[int] = set()
+        settle_deadline = None
+        settle_seconds = max(0.0, float(settle_time))
+        find_windows = getattr(controller, "find_windows_for_pid", None)
+        while True:
+            now = monotonic()
+            if not hidden_hwnds and now >= deadline:
+                break
+            settling_expired = bool(
+                hidden_hwnds
+                and settle_deadline is not None
+                and now >= settle_deadline
+            )
+            if callable(find_windows):
+                candidates = [
+                    int(item or 0)
+                    for item in (find_windows(launcher_pid) or [])
+                    if int(item or 0)
+                ]
+            else:
+                candidate = int(controller.find_window_for_pid(launcher_pid) or 0)
+                candidates = [candidate] if candidate else []
+            for candidate in candidates:
+                if candidate in hidden_hwnds:
+                    continue
+                hidden = controller.hide(
+                    BrowserWindowRef(
+                        pid=launcher_pid,
+                        hwnd=candidate,
+                        mode=WINDOW_MODE_HIDDEN,
+                    )
+                )
+                if not hidden.ok:
+                    raise RuntimeError("Chromium native window could not be hidden")
+                hidden_hwnds.add(candidate)
+                if settle_deadline is None:
+                    settle_deadline = monotonic() + settle_seconds
+            if candidates:
+                preferred = next(
+                    (candidate for candidate in candidates if candidate in hidden_hwnds),
+                    0,
+                )
+                if preferred:
+                    hwnd = preferred
+            if settling_expired or (
+                hidden_hwnds
+                and settle_deadline is not None
+                and monotonic() >= settle_deadline
+            ):
                 break
             sleep(0.01)
         if not hwnd:
             raise RuntimeError("Chromium native window was not found")
-        hidden = controller.hide(
-            BrowserWindowRef(pid=launcher_pid, hwnd=hwnd, mode=WINDOW_MODE_HIDDEN)
-        )
-        if not hidden.ok:
-            raise RuntimeError("Chromium native window could not be hidden")
         return HiddenLaunchResult(
             process=process,
             launcher_pid=launcher_pid,

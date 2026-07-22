@@ -402,6 +402,33 @@ class FakeBootstrapController:
         return WindowControlResult(True, "hidden")
 
 
+class SequencedBootstrapController(FakeBootstrapController):
+    def __init__(self, window_sequences):
+        super().__init__(hwnd=0)
+        self.window_sequences = [list(items) for items in window_sequences]
+        self.find_calls = 0
+
+    def find_windows_for_pid(self, pid):
+        index = min(self.find_calls, len(self.window_sequences) - 1)
+        self.find_calls += 1
+        return list(self.window_sequences[index])
+
+    def find_window_for_pid(self, pid):
+        windows = self.find_windows_for_pid(pid)
+        return windows[0] if windows else 0
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0.001, float(seconds))
+
+
 def test_silent_bootstrap_creates_headed_background_minimized_window():
     process = FakeProcess()
     websocket = FakeWebSocket()
@@ -460,6 +487,35 @@ def test_silent_bootstrap_creates_headed_background_minimized_window():
     )
     assert controller.hidden_refs[0].pid == 9300
     assert controller.hidden_refs[0].hwnd == 701
+
+
+def test_silent_bootstrap_hides_delayed_replacement_main_window():
+    process = FakeProcess()
+    websocket = FakeWebSocket()
+    controller = SequencedBootstrapController(
+        [[701], [701], [702], [702], [702], [702]]
+    )
+    clock = FakeClock()
+
+    result = bootstrap_hidden_chromium(
+        port=19226,
+        browser_path="chrome.exe",
+        arguments=["--user-data-dir=X"],
+        controller=controller,
+        popen=lambda *_args, **_kwargs: process,
+        version_reader=lambda _port: {
+            "webSocketDebuggerUrl": "ws://127.0.0.1:19226/devtools/browser/id"
+        },
+        websocket_factory=lambda _url: websocket,
+        executable_resolver=lambda value: value,
+        settle_time=0.05,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert [ref.hwnd for ref in controller.hidden_refs] == [701, 702]
+    assert result.hwnd == 702
+    assert clock.now <= 0.06
 
 
 def test_silent_bootstrap_passes_hidden_startup_info_to_popen():
