@@ -246,6 +246,9 @@ class AccountCatalog:
                 "total": total,
                 "total_pages": total_pages,
             },
+            "summary": {
+                "total_accounts": len(snapshot.accounts),
+            },
             "filters": {
                 "sources": [item.name for item in snapshot.sources],
             },

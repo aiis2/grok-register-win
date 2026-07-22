@@ -3,6 +3,7 @@
 
   const THEME_KEY = 'panel-v2-theme';
   const SECTION_KEY = 'panel-v2-section';
+  const ACCOUNT_PAGE_SIZE_KEY = 'panel-v2-account-page-size';
   const DEFAULT_SECTION_HASH = '#overview';
   const THEMES = new Set(['system', 'light', 'dark']);
   const SECTIONS = new Set([
@@ -23,6 +24,22 @@
     pollTimer: null,
     confirmResolver: null,
     confirmFocus: null,
+    accounts: {
+      loaded: false,
+      loading: false,
+      page: 1,
+      pageSize: 25,
+      q: '',
+      source: 'all',
+      status: 'all',
+      sort: 'newest',
+      totalPages: 0,
+      files: [],
+      selectedFiles: new Set(),
+      controller: null,
+      requestGeneration: 0,
+      searchTimer: null,
+    },
   };
   const workerControlPending = new Set();
 
@@ -78,6 +95,7 @@
     if (updateHash && window.location.hash !== `#${next}`) {
       window.history.pushState(null, '', `#${next}`);
     }
+    if (next === 'accounts') ensureAccountsLoaded();
   }
 
   function setText(id, value) {
@@ -145,6 +163,7 @@
       control.disabled = active;
     });
     if (group === 'registration') syncRegistrationControls();
+    if (group === 'accounts') syncAccountControls();
   }
 
   function confirmAction({ title, message, acceptLabel = '确认' }) {
@@ -289,6 +308,257 @@
     } finally {
       workerControlPending.delete(pendingKey);
       renderWorkers(state.job?.workers || []);
+    }
+  }
+
+  function setAccountsError(message = '') {
+    const alert = document.getElementById('accounts-error');
+    if (!alert) return;
+    setText('accounts-error-text', message);
+    alert.hidden = !message;
+  }
+
+  function syncAccountControls() {
+    const accounts = state.accounts;
+    const busy = accounts.loading || state.busy.has('accounts');
+    const previous = document.getElementById('accounts-prev');
+    const next = document.getElementById('accounts-next');
+    const remove = document.getElementById('account-files-delete');
+    const selectAll = document.getElementById('account-files-select-all');
+    if (previous) previous.disabled = busy || accounts.page <= 1;
+    if (next) next.disabled = busy || accounts.totalPages === 0 || accounts.page >= accounts.totalPages;
+    if (remove) remove.disabled = busy || accounts.selectedFiles.size === 0;
+    if (selectAll) selectAll.disabled = busy || accounts.files.length === 0;
+  }
+
+  function updateAccountSources(sources = []) {
+    const select = document.getElementById('accounts-source');
+    if (!select) return;
+    const current = state.accounts.source;
+    const options = [createElement('option', '', '全部批次')];
+    options[0].value = 'all';
+    sources.forEach((source) => {
+      const option = createElement('option', '', source);
+      option.value = source;
+      options.push(option);
+    });
+    select.replaceChildren(...options);
+    state.accounts.source = sources.includes(current) ? current : 'all';
+    select.value = state.accounts.source;
+  }
+
+  function renderAccountRows(items = []) {
+    const body = document.getElementById('accounts-table-body');
+    const table = document.getElementById('accounts-table-wrap');
+    const empty = document.getElementById('accounts-empty');
+    if (!body || !table || !empty) return;
+    body.replaceChildren();
+    items.forEach((account) => {
+      const row = document.createElement('tr');
+      const email = document.createElement('td');
+      email.className = 'account-email';
+      email.textContent = account.email || '—';
+      const source = document.createElement('td');
+      source.className = 'table-muted';
+      source.textContent = account.source || '—';
+      const statusCell = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.className = 'status-badge';
+      badge.dataset.status = account.status === 'ready' ? 'ready' : 'pending';
+      badge.textContent = account.status === 'ready' ? 'CPA 就绪' : '待转换';
+      statusCell.append(badge);
+      const modified = document.createElement('td');
+      modified.className = 'table-muted';
+      modified.textContent = account.source_mtime || '—';
+      row.append(email, source, statusCell, modified);
+      body.append(row);
+    });
+    table.hidden = items.length === 0;
+    empty.hidden = items.length !== 0;
+  }
+
+  function renderAccountFiles(files = []) {
+    const body = document.getElementById('account-files-body');
+    const empty = document.getElementById('account-files-empty');
+    const selectAll = document.getElementById('account-files-select-all');
+    if (!body || !empty || !selectAll) return;
+    const availableNames = new Set(files.map((file) => file.name));
+    state.accounts.selectedFiles.forEach((name) => {
+      if (!availableNames.has(name)) state.accounts.selectedFiles.delete(name);
+    });
+    body.replaceChildren();
+    files.forEach((file) => {
+      const row = document.createElement('tr');
+      const checkboxCell = document.createElement('td');
+      checkboxCell.className = 'checkbox-cell';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = state.accounts.selectedFiles.has(file.name);
+      checkbox.setAttribute('aria-label', `选择 ${file.name}`);
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) state.accounts.selectedFiles.add(file.name);
+        else state.accounts.selectedFiles.delete(file.name);
+        renderAccountFiles(state.accounts.files);
+      });
+      checkboxCell.append(checkbox);
+
+      const name = document.createElement('td');
+      name.className = 'file-name';
+      name.textContent = file.name;
+      name.title = file.name;
+      const count = document.createElement('td');
+      count.className = 'table-muted';
+      count.textContent = String(file.count || 0);
+      const modified = document.createElement('td');
+      modified.className = 'table-muted';
+      modified.textContent = file.mtime || '—';
+      const actions = document.createElement('td');
+      actions.className = 'file-actions';
+      const encodedName = encodeURIComponent(file.name);
+      const preview = document.createElement('a');
+      preview.href = `/preview/${encodedName}`;
+      preview.target = '_blank';
+      preview.rel = 'noopener';
+      preview.textContent = '预览';
+      const download = document.createElement('a');
+      download.href = `/download/${encodedName}`;
+      download.textContent = '下载';
+      actions.append(preview, download);
+      row.append(checkboxCell, name, count, modified, actions);
+      body.append(row);
+    });
+    empty.hidden = files.length !== 0;
+    selectAll.checked = files.length > 0 && state.accounts.selectedFiles.size === files.length;
+    selectAll.indeterminate = state.accounts.selectedFiles.size > 0
+      && state.accounts.selectedFiles.size < files.length;
+    syncAccountControls();
+  }
+
+  async function loadAccounts() {
+    const accounts = state.accounts;
+    accounts.controller?.abort();
+    accounts.controller = new AbortController();
+    const requestGeneration = ++accounts.requestGeneration;
+    accounts.loading = true;
+    setBusy('accounts', true);
+    setAccountsError();
+    const params = new URLSearchParams({
+      page: String(accounts.page),
+      page_size: String(accounts.pageSize),
+      q: accounts.q,
+      source: accounts.source,
+      status: accounts.status,
+      sort: accounts.sort,
+    });
+    try {
+      const payload = await requestJson(`/api/v2/accounts?${params.toString()}`, {
+        signal: accounts.controller.signal,
+      });
+      if (requestGeneration !== accounts.requestGeneration) return;
+      const pagination = payload.pagination || {};
+      const totalPages = Number(pagination.total_pages || 0);
+      if (totalPages > 0 && accounts.page > totalPages) {
+        accounts.page = totalPages;
+        await loadAccounts();
+        return;
+      }
+      accounts.loaded = true;
+      accounts.totalPages = totalPages;
+      accounts.files = Array.isArray(payload.files) ? payload.files : [];
+      updateAccountSources(payload.filters?.sources || []);
+      renderAccountRows(Array.isArray(payload.items) ? payload.items : []);
+      renderAccountFiles(accounts.files);
+      setText('metric-accounts', Number(payload.summary?.total_accounts || 0));
+      setText('accounts-result-count', `${Number(pagination.total || 0)} 个账号`);
+      setText('accounts-page-label', totalPages
+        ? `第 ${accounts.page} / ${totalPages} 页`
+        : '第 0 / 0 页');
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      if (requestGeneration !== accounts.requestGeneration) return;
+      accounts.loaded = false;
+      setAccountsError(safeErrorMessage(error));
+    } finally {
+      if (requestGeneration === accounts.requestGeneration) {
+        accounts.loading = false;
+        setBusy('accounts', false);
+      }
+    }
+  }
+
+  function ensureAccountsLoaded() {
+    if (!state.accounts.loaded && !state.accounts.loading) {
+      loadAccounts().catch(() => {});
+    }
+  }
+
+  function resetAccountPageAndLoad() {
+    state.accounts.page = 1;
+    loadAccounts().catch(() => {});
+  }
+
+  async function deleteSelectedAccountFiles() {
+    const names = [...state.accounts.selectedFiles];
+    if (!names.length) return;
+    const accepted = await confirmAction({
+      title: `删除 ${names.length} 个账号批次？`,
+      message: '所选 TXT 文件将被删除；不再属于当前账号的 CPA 会移动到 archive。',
+      acceptLabel: '删除所选',
+    });
+    if (!accepted) return;
+    state.accounts.loading = true;
+    setBusy('accounts', true);
+    try {
+      const payload = await requestJson('/api/accounts/delete', {
+        method: 'POST',
+        body: { files: names },
+      });
+      state.accounts.selectedFiles.clear();
+      state.accounts.loaded = false;
+      showToast(payload.message || '账号批次已删除');
+      await loadAccounts();
+      await Promise.allSettled([loadJobStatus({ silent: true }), loadCredentialSummary()]);
+    } catch (error) {
+      setAccountsError(safeErrorMessage(error));
+    } finally {
+      state.accounts.loading = false;
+      setBusy('accounts', false);
+    }
+  }
+
+  async function importCredentials(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const file = document.getElementById('credential-import-file')?.files?.[0];
+    if (!file || !form.reportValidity()) return;
+    const accepted = await confirmAction({
+      title: '替换当前凭据工作区？',
+      message: `将导入 ${file.name}，当前账号和 CPA 会先归档，再激活新批次。`,
+      acceptLabel: '确认导入',
+    });
+    if (!accepted) return;
+    const data = new FormData(form);
+    state.accounts.loading = true;
+    setBusy('accounts', true);
+    try {
+      const payload = await requestJson('/api/credentials/import', {
+        method: 'POST',
+        body: data,
+      });
+      showToast(`已导入 ${payload.parsed || 0} 个账号，CPA 入队 ${payload.queued || 0}`);
+      form.reset();
+      state.accounts.selectedFiles.clear();
+      state.accounts.loaded = false;
+      await Promise.allSettled([
+        loadAccounts(),
+        loadJobStatus({ silent: true }),
+        loadCredentialSummary(),
+      ]);
+    } catch (error) {
+      setAccountsError(safeErrorMessage(error));
+    } finally {
+      state.accounts.loading = false;
+      setBusy('accounts', false);
     }
   }
 
@@ -473,6 +743,53 @@
     document.getElementById('stop-registration')?.addEventListener('click', stopRegistration);
     document.getElementById('save-browser-settings')?.addEventListener('click', saveBrowserSettings);
     document.getElementById('browser-engine')?.addEventListener('change', syncRegistrationControls);
+    document.getElementById('accounts-search')?.addEventListener('input', (event) => {
+      window.clearTimeout(state.accounts.searchTimer);
+      state.accounts.searchTimer = window.setTimeout(() => {
+        state.accounts.q = event.target.value.trim();
+        resetAccountPageAndLoad();
+      }, 250);
+    });
+    document.getElementById('accounts-source')?.addEventListener('change', (event) => {
+      state.accounts.source = event.target.value || 'all';
+      resetAccountPageAndLoad();
+    });
+    document.getElementById('accounts-status')?.addEventListener('change', (event) => {
+      state.accounts.status = event.target.value || 'all';
+      resetAccountPageAndLoad();
+    });
+    document.getElementById('accounts-sort')?.addEventListener('change', (event) => {
+      state.accounts.sort = event.target.value || 'newest';
+      resetAccountPageAndLoad();
+    });
+    document.getElementById('accounts-page-size')?.addEventListener('change', (event) => {
+      const size = Number(event.target.value);
+      state.accounts.pageSize = [25, 50, 100].includes(size) ? size : 25;
+      savePreference(ACCOUNT_PAGE_SIZE_KEY, String(state.accounts.pageSize));
+      resetAccountPageAndLoad();
+    });
+    document.getElementById('accounts-prev')?.addEventListener('click', () => {
+      if (state.accounts.page <= 1) return;
+      state.accounts.page -= 1;
+      loadAccounts().catch(() => {});
+    });
+    document.getElementById('accounts-next')?.addEventListener('click', () => {
+      if (state.accounts.page >= state.accounts.totalPages) return;
+      state.accounts.page += 1;
+      loadAccounts().catch(() => {});
+    });
+    document.getElementById('accounts-retry')?.addEventListener('click', () => {
+      loadAccounts().catch(() => {});
+    });
+    document.getElementById('account-files-select-all')?.addEventListener('change', (event) => {
+      state.accounts.selectedFiles.clear();
+      if (event.target.checked) {
+        state.accounts.files.forEach((file) => state.accounts.selectedFiles.add(file.name));
+      }
+      renderAccountFiles(state.accounts.files);
+    });
+    document.getElementById('account-files-delete')?.addEventListener('click', deleteSelectedAccountFiles);
+    document.getElementById('credential-import-form')?.addEventListener('submit', importCredentials);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) loadJobStatus({ silent: true }).catch(() => {});
     });
@@ -480,6 +797,10 @@
 
   async function initialise() {
     const preference = readPreference(THEME_KEY, 'system');
+    const savedPageSize = Number(readPreference(ACCOUNT_PAGE_SIZE_KEY, '25'));
+    state.accounts.pageSize = [25, 50, 100].includes(savedPageSize) ? savedPageSize : 25;
+    const pageSize = document.getElementById('accounts-page-size');
+    if (pageSize) pageSize.value = String(state.accounts.pageSize);
     applyTheme(preference, false);
     showSection(requestedSection());
     bindEvents();

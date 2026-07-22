@@ -189,6 +189,7 @@ def test_catalog_filters_sorts_and_paginates_stably(tmp_path):
         "total": 2,
         "total_pages": 1,
     }
+    assert ready["summary"] == {"total_accounts": 4}
     assert [item["email"] for item in pending_from_a["items"]] == [
         "zeta@example.com"
     ]

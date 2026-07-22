@@ -79,6 +79,7 @@
         <article class="metric-card"><span>任务状态</span><strong id="metric-job-state">空闲</strong><small>等待启动</small></article>
         <article class="metric-card"><span>成功 / 失败</span><strong id="metric-outcomes">0 / 0</strong><small>当前任务</small></article>
         <article class="metric-card"><span>有效并发</span><strong id="metric-concurrency">0</strong><small>独立浏览器</small></article>
+        <article class="metric-card"><span>账号总数</span><strong id="metric-accounts">—</strong><small>当前工作区</small></article>
         <article class="metric-card"><span>CPA 凭据</span><strong id="metric-cpa">0</strong><small>可用账号</small></article>
       </div>
       <div class="content-grid content-grid--overview">
@@ -167,8 +168,82 @@
     </section>
 
     <section id="section-accounts" class="panel-section" data-section="accounts" hidden>
-      <div class="section-heading"><div><p class="eyebrow">Accounts</p><h1>账号工作区</h1><p>按邮箱、来源和凭据状态检索账号，管理批次文件。</p></div></div>
-      <div class="surface-card"><div class="empty-state"><span aria-hidden="true">⌕</span><strong>账号目录按需加载</strong><p>进入该区域后才会请求安全分页接口。</p></div></div>
+      <div class="section-heading">
+        <div><p class="eyebrow">Accounts</p><h1>账号工作区</h1><p>按邮箱、来源和凭据状态检索账号，管理批次文件。</p></div>
+        <a class="button button--primary" href="/download/sso.txt">下载合并 SSO</a>
+      </div>
+
+      <div class="download-strip" aria-label="账号与凭据下载">
+        <a href="/download/accounts.json"><strong>账号 JSON</strong><span>完整账号备份</span></a>
+        <a href="/download/all.zip"><strong>全部批次 ZIP</strong><span>原始 TXT 文件</span></a>
+        <a href="/download/cpa.zip"><strong>CPA ZIP</strong><span>OAuth 凭据</span></a>
+        <a href="/download/sub2.zip"><strong>Sub2 ZIP</strong><span>分文件导入</span></a>
+        <a href="/download/sub2.json"><strong>Sub2 JSON</strong><span>合并数据包</span></a>
+        <a href="/download/grok2api.json"><strong>grok2api JSON</strong><span>Token pool</span></a>
+      </div>
+
+      <article class="surface-card account-browser">
+        <div class="account-toolbar">
+          <label class="search-field" for="accounts-search">
+            <span aria-hidden="true">⌕</span>
+            <input id="accounts-search" type="search" placeholder="搜索邮箱" autocomplete="off" data-busy-group="accounts">
+          </label>
+          <label class="compact-field" for="accounts-source"><span>来源</span><select id="accounts-source" data-busy-group="accounts"><option value="all">全部批次</option></select></label>
+          <label class="compact-field" for="accounts-status"><span>状态</span><select id="accounts-status" data-busy-group="accounts"><option value="all">全部</option><option value="ready">CPA 就绪</option><option value="pending">待转换</option></select></label>
+          <label class="compact-field" for="accounts-sort"><span>排序</span><select id="accounts-sort" data-busy-group="accounts"><option value="newest">最新批次</option><option value="oldest">最早批次</option><option value="email">邮箱</option></select></label>
+          <label class="compact-field" for="accounts-page-size"><span>每页</span><select id="accounts-page-size" data-busy-group="accounts"><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label>
+        </div>
+
+        <div class="inline-alert inline-alert--error account-alert" id="accounts-error" role="alert" hidden>
+          <span id="accounts-error-text"></span>
+          <button class="button button--ghost" id="accounts-retry" type="button">重试</button>
+        </div>
+        <div class="table-scroll" id="accounts-table-wrap">
+          <table class="data-table account-table">
+            <thead><tr><th scope="col">邮箱</th><th scope="col">来源批次</th><th scope="col">CPA 状态</th><th scope="col">批次时间</th></tr></thead>
+            <tbody id="accounts-table-body"></tbody>
+          </table>
+        </div>
+        <div class="empty-state table-empty" id="accounts-empty" hidden><span aria-hidden="true">⌕</span><strong>没有匹配账号</strong><p>调整搜索词或筛选条件后重试。</p></div>
+        <div class="table-footer">
+          <span id="accounts-result-count">0 个账号</span>
+          <div class="pagination" aria-label="账号分页">
+            <button class="button button--ghost" id="accounts-prev" type="button" disabled data-busy-group="accounts">上一页</button>
+            <span id="accounts-page-label">第 1 / 1 页</span>
+            <button class="button button--ghost" id="accounts-next" type="button" disabled data-busy-group="accounts">下一页</button>
+          </div>
+        </div>
+      </article>
+
+      <div class="accounts-secondary-grid">
+        <article class="surface-card batch-card">
+          <div class="card-heading">
+            <div><span class="eyebrow">Batch files</span><h2>账号批次文件</h2></div>
+            <button class="button button--danger" id="account-files-delete" type="button" disabled data-busy-group="accounts">删除所选</button>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table batch-table">
+              <thead><tr><th scope="col" class="checkbox-cell"><input id="account-files-select-all" type="checkbox" aria-label="选择全部批次" data-busy-group="accounts"></th><th scope="col">文件</th><th scope="col">账号数</th><th scope="col">修改时间</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
+              <tbody id="account-files-body"></tbody>
+            </table>
+          </div>
+          <div class="empty-state table-empty" id="account-files-empty"><span aria-hidden="true">≡</span><strong>暂无账号批次</strong><p>注册成功或导入凭据后会生成 TXT 文件。</p></div>
+        </article>
+
+        <article class="surface-card import-card">
+          <div class="card-heading"><div><span class="eyebrow">Import</span><h2>替换导入凭据</h2></div></div>
+          <form id="credential-import-form" class="form-stack">
+            <label class="file-drop" for="credential-import-file">
+              <span aria-hidden="true">＋</span>
+              <strong>选择 TXT 或 JSON 文件</strong>
+              <small>最多 30 MiB；按 SSO 去重</small>
+              <input id="credential-import-file" name="file" type="file" accept=".txt,.json,text/plain,application/json" required data-busy-group="accounts">
+            </label>
+            <p class="form-note">导入会归档当前账号和 CPA 文件，再激活新批次。原数据可从凭据目录的 archive 恢复。</p>
+            <button class="button button--secondary" type="submit" data-busy-group="accounts">确认并导入</button>
+          </form>
+        </article>
+      </div>
     </section>
 
     <section id="section-mail" class="panel-section" data-section="mail" hidden>

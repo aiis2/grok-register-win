@@ -212,3 +212,101 @@ def test_v2_registration_busy_state_is_scoped_to_related_controls():
     assert "setBusy('registration'" in source
     assert "data-busy-group" in source
     assert "document.body" not in source.split("function setBusy", 1)[1].split("}", 1)[0]
+
+
+def test_v2_accounts_has_search_filters_pagination_and_batch_regions(
+    isolated_v2_panel,
+):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+
+    for control_id in (
+        "accounts-search",
+        "accounts-source",
+        "accounts-status",
+        "accounts-sort",
+        "accounts-page-size",
+        "accounts-prev",
+        "accounts-next",
+        "accounts-table-body",
+        "accounts-empty",
+        "accounts-error",
+        "accounts-retry",
+        "account-files-body",
+        "account-files-select-all",
+        "account-files-delete",
+        "credential-import-form",
+        "credential-import-file",
+    ):
+        assert f'id="{control_id}"' in html
+    for size in (25, 50, 100):
+        assert f'value="{size}"' in html
+    assert 'id="metric-accounts"' in html
+
+
+def test_v2_accounts_keeps_all_existing_download_entry_points(isolated_v2_panel):
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(as_text=True)
+
+    for path in (
+        "/download/sso.txt",
+        "/download/accounts.json",
+        "/download/all.zip",
+        "/download/cpa.zip",
+        "/download/sub2.zip",
+        "/download/sub2.json",
+        "/download/grok2api.json",
+    ):
+        assert f'href="{path}"' in html
+
+
+def test_v2_accounts_javascript_is_lazy_cancellable_and_debounced():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    assert "/api/v2/accounts" in source
+    assert "requestJson('/api/accounts')" not in source
+    assert "AbortController" in source
+    assert "accounts.requestGeneration" in source
+    assert "250" in source
+    assert "ensureAccountsLoaded" in source
+    assert "next === 'accounts'" in source
+    assert "panel-v2-account-page-size" in source
+
+
+def test_v2_account_and_file_renderers_use_safe_dom_and_encoded_paths():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+    account_renderer = source.split("function renderAccountRows", 1)[1].split(
+        "function renderAccountFiles", 1
+    )[0]
+    file_renderer = source.split("function renderAccountFiles", 1)[1].split(
+        "async function loadAccounts", 1
+    )[0]
+
+    assert "document.createElement" in account_renderer
+    assert ".textContent" in account_renderer
+    assert "innerHTML" not in account_renderer
+    assert "document.createElement" in file_renderer
+    assert ".textContent" in file_renderer
+    assert "encodeURIComponent" in file_renderer
+    assert "innerHTML" not in file_renderer
+
+
+def test_v2_account_batch_actions_reuse_current_delete_and_import_contracts():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    assert "/api/accounts/delete" in source
+    assert "/api/credentials/import" in source
+    assert "new FormData" in source
+    assert "confirmAction" in source
+    assert "encodeURIComponent" in source
+
+
+def test_v2_credential_import_captures_file_before_disabling_form_controls():
+    root = Path(panel_app.__file__).resolve().parent
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+    importer = source.split("async function importCredentials", 1)[1].split(
+        "function renderJob", 1
+    )[0]
+
+    assert importer.index("new FormData") < importer.index("setBusy('accounts', true)")
