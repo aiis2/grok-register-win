@@ -231,6 +231,11 @@ def rectangles_intersect(first, second):
 
 The safe explicit-show origin is the primary work area's left/top plus 64 DIP, clamped inside the work area.
 
+If a browser created with Windows `SW_HIDE` reports a zero-sized initial rectangle,
+seed an offscreen `1280x800` rectangle with `SetWindowPos` and `SWP_NOACTIVATE`
+before hiding it. This preserves the early hidden-startup defense while ensuring
+that a later explicit show restores a usable native window.
+
 **Step 3: Strengthen `hide()`**
 
 After ownership validation, remember the original style, apply the tool-window style, issue the no-activate hide, and verify `IsWindowVisible` is false. On any failure restore the original style before returning `hide_failed`.

@@ -50,6 +50,8 @@ SPI_GETWORKAREA = 0x0030
 VISIBLE_WINDOW_MARGIN = 64
 HIDDEN_WINDOW_X = -32000
 HIDDEN_WINDOW_Y = -32000
+DEFAULT_HIDDEN_WINDOW_WIDTH = 1280
+DEFAULT_HIDDEN_WINDOW_HEIGHT = 800
 HIDDEN_WINDOW_POSITION_ARGUMENT = (
     f"--window-position={HIDDEN_WINDOW_X},{HIDDEN_WINDOW_Y}"
 )
@@ -617,6 +619,22 @@ class CtypesWindowsApi:
             )
         )
 
+    def place_window_no_activate(
+        self, hwnd: int, x: int, y: int, width: int, height: int
+    ) -> bool:
+        flags = SWP_NOZORDER | SWP_NOACTIVATE
+        return bool(
+            self._user32.SetWindowPos(
+                int(hwnd),
+                0,
+                int(x),
+                int(y),
+                max(1, int(width)),
+                max(1, int(height)),
+                flags,
+            )
+        )
+
     def show_window(self, hwnd: int, command: int) -> bool:
         return bool(self._user32.ShowWindowAsync(int(hwnd), int(command)))
 
@@ -657,6 +675,24 @@ class WindowsBrowserWindowController:
         except Exception:
             pass
 
+    def _ensure_restorable_bounds(self, hwnd: int) -> None:
+        rect = self.api.window_rect(hwnd)
+        width = int(rect[2]) - int(rect[0])
+        height = int(rect[3]) - int(rect[1])
+        if width > 0 and height > 0:
+            return
+        if not self.api.place_window_no_activate(
+            hwnd,
+            HIDDEN_WINDOW_X,
+            HIDDEN_WINDOW_Y,
+            DEFAULT_HIDDEN_WINDOW_WIDTH,
+            DEFAULT_HIDDEN_WINDOW_HEIGHT,
+        ):
+            raise RuntimeError("browser window could not receive restorable bounds")
+        rect = self.api.window_rect(hwnd)
+        if int(rect[2]) <= int(rect[0]) or int(rect[3]) <= int(rect[1]):
+            raise RuntimeError("browser window retained zero-sized restore bounds")
+
     def _validate(self, ref: BrowserWindowRef) -> WindowControlResult | None:
         if not ref.hwnd or not self.api.is_window(ref.hwnd):
             return WindowControlResult(
@@ -693,6 +729,7 @@ class WindowsBrowserWindowController:
             return invalid
         original_style = None
         try:
+            self._ensure_restorable_bounds(ref.hwnd)
             original_style = self.api.get_ex_style(ref.hwnd)
             hidden_style = (original_style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
             self.api.set_ex_style(ref.hwnd, hidden_style)

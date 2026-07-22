@@ -35,6 +35,7 @@ class FakeWindowApi:
         hide_return=True,
         keep_visible_after_hide=False,
         move_return=True,
+        place_return=True,
     ):
         self.hwnd_pid = dict(hwnd_pid or {})
         self.ex_styles = dict(ex_styles or {})
@@ -51,12 +52,14 @@ class FakeWindowApi:
         self.hide_return = bool(hide_return)
         self.keep_visible_after_hide = bool(keep_visible_after_hide)
         self.move_return = bool(move_return)
+        self.place_return = bool(place_return)
         self.show_calls = []
         self.foreground_calls = []
         self.style_calls = []
         self.frame_calls = []
         self.hide_no_activate_calls = []
         self.move_calls = []
+        self.place_calls = []
 
     def is_window(self, hwnd):
         return int(hwnd) in self.hwnd_pid
@@ -125,6 +128,19 @@ class FakeWindowApi:
                 y + max(1, bottom - top),
             )
         return self.move_return
+
+    def place_window_no_activate(self, hwnd, x, y, width, height):
+        hwnd = int(hwnd)
+        values = (hwnd, int(x), int(y), int(width), int(height))
+        self.place_calls.append(values)
+        if self.place_return:
+            self.window_rects[hwnd] = (
+                int(x),
+                int(y),
+                int(x) + int(width),
+                int(y) + int(height),
+            )
+        return self.place_return
 
 
 def test_hide_rejects_hwnd_owned_by_another_pid():
@@ -235,6 +251,22 @@ def test_hide_fails_and_rolls_back_style_when_window_remains_visible():
     assert result.ok is False
     assert result.code == "hide_failed"
     assert api.ex_styles[701] == WS_EX_APPWINDOW
+
+
+def test_hide_seeds_restorable_bounds_for_startup_hidden_zero_size_window():
+    api = FakeWindowApi(
+        hwnd_pid={701: 9001},
+        ex_styles={701: WS_EX_APPWINDOW},
+        visible={701: False},
+        window_rects={701: (0, 0, 0, 0)},
+    )
+    controller = WindowsBrowserWindowController(api=api)
+
+    result = controller.hide(BrowserWindowRef(pid=9001, hwnd=701))
+
+    assert result.ok is True
+    assert api.place_calls == [(701, -32000, -32000, 1280, 800)]
+    assert api.window_rects[701] == (-32000, -32000, -30720, -31200)
 
 
 def test_show_rolls_back_taskbar_style_when_window_remains_hidden():

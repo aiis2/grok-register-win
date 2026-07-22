@@ -52,11 +52,13 @@ CDP 参数与启动参数同时指定屏幕外位置，用于覆盖不同 Chromi
 找到属于本次 Popen PID 的 `Chrome_WidgetWin_*` 顶层 HWND 后：
 
 1. 再次校验 HWND 当前 PID；
-2. 添加 `WS_EX_TOOLWINDOW` 并移除 `WS_EX_APPWINDOW`；
-3. 使用包含 `SWP_NOACTIVATE`、`SWP_HIDEWINDOW` 和 `SWP_FRAMECHANGED` 的
+2. 如果 `STARTUPINFO/SW_HIDE` 使首次 `GetWindowRect` 返回零尺寸，则使用
+   `SWP_NOACTIVATE` 在屏幕外预置 `1280×800` 的可恢复矩形；
+3. 添加 `WS_EX_TOOLWINDOW` 并移除 `WS_EX_APPWINDOW`；
+4. 使用包含 `SWP_NOACTIVATE`、`SWP_HIDEWINDOW` 和 `SWP_FRAMECHANGED` 的
    `SetWindowPos` 请求隐藏及刷新任务栏样式；
-4. 检查 `IsWindowVisible`，只有窗口确实不可见才返回成功；
-5. 失败时恢复原扩展样式并触发现有回退流程。
+5. 检查 `IsWindowVisible`，只有窗口确实不可见才返回成功；
+6. 失败时恢复原扩展样式并触发现有回退流程。
 
 自动启动、重启和隐藏路径均不得调用 `SetForegroundWindow`。
 
@@ -91,9 +93,10 @@ CDP 参数与启动参数同时指定屏幕外位置，用于覆盖不同 Chromi
 3. CDP 创建参数包含后台、无焦点、最小化和屏幕外坐标。
 4. 隐藏操作包含 `SWP_NOACTIVATE | SWP_HIDEWINDOW`，不调用前台激活 API。
 5. 隐藏失败恢复原任务栏扩展样式。
-6. 显示操作不依赖 `ShowWindowAsync` 的历史可见状态返回值。
-7. 仅屏幕外窗口在显式显示时被移回可见工作区；已在屏幕内的窗口位置保持不变。
-8. PID/HWND 所有权、浏览器复用、失败回退和进程树清理测试继续通过。
+6. 启动期零尺寸 HWND 会在屏幕外取得非零可恢复矩形。
+7. 显示操作不依赖 `ShowWindowAsync` 的历史可见状态返回值。
+8. 仅屏幕外窗口在显式显示时被移回可见工作区；已在屏幕内的窗口位置保持不变。
+9. PID/HWND 所有权、浏览器复用、失败回退和进程树清理测试继续通过。
 
 ### Windows 实机验证
 
