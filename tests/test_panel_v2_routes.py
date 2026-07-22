@@ -65,7 +65,7 @@ def test_v1_9_release_documents_hidden_window_and_sso_refresh(isolated_v2_panel)
         "10000",
         "失败保留旧 CPA",
         "?ui=legacy",
-        "373 passed",
+        "374 passed",
     ):
         assert phrase in release
     release_lower = release.casefold()
