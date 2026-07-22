@@ -88,6 +88,13 @@ def test_cpa_listing_and_zip_include_current_and_legacy_files(isolated_storage):
     legacy_cpa.mkdir(parents=True)
     current_payload = {"email": "current@example.com", "sso": "current-sso"}
     legacy_payload = {"email": "legacy@example.com", "sso": "legacy-sso"}
+    current_sso = app_root / "vault" / "sso"
+    current_sso.mkdir(parents=True)
+    (current_sso / "accounts_active.txt").write_text(
+        "current@example.com----pw----current-sso\n"
+        "legacy@example.com----pw----legacy-sso\n",
+        encoding="utf-8",
+    )
     (current_cpa / "xai-current.json").write_text(
         json.dumps(current_payload), encoding="utf-8"
     )
@@ -106,6 +113,117 @@ def test_cpa_listing_and_zip_include_current_and_legacy_files(isolated_storage):
     with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
         assert "xai-current.json" in archive.namelist()
         assert "xai-legacy.json" in archive.namelist()
+
+
+def test_cpa_zip_excludes_credentials_not_owned_by_current_accounts(
+    isolated_storage,
+):
+    app_root, _ = isolated_storage
+    sso_dir = app_root / "vault" / "sso"
+    cpa_dir = app_root / "vault" / "cpa"
+    sso_dir.mkdir(parents=True)
+    cpa_dir.mkdir(parents=True)
+    (sso_dir / "accounts_active.txt").write_text(
+        "active@example.com----pw----active-sso\n", encoding="utf-8"
+    )
+    (cpa_dir / "xai-active.json").write_text(
+        json.dumps({"email": "active@example.com", "sso": "active-sso"}),
+        encoding="utf-8",
+    )
+    (cpa_dir / "xai-orphan.json").write_text(
+        json.dumps({"email": "old@example.com", "sso": "old-sso"}),
+        encoding="utf-8",
+    )
+
+    response = panel_app.app.test_client().get("/download/cpa.zip")
+
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+        assert "xai-active.json" in archive.namelist()
+        assert "xai-orphan.json" not in archive.namelist()
+
+
+def test_orphan_cpa_is_archived_and_removed_from_index(
+    isolated_storage, monkeypatch
+):
+    app_root, _ = isolated_storage
+    sso_dir = app_root / "vault" / "sso"
+    cpa_dir = app_root / "vault" / "cpa"
+    sso_dir.mkdir(parents=True)
+    cpa_dir.mkdir(parents=True)
+    (sso_dir / "accounts_active.txt").write_text(
+        "active@example.com----pw----active-sso\n", encoding="utf-8"
+    )
+    active = cpa_dir / "xai-active.json"
+    orphan = cpa_dir / "xai-orphan.json"
+    malformed = cpa_dir / "xai-malformed.json"
+    active.write_text(
+        json.dumps({"email": "active@example.com", "sso": "active-sso"}),
+        encoding="utf-8",
+    )
+    orphan.write_text(
+        json.dumps({"email": "old@example.com", "sso": "old-sso"}),
+        encoding="utf-8",
+    )
+    malformed.write_text("not-json", encoding="utf-8")
+    index = cpa_dir / "index.json"
+    index.write_text(
+        json.dumps(
+            {
+                "items": {
+                    panel_app.sso_fingerprint("active-sso"): {
+                        "file": active.name
+                    },
+                    panel_app.sso_fingerprint("old-sso"): {
+                        "file": orphan.name
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(panel_app, "_cpa_done", set())
+
+    result = panel_app.archive_orphan_cpa(
+        reason="account-delete", timestamp="20260722_120000"
+    )
+
+    assert result.archived == 2
+    assert active.exists()
+    assert not orphan.exists()
+    assert not malformed.exists()
+    assert (result.archive_dir / "cpa" / orphan.name).is_file()
+    assert (result.archive_dir / "cpa" / malformed.name).is_file()
+    saved_index = json.loads(index.read_text(encoding="utf-8"))
+    assert list(saved_index["items"].values()) == [{"file": active.name}]
+
+
+def test_deleting_account_file_archives_its_orphan_cpa(isolated_storage):
+    app_root, _ = isolated_storage
+    sso_dir = app_root / "vault" / "sso"
+    cpa_dir = app_root / "vault" / "cpa"
+    sso_dir.mkdir(parents=True)
+    cpa_dir.mkdir(parents=True)
+    account = sso_dir / "accounts_delete.txt"
+    account.write_text(
+        "delete@example.com----pw----delete-sso\n", encoding="utf-8"
+    )
+    cpa = cpa_dir / "xai-delete.json"
+    cpa.write_text(
+        json.dumps({"email": "delete@example.com", "sso": "delete-sso"}),
+        encoding="utf-8",
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/accounts/delete", json={"files": [account.name]}
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["cpa_archived"] == 1
+    assert not cpa.exists()
+    archive_dir = app_root / "vault" / "archive"
+    assert any(path.name == cpa.name for path in archive_dir.rglob("*.json"))
 
 
 def test_cpa_index_writes_only_to_current_configured_directory(isolated_storage):

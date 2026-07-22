@@ -24,6 +24,7 @@ def test_default_directory_resolves_under_app_root(tmp_path):
     assert layout.sso_dir == layout.root / "sso"
     assert layout.mail_dir == layout.root / "mail"
     assert layout.cpa_dir == layout.root / "cpa"
+    assert layout.archive_dir == layout.root / "archive"
 
 
 def test_relative_directory_resolves_under_app_root(tmp_path):
@@ -88,6 +89,7 @@ def test_ensure_layout_creates_all_subdirectories(tmp_path):
     assert layout.sso_dir.is_dir()
     assert layout.mail_dir.is_dir()
     assert layout.cpa_dir.is_dir()
+    assert layout.archive_dir.is_dir()
 
 
 def test_ensure_layout_rejects_existing_file(tmp_path):
@@ -216,6 +218,35 @@ def test_migration_skips_identical_target_and_removes_source(tmp_path):
     assert result.skipped == 1
     assert result.renamed == 0
     assert destination.read_text(encoding="utf-8") == "same"
+    assert not source.exists()
+
+
+def test_migration_preserves_nested_credential_archives(tmp_path):
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    current = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "old"})
+    )
+    target = CredentialLayout.from_config(
+        app_root, {"credentials_dir": "new"}
+    )
+    source = _write(
+        current.archive_dir / "20260722_batch" / "cpa" / "xai-old.json",
+        "archived-cpa",
+    )
+
+    result = migrate_credentials(
+        app_root,
+        current,
+        target,
+        switch_config=lambda _setting: None,
+    )
+
+    migrated = (
+        target.archive_dir / "20260722_batch" / "cpa" / "xai-old.json"
+    )
+    assert result.copied == 1
+    assert migrated.read_text(encoding="utf-8") == "archived-cpa"
     assert not source.exists()
 
 
@@ -351,3 +382,4 @@ def test_cleanup_never_removes_a_target_subdirectory(tmp_path):
     assert target.sso_dir.is_dir()
     assert target.mail_dir.is_dir()
     assert target.cpa_dir.is_dir()
+    assert target.archive_dir.is_dir()

@@ -20,6 +20,7 @@ class CredentialLayout:
     sso_dir: Path
     mail_dir: Path
     cpa_dir: Path
+    archive_dir: Path
 
     @classmethod
     def from_config(
@@ -43,6 +44,7 @@ class CredentialLayout:
             sso_dir=root / "sso",
             mail_dir=root / "mail",
             cpa_dir=root / "cpa",
+            archive_dir=root / "archive",
         )
 
 
@@ -78,7 +80,13 @@ def normalize_credentials_setting(app_root: Path, value: str) -> str:
 
 
 def ensure_layout(layout: CredentialLayout) -> CredentialLayout:
-    for path in (layout.root, layout.sso_dir, layout.mail_dir, layout.cpa_dir):
+    for path in (
+        layout.root,
+        layout.sso_dir,
+        layout.mail_dir,
+        layout.cpa_dir,
+        layout.archive_dir,
+    ):
         if path.exists() and not path.is_dir():
             raise ValueError(f"凭据路径不是目录: {path}")
         path.mkdir(parents=True, exist_ok=True)
@@ -173,6 +181,16 @@ def _migration_sources(
                     continue
                 seen.add(resolved)
                 sources.append((source, destination_dir))
+    if current.root != target.root and current.archive_dir.is_dir():
+        for source in sorted(
+            current.archive_dir.rglob("*"), key=lambda path: str(path)
+        ):
+            resolved = source.resolve()
+            if not source.is_file() or resolved in seen:
+                continue
+            relative = source.relative_to(current.archive_dir)
+            seen.add(resolved)
+            sources.append((source, target.archive_dir / relative.parent))
     return sources
 
 
@@ -228,6 +246,7 @@ def migrate_credentials(
 
     try:
         for source, destination_dir in sources:
+            destination_dir.mkdir(parents=True, exist_ok=True)
             destination, identical, conflict = _conflict_destination(
                 source, destination_dir, timestamp
             )
@@ -285,6 +304,12 @@ def migrate_credentials(
         current.sso_dir,
         current.mail_dir,
         current.cpa_dir,
+        *sorted(
+            (path for path in current.archive_dir.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ),
+        current.archive_dir,
         current.root,
         resolved_app_root / "data" / "cpa",
     ]

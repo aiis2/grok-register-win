@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -164,6 +165,13 @@ class CpaPaths:
     directory: Path
     index_path: Path
     failed_path: Path
+
+
+@dataclass(frozen=True)
+class ArchiveResult:
+    archived: int
+    archive_dir: Path
+    files: Tuple[str, ...]
 
 
 def current_credential_layout(cfg: Optional[dict] = None) -> CredentialLayout:
@@ -802,11 +810,162 @@ def list_cpa_files() -> List[Path]:
     return files
 
 
+def active_identity_sets() -> Tuple[Set[str], Set[str]]:
+    emails: Set[str] = set()
+    fingerprints: Set[str] = set()
+    for account in unique_accounts():
+        email = str(account.get("email") or "").strip().lower()
+        if email and email != "unknown":
+            emails.add(email)
+        sso = normalize_sso(account.get("sso") or "")
+        if sso:
+            fingerprints.add(sso_fingerprint(sso))
+    return emails, fingerprints
+
+
+def cpa_matches_active(
+    payload: dict, emails: Set[str], fingerprints: Set[str]
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    sso = normalize_sso(payload.get("sso") or "")
+    if sso and sso_fingerprint(sso) in fingerprints:
+        return True
+    email = str(payload.get("email") or "").strip().lower()
+    return bool(email and email in emails)
+
+
+def list_active_cpa_files() -> List[Path]:
+    emails, fingerprints = active_identity_sets()
+    if not emails and not fingerprints:
+        return []
+    active: List[Path] = []
+    for path in list_cpa_files():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if cpa_matches_active(payload, emails, fingerprints):
+            active.append(path)
+    return active
+
+
+def _archive_destination(directory: Path, name: str) -> Path:
+    destination = directory / Path(name).name
+    if not destination.exists():
+        return destination
+    for sequence in range(2, 10000):
+        candidate = directory / f"{destination.stem}-{sequence}{destination.suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("archive destination exhausted")
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _prune_cpa_indexes(alive_names: Set[str]) -> None:
+    for directory in _cpa_read_directories():
+        index_path = directory / "index.json"
+        if not index_path.is_file():
+            continue
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, dict):
+                continue
+            filtered = {
+                fingerprint: item
+                for fingerprint, item in items.items()
+                if isinstance(item, dict)
+                and str(item.get("file") or "") in alive_names
+            }
+            _write_json_atomic(
+                index_path,
+                {
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "items": filtered,
+                },
+            )
+        except Exception as exc:
+            log_line(f"[!] CPA 索引整理失败: {type(exc).__name__}")
+
+
+def archive_orphan_cpa(
+    *, reason: str = "orphan", timestamp: Optional[str] = None
+) -> ArchiveResult:
+    global _cpa_done
+    layout = current_credential_layout()
+    safe_reason = re.sub(r"[^A-Za-z0-9_-]+", "-", str(reason or "orphan"))[:40]
+    batch_name = f"{timestamp or datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_reason}"
+    batch_dir = (layout.archive_dir / batch_name).resolve()
+    batch_dir.relative_to(layout.archive_dir.resolve())
+    cpa_archive = batch_dir / "cpa"
+    emails, fingerprints = active_identity_sets()
+    candidates: List[Path] = []
+    seen: Set[Path] = set()
+    for directory in _cpa_read_directories():
+        for path in sorted(directory.glob("xai-*.json"), key=lambda item: item.name):
+            resolved = path.resolve()
+            if not path.is_file() or resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = None
+            if not cpa_matches_active(payload, emails, fingerprints):
+                candidates.append(path)
+
+    archived_names: List[str] = []
+    for source in candidates:
+        cpa_archive.mkdir(parents=True, exist_ok=True)
+        destination = _archive_destination(cpa_archive, source.name)
+        shutil.move(str(source), str(destination))
+        archived_names.append(destination.name)
+
+    active_files = list_active_cpa_files()
+    alive_names = {path.name for path in active_files}
+    _prune_cpa_indexes(alive_names)
+    remaining_fingerprints: Set[str] = set()
+    for path in active_files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            sso = normalize_sso(payload.get("sso") or "")
+            if sso:
+                remaining_fingerprints.add(sso_fingerprint(sso))
+        except Exception:
+            continue
+    with _cpa_lock:
+        _cpa_done = remaining_fingerprints
+        _cpa_state["ok"] = len(active_files)
+    if archived_names:
+        log_line(f"[*] 已归档无主 CPA: {len(archived_names)} 个")
+    return ArchiveResult(
+        archived=len(archived_names),
+        archive_dir=batch_dir,
+        files=tuple(archived_names),
+    )
+
+
 def cpa_stats() -> dict:
     with _cpa_lock:
         st = dict(_cpa_state)
         done_n = len(_cpa_done)
-    files = list_cpa_files()
+    files = list_active_cpa_files()
     st["files"] = len(files)
     st["done"] = done_n
     st["dir"] = str(current_cpa_paths().directory)
@@ -4322,7 +4481,7 @@ def index():
         files=files_meta,
         file_count=len(files_meta),
         account_count=total,
-        cpa_files=len(list_cpa_files()),
+        cpa_files=len(list_active_cpa_files()),
         register_concurrency=register_concurrency,
     )
 
@@ -4452,7 +4611,7 @@ def download_cpa_zip():
     need = require_login()
     if need:
         return need
-    files = list_cpa_files()
+    files = list_active_cpa_files()
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         readme = (
@@ -4501,7 +4660,7 @@ def _load_cpa_entries_for_sub2() -> Tuple[List[dict], List[str]]:
     """Read existing CPA JSON files for Sub2 export. No re-OAuth."""
     entries: List[dict] = []
     name_hints: List[str] = []
-    for p in list_cpa_files():
+    for p in list_active_cpa_files():
         try:
             obj = json.loads(p.read_text(encoding="utf-8"))
             if not isinstance(obj, dict):
@@ -4782,6 +4941,10 @@ def api_accounts_delete():
         except Exception as e:
             errors.append(f"{name}: {e}")
 
+    cpa_archived = 0
+    if deleted:
+        cpa_archived = archive_orphan_cpa(reason="account-delete").archived
+
     if not deleted and errors:
         return jsonify({"ok": False, "error": "; ".join(errors)}), 400
     return jsonify(
@@ -4790,7 +4953,9 @@ def api_accounts_delete():
             "deleted": deleted,
             "missing": missing,
             "errors": errors,
+            "cpa_archived": cpa_archived,
             "message": f"已删除 {len(deleted)} 个文件"
+            + (f"，归档 CPA {cpa_archived}" if cpa_archived else "")
             + (f"，跳过 {len(missing)}" if missing else ""),
         }
     )
