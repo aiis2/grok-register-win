@@ -7,7 +7,7 @@
 ### Windows 本地运行的 Grok 账号注册与凭据导出面板
 
 [![Tests](https://github.com/aiis2/grok-register-win/actions/workflows/tests.yml/badge.svg)](https://github.com/aiis2/grok-register-win/actions/workflows/tests.yml)
-[![Version](https://img.shields.io/badge/version-v1.10.1-111827)](https://github.com/aiis2/grok-register-win/releases/tag/v1.10.1)
+[![Version](https://img.shields.io/badge/version-v1.11.0-111827)](https://github.com/aiis2/grok-register-win/releases/tag/v1.11.0)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows)](#运行要求)
 [![License](https://img.shields.io/badge/License-MIT-16A34A)](LICENSE)
