@@ -87,11 +87,39 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # SSO → real CPA (CLIProxyAPI OAuth JSON)
 CPA_DIR_ENV = "CPA_DIR"
+CPA_CONCURRENCY_ENV = "CPA_CONCURRENCY"
+DEFAULT_CPA_CONCURRENCY = 2
+MAX_CPA_CONCURRENCY = 4
 SSO2CPA_PATH = Path(
     os.environ.get("SSO2CPA_PATH", str(BASE_DIR / "lib"))
 ).resolve()
 AUTO_CPA = os.environ.get("AUTO_CPA", "1").strip() not in ("0", "false", "False", "no")
 CPA_DELAY = float(os.environ.get("CPA_DELAY", "1.0"))
+
+
+def normalize_cpa_concurrency(value) -> int:
+    """Return a conservative, bounded OAuth worker count."""
+    if value is None or str(value).strip() == "":
+        return DEFAULT_CPA_CONCURRENCY
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_CPA_CONCURRENCY
+    return max(1, min(parsed, MAX_CPA_CONCURRENCY))
+
+
+def resolve_cpa_concurrency(cfg: Optional[dict] = None) -> int:
+    """Resolve environment override first, then the saved application setting."""
+    override = str(os.environ.get(CPA_CONCURRENCY_ENV) or "").strip()
+    data = cfg if isinstance(cfg, dict) else load_config()
+    source = (
+        override
+        if override
+        else data.get("cpa_oauth_concurrency", DEFAULT_CPA_CONCURRENCY)
+    )
+    return normalize_cpa_concurrency(source)
+
+
 # Hard wall-clock per register round (one account). Stuck process is killed, next round starts.
 DEFAULT_ROUND_TIMEOUT_SEC = 300
 # Optional: talk to local Clash Meta external-controller for node list.
@@ -537,7 +565,13 @@ _cpa_state: Dict = {
     "enabled": AUTO_CPA,
     "core_ok": _CPA_CORE_OK,
     "core_error": _CPA_CORE_ERR,
+    "concurrency": normalize_cpa_concurrency(
+        os.environ.get(CPA_CONCURRENCY_ENV)
+    ),
     "pending": 0,
+    "active_workers": 0,
+    "commit_pending": 0,
+    "commit_active": 0,
     "ok": 0,
     "fail": 0,
     "running": False,
