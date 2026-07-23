@@ -225,3 +225,133 @@ def test_fingerprint_remains_inflight_until_serial_commit(
     assert fingerprint not in panel_app._cpa_inflight
     assert fingerprint in panel_app._cpa_done
     assert panel_app._cpa_state["commit_pending"] == 0
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "token HTTP 429",
+        "token HTTP 500",
+        "token HTTP 502",
+        "token HTTP 503",
+        "token HTTP 504",
+        "authorize 请求失败: timeout",
+        "consent 请求失败: connection reset",
+    ],
+)
+def test_transient_cpa_error_classification(message):
+    assert panel_app.is_transient_cpa_error(RuntimeError(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "SSO 无效或已过期（跳到登录页）",
+        "authorize 被 Cloudflare 拦截 (HTTP 403)",
+        "consent 响应缺少 code",
+        "token HTTP 400",
+    ],
+)
+def test_permanent_cpa_error_classification(message):
+    assert not panel_app.is_transient_cpa_error(RuntimeError(message))
+
+
+def test_transient_oauth_failure_retries_twice_then_succeeds(
+    isolated_pipeline, monkeypatch
+):
+    calls = 0
+    sleeps = []
+
+    def convert(sso, email="", proxy=""):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RuntimeError("token HTTP 429")
+        return {
+            "email": email,
+            "sso": sso,
+            "access_token": "synthetic-access",
+            "refresh_token": "synthetic-refresh",
+            "auth_kind": "oauth",
+        }
+
+    monkeypatch.setattr(panel_app, "convert_one", convert)
+    monkeypatch.setattr(panel_app, "_cpa_sleep", sleeps.append, raising=False)
+    monkeypatch.setattr(
+        panel_app, "_wait_for_cpa_cooldown", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        panel_app, "_extend_cpa_cooldown", lambda _seconds: None, raising=False
+    )
+
+    entry, error, attempts = panel_app._convert_cpa_with_retry(
+        "synthetic-sso", "retry@example.invalid"
+    )
+
+    assert error is None
+    assert entry["email"] == "retry@example.invalid"
+    assert attempts == 3
+    assert calls == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_permanent_oauth_failure_is_not_retried(
+    isolated_pipeline, monkeypatch
+):
+    calls = 0
+
+    def convert(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("SSO 无效或已过期（跳到登录页）")
+
+    monkeypatch.setattr(panel_app, "convert_one", convert)
+    monkeypatch.setattr(panel_app, "_cpa_sleep", lambda _seconds: None, raising=False)
+
+    entry, error, attempts = panel_app._convert_cpa_with_retry(
+        "synthetic-sso", "expired@example.invalid"
+    )
+
+    assert entry is None
+    assert "SSO 无效" in str(error)
+    assert attempts == 1
+    assert calls == 1
+
+
+def test_final_failure_preserves_old_cpa_and_clears_pipeline_state(
+    isolated_pipeline, monkeypatch
+):
+    existing = isolated_pipeline / "xai-bench-0@example.invalid.json"
+    canary = b'{"email":"bench-0@example.invalid","access_token":"old-canary"}\n'
+    isolated_pipeline.mkdir(parents=True, exist_ok=True)
+    existing.write_bytes(canary)
+    monkeypatch.setattr(
+        panel_app,
+        "convert_one",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("SSO 无效或已过期（跳到登录页）")
+        ),
+    )
+    _enqueue_synthetic(1)
+
+    workers, committer = panel_app._start_cpa_pipeline_threads(2)
+    panel_app._cpa_q.join()
+    panel_app._cpa_result_q.join()
+
+    assert existing.read_bytes() == canary
+    assert panel_app._cpa_state["pending"] == 0
+    assert panel_app._cpa_state["active_workers"] == 0
+    assert panel_app._cpa_state["commit_pending"] == 0
+    assert panel_app._cpa_state["commit_active"] == 0
+    assert panel_app._cpa_state["running"] is False
+    assert panel_app._cpa_state["active"] is False
+    assert panel_app._cpa_state["fail"] == 1
+    assert not panel_app._cpa_inflight
+    failed_lines = (
+        panel_app.current_cpa_paths()
+        .failed_path.read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert len(failed_lines) == 1
+
+    _stop_pipeline(workers, committer)

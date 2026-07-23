@@ -585,6 +585,8 @@ _cpa_inflight: Set[str] = set()
 _cpa_workspace_generation = 0
 _cpa_threads: List[threading.Thread] = []
 _cpa_commit_thread: Optional[threading.Thread] = None
+_cpa_cooldown_until = 0.0
+_cpa_sleep = time.sleep
 
 
 def _refresh_cpa_running_locked() -> None:
@@ -600,6 +602,76 @@ def _refresh_cpa_running_locked() -> None:
             "commit_active",
         )
     )
+
+
+def is_transient_cpa_error(error: Exception) -> bool:
+    text = str(error).casefold()
+    permanent_markers = (
+        "sso 无效",
+        "cloudflare 拦截",
+        "consent 响应缺少",
+    )
+    if any(marker in text for marker in permanent_markers):
+        return False
+    transient_markers = (
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "temporarily unavailable",
+    )
+    return any(marker in text for marker in transient_markers)
+
+
+def _extend_cpa_cooldown(seconds: float) -> None:
+    global _cpa_cooldown_until
+    delay = max(0.0, min(float(seconds), 8.0))
+    with _cpa_lock:
+        _cpa_cooldown_until = max(
+            _cpa_cooldown_until, time.monotonic() + delay
+        )
+
+
+def _wait_for_cpa_cooldown() -> None:
+    with _cpa_lock:
+        remaining = max(0.0, _cpa_cooldown_until - time.monotonic())
+    if remaining > 0:
+        _cpa_sleep(remaining)
+
+
+def _convert_cpa_with_retry(
+    sso: str, email: str
+) -> Tuple[Optional[dict], Optional[Exception], int]:
+    if convert_one is None:
+        return None, RuntimeError(f"core missing: {_CPA_CORE_ERR}"), 1
+    last_error: Optional[Exception] = None
+    for attempt in range(1, 4):
+        _wait_for_cpa_cooldown()
+        try:
+            return (
+                convert_one(sso, email=email, proxy=PROXY_URL),
+                None,
+                attempt,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 3 or not is_transient_cpa_error(exc):
+                return None, exc, attempt
+            delay = float(2 ** (attempt - 1))
+            text = str(exc).casefold()
+            if "http 429" in text or any(
+                f"http {status}" in text
+                for status in (500, 502, 503, 504)
+            ):
+                _extend_cpa_cooldown(delay)
+            _cpa_sleep(delay)
+    return None, last_error, 3
 
 
 def log_line(msg: str):
@@ -1388,12 +1460,9 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
 
         entry = None
         error = None
+        attempts = 1
         try:
-            if convert_one is None:
-                raise RuntimeError(f"core missing: {_CPA_CORE_ERR}")
-            entry = convert_one(sso, email=email, proxy=PROXY_URL)
-        except Exception as exc:
-            error = exc
+            entry, error, attempts = _convert_cpa_with_retry(sso, email)
         finally:
             with _cpa_lock:
                 _cpa_state["active_workers"] = max(
@@ -1410,6 +1479,7 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
                     "error": error,
                     "workspace_generation": item_generation,
                     "worker_id": worker_id,
+                    "attempts": attempts,
                 }
             )
             if CPA_DELAY > 0:
