@@ -309,7 +309,7 @@ def credential_change_blocker() -> str:
     if registration_is_running():
         return "注册任务运行中，不能修改或迁移凭据目录"
     with _cpa_lock:
-        if bool(_cpa_state.get("running")) or int(_cpa_state.get("pending") or 0):
+        if _cpa_pipeline_busy_locked():
             return "CPA 转换仍在运行，完成后才能迁移凭据目录"
     return ""
 
@@ -601,6 +601,20 @@ def _refresh_cpa_running_locked() -> None:
             "commit_pending",
             "commit_active",
         )
+    )
+
+
+def _cpa_active_stage_locked() -> bool:
+    return bool(_cpa_state.get("active")) or any(
+        max(0, int(_cpa_state.get(key) or 0)) > 0
+        for key in ("active_workers", "commit_pending", "commit_active")
+    )
+
+
+def _cpa_pipeline_busy_locked() -> bool:
+    return (
+        max(0, int(_cpa_state.get("pending") or 0)) > 0
+        or _cpa_active_stage_locked()
     )
 
 
@@ -1243,7 +1257,7 @@ def _credential_import_archive_sources(
 def _begin_cpa_workspace_switch() -> Tuple[int, List[dict]]:
     global _cpa_workspace_generation
     with _cpa_lock:
-        if bool(_cpa_state.get("active")):
+        if _cpa_active_stage_locked():
             raise CredentialImportBusy("CPA 转换正在执行，完成后才能导入")
         previous_generation = _cpa_workspace_generation
         _cpa_workspace_generation += 1
@@ -1268,7 +1282,7 @@ def _begin_cpa_workspace_switch() -> Tuple[int, List[dict]]:
         _cpa_state["pending"] = max(
             0, int(_cpa_state.get("pending") or 0) - len(drained)
         )
-        _cpa_state["running"] = bool(_cpa_state.get("active"))
+        _refresh_cpa_running_locked()
     return previous_generation, drained
 
 
@@ -1286,9 +1300,7 @@ def _restore_cpa_workspace_switch(
         _cpa_state["pending"] = int(_cpa_state.get("pending") or 0) + len(
             drained
         )
-        _cpa_state["running"] = bool(
-            _cpa_state.get("active") or _cpa_state.get("pending")
-        )
+        _refresh_cpa_running_locked()
 
 
 def _reset_cpa_workspace_state() -> None:
@@ -1299,6 +1311,9 @@ def _reset_cpa_workspace_state() -> None:
         _cpa_state.update(
             {
                 "pending": 0,
+                "active_workers": 0,
+                "commit_pending": 0,
+                "commit_active": 0,
                 "ok": 0,
                 "fail": 0,
                 "running": False,

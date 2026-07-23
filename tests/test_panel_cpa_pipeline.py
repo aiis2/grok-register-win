@@ -355,3 +355,58 @@ def test_final_failure_preserves_old_cpa_and_clears_pipeline_state(
     assert len(failed_lines) == 1
 
     _stop_pipeline(workers, committer)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["active_workers", "commit_pending", "commit_active"],
+)
+def test_workspace_switch_rejects_every_active_pipeline_stage(
+    isolated_pipeline, field
+):
+    panel_app._cpa_state[field] = 1
+    if field == "active_workers":
+        panel_app._cpa_state["active"] = True
+
+    assert (
+        panel_app.credential_change_blocker()
+        == "CPA 转换仍在运行，完成后才能迁移凭据目录"
+    )
+    with pytest.raises(panel_app.CredentialImportBusy):
+        panel_app._begin_cpa_workspace_switch()
+
+
+def test_stale_commit_result_never_writes_into_new_workspace(
+    isolated_pipeline,
+):
+    sso = "stale-workspace-sso"
+    fingerprint = panel_app.sso_fingerprint(sso)
+    panel_app._cpa_inflight.add(fingerprint)
+    result = {
+        "item": {
+            "email": "stale@example.invalid",
+            "sso": sso,
+            "password": "",
+            "source": "old-workspace",
+            "fp": fingerprint,
+        },
+        "entry": {
+            "email": "stale@example.invalid",
+            "sso": sso,
+            "access_token": "synthetic-access",
+            "refresh_token": "synthetic-refresh",
+            "auth_kind": "oauth",
+        },
+        "error": None,
+        "workspace_generation": 11,
+        "worker_id": 1,
+        "attempts": 1,
+    }
+    panel_app._cpa_workspace_generation = 12
+
+    panel_app._commit_cpa_result(result)
+
+    assert not list(isolated_pipeline.glob("xai-*.json"))
+    assert not panel_app.current_cpa_paths().index_path.exists()
+    assert fingerprint not in panel_app._cpa_inflight
+    assert fingerprint not in panel_app._cpa_done
