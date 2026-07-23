@@ -4413,6 +4413,23 @@ return '';
         return ""
 
 
+def is_signup_flow_url(url):
+    """Return True only for the accounts.x.ai registration routes."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url or "").strip())
+    except Exception:
+        return False
+    hostname = str(parsed.hostname or "").lower()
+    if hostname != "accounts.x.ai" and not hostname.endswith(".accounts.x.ai"):
+        return False
+    segments = {
+        segment.lower()
+        for segment in str(parsed.path or "").split("/")
+        if segment.strip()
+    }
+    return bool(segments.intersection({"sign-up", "signup", "register"}))
+
+
 def wait_for_sso_cookie(
     timeout=120,
     log_callback=None,
@@ -4450,8 +4467,14 @@ def wait_for_sso_cookie(
                 dismiss_cookie_and_consent_banners(log_callback=log_callback)
                 last_consent_retry = now
 
+            try:
+                cur = (page.url or "") if page is not None else ""
+            except Exception:
+                cur = ""
+            on_signup_page = is_signup_flow_url(cur)
+
             # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
-            if now - last_submit_retry >= 2.5:
+            if on_signup_page and now - last_submit_retry >= 2.5:
                 retried = page.run_js(
                     r"""
 function isVisible(node) {
@@ -4461,7 +4484,8 @@ function isVisible(node) {
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
 }
-const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
+const titleHit = !!Array.from(document.querySelectorAll('h1,h2,h3,[role="heading"]')).find((el) => {
+    if (!isVisible(el)) return false;
     const t = (el.textContent || '').replace(/\s+/g, '');
     const lower = t.toLowerCase();
     return t.includes('完成注册') || lower.includes('completeyoursignup') || lower.includes('completesignup');
@@ -4557,15 +4581,14 @@ return String(cfInput.value || '').trim().length;
                             if log_callback:
                                 log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
                         last_cf_retry_at = now
+            elif not on_signup_page:
+                final_no_submit_state = ""
+                final_no_submit_since = None
 
             # 离开注册页后，只尝试一次等待落到 grok.com 登录态
-            try:
-                cur = (page.url or "") if page is not None else ""
-            except Exception:
-                cur = ""
             left_signup = bool(
                 cur
-                and ("sign-up" not in cur)
+                and not on_signup_page
                 and not cur.rstrip("/").endswith("accounts.x.ai")
             )
             if (not grok_wait_done) and (left_signup or "grok.com" in cur):

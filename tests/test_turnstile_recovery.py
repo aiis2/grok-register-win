@@ -266,3 +266,51 @@ def test_chromium_turnstile_interaction_clicks_nested_shadow_control(monkeypatch
         "token": "t" * 120,
         "token_len": 120,
     }
+
+
+def test_account_landing_page_never_retries_the_registration_submit(monkeypatch):
+    class AccountLandingPage:
+        url = "https://accounts.x.ai/account"
+
+        def __init__(self):
+            self.submit_retries = 0
+
+        def run_js(self, script, *args):
+            if "final-page-no-submit" in script:
+                self.submit_retries += 1
+                return "final-page-no-submit:您正在登录 | 返回"
+            return ""
+
+    fake_page = AccountLandingPage()
+    monkeypatch.setattr(main, "page", fake_page)
+    monkeypatch.setattr(main, "refresh_active_page", lambda: None)
+    monkeypatch.setattr(main, "dismiss_cookie_and_consent_banners", lambda **kwargs: "")
+    monkeypatch.setattr(main, "wait_for_grok_com_landing", lambda **kwargs: True)
+    monkeypatch.setattr(
+        main,
+        "_iter_cookie_sources",
+        lambda: [
+            (
+                fake_page,
+                [{"name": "sso", "domain": ".grok.com", "value": "private-sso"}],
+            )
+        ],
+    )
+
+    assert main.wait_for_sso_cookie(timeout=1) == "private-sso"
+    assert fake_page.submit_retries == 0
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://accounts.x.ai/sign-up?redirect=grok-com", True),
+        ("https://accounts.x.ai/signup", True),
+        ("https://accounts.x.ai/register", True),
+        ("https://accounts.x.ai/account", False),
+        ("https://grok.com/", False),
+        ("", False),
+    ],
+)
+def test_signup_flow_url_detection(url, expected):
+    assert main.is_signup_flow_url(url) is expected
