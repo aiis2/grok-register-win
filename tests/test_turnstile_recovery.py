@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 
 import grok_register_ttk as main
+
+
+def _web_sso(session_id="test-session"):
+    encode = lambda payload: base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return ".".join(
+        (
+            encode({"alg": "HS256", "typ": "JWT"}),
+            encode({"session_id": session_id}),
+            encode({"signature": "fixture"}),
+        )
+    )
 
 
 class ProfilePage:
@@ -282,6 +298,7 @@ def test_account_landing_page_never_retries_the_registration_submit(monkeypatch)
             return ""
 
     fake_page = AccountLandingPage()
+    valid_sso = _web_sso()
     monkeypatch.setattr(main, "page", fake_page)
     monkeypatch.setattr(main, "refresh_active_page", lambda: None)
     monkeypatch.setattr(main, "dismiss_cookie_and_consent_banners", lambda **kwargs: "")
@@ -292,12 +309,12 @@ def test_account_landing_page_never_retries_the_registration_submit(monkeypatch)
         lambda: [
             (
                 fake_page,
-                [{"name": "sso", "domain": ".grok.com", "value": "private-sso"}],
+                [{"name": "sso", "domain": ".grok.com", "value": valid_sso}],
             )
         ],
     )
 
-    assert main.wait_for_sso_cookie(timeout=1) == "private-sso"
+    assert main.wait_for_sso_cookie(timeout=1) == valid_sso
     assert fake_page.submit_retries == 0
 
 
@@ -314,3 +331,47 @@ def test_account_landing_page_never_retries_the_registration_submit(monkeypatch)
 )
 def test_signup_flow_url_detection(url, expected):
     assert main.is_signup_flow_url(url) is expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (_web_sso(), True),
+        (_web_sso("another-session"), True),
+        ("not-a-jwt", False),
+        ("binary-header.payload.signature", False),
+        ("", False),
+    ],
+)
+def test_web_sso_cookie_requires_a_decodable_session_jwt(value, expected):
+    assert main.is_canonical_web_sso_cookie(value) is expected
+
+
+def test_sso_wait_skips_provisional_cookie_until_canonical_cookie_arrives(monkeypatch):
+    class LandingPage:
+        url = "https://grok.com/"
+
+    fake_page = LandingPage()
+    provisional_sso = "eJyrVkrLz1eyUkpKLFKqBQAq7gUa.payload.signature"
+    canonical_sso = _web_sso("ready-session")
+    cookie_snapshots = iter(
+        (
+            [{"name": "sso", "domain": ".grok.com", "value": provisional_sso}],
+            [{"name": "sso", "domain": ".grok.com", "value": canonical_sso}],
+        )
+    )
+    logs = []
+
+    monkeypatch.setattr(main, "page", fake_page)
+    monkeypatch.setattr(main, "refresh_active_page", lambda: None)
+    monkeypatch.setattr(main, "dismiss_cookie_and_consent_banners", lambda **kwargs: "")
+    monkeypatch.setattr(main, "wait_for_grok_com_landing", lambda **kwargs: True)
+    monkeypatch.setattr(main, "sleep_with_cancel", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "_iter_cookie_sources",
+        lambda: [(fake_page, next(cookie_snapshots))],
+    )
+
+    assert main.wait_for_sso_cookie(timeout=1, log_callback=logs.append) == canonical_sso
+    assert sum("过渡态 sso cookie" in line for line in logs) == 1

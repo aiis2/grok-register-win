@@ -4202,6 +4202,38 @@ def _cookie_name_domain_value(item):
     return name, domain, value
 
 
+def is_canonical_web_sso_cookie(value):
+    """Reject provisional cookies that are not usable Grok session JWTs."""
+    token = str(value or "").strip()
+    parts = token.split(".")
+    if len(parts) != 3 or any(not part for part in parts):
+        return False
+
+    def decode_json_segment(segment):
+        padding = "=" * ((4 - len(segment) % 4) % 4)
+        decoded = base64.urlsafe_b64decode((segment + padding).encode("ascii"))
+        return json.loads(decoded.decode("utf-8"))
+
+    try:
+        header = decode_json_segment(parts[0])
+        payload = decode_json_segment(parts[1])
+        signature_padding = "=" * ((4 - len(parts[2]) % 4) % 4)
+        signature = base64.urlsafe_b64decode(
+            (parts[2] + signature_padding).encode("ascii")
+        )
+    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    except Exception:
+        return False
+    return bool(
+        isinstance(header, dict)
+        and str(header.get("alg") or "").strip()
+        and isinstance(payload, dict)
+        and str(payload.get("session_id") or "").strip()
+        and signature
+    )
+
+
 def _iter_cookie_sources():
     """优先 grok.com 标签页，再扫其它标签页与当前 page（对齐 grok-reg-tool）。"""
     tabs = []
@@ -4452,6 +4484,7 @@ def wait_for_sso_cookie(
     fallback_sso = ""
     fallback_domain = ""
     grok_wait_done = False
+    provisional_sso_logged = False
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -4609,6 +4642,13 @@ return String(cfInput.value || '').trim().length;
                         last_seen_names.add(f"{name}@{domain}" if domain else name)
                     if name != "sso" or not value:
                         continue
+                    if not is_canonical_web_sso_cookie(value):
+                        if log_callback and not provisional_sso_logged:
+                            log_callback(
+                                "[*] 已检测到过渡态 sso cookie，等待服务端刷新为可用会话"
+                            )
+                            provisional_sso_logged = True
+                        continue
                     # 优先 grok.com
                     if prefer_domain and prefer_domain in domain:
                         preferred_hit = (domain, value)
@@ -4649,6 +4689,8 @@ return String(cfInput.value || '').trim().length;
             for item in cookies:
                 name, domain, value = _cookie_name_domain_value(item)
                 if name == "sso" and value:
+                    if not is_canonical_web_sso_cookie(value):
+                        continue
                     if prefer_domain and prefer_domain in domain:
                         if log_callback:
                             log_callback(f"[*] 已获取到 {domain} 域的 sso cookie")
