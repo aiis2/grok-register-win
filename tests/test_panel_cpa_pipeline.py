@@ -1,10 +1,83 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
+import time
 
 import pytest
 
 from panel import app as panel_app
+
+
+@pytest.fixture
+def isolated_pipeline(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"credentials_dir": "vault"}), encoding="utf-8"
+    )
+    cpa_dir = tmp_path / "vault" / "cpa"
+    monkeypatch.setattr(panel_app, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(panel_app, "CONFIG_PATH", config_path)
+    monkeypatch.setenv(panel_app.CPA_DIR_ENV, str(cpa_dir))
+    monkeypatch.delenv(panel_app.CPA_CONCURRENCY_ENV, raising=False)
+    monkeypatch.setattr(panel_app, "_credential_import_lock", threading.RLock())
+    monkeypatch.setattr(panel_app, "_cpa_lock", threading.Lock())
+    monkeypatch.setattr(panel_app, "_cpa_q", queue.Queue())
+    monkeypatch.setattr(panel_app, "_cpa_result_q", queue.Queue(), raising=False)
+    monkeypatch.setattr(panel_app, "_cpa_done", set())
+    monkeypatch.setattr(panel_app, "_cpa_inflight", set())
+    monkeypatch.setattr(panel_app, "_cpa_workspace_generation", 11)
+    monkeypatch.setattr(panel_app, "AUTO_CPA", True)
+    monkeypatch.setattr(panel_app, "_CPA_CORE_OK", True)
+    monkeypatch.setattr(panel_app, "CPA_DELAY", 0)
+    monkeypatch.setattr(panel_app, "PANEL_AUTH", False)
+    monkeypatch.setattr(
+        panel_app,
+        "_cpa_state",
+        {
+            "enabled": True,
+            "core_ok": True,
+            "core_error": "",
+            "concurrency": 2,
+            "pending": 0,
+            "active_workers": 0,
+            "commit_pending": 0,
+            "commit_active": 0,
+            "ok": 0,
+            "fail": 0,
+            "running": False,
+            "active": False,
+            "last_error": "",
+            "last_ok_email": "",
+        },
+    )
+    panel_app._logs.clear()
+    return cpa_dir
+
+
+def _enqueue_synthetic(count: int) -> None:
+    for index in range(count):
+        queued, reason = panel_app.enqueue_cpa_convert(
+            email=f"bench-{index}@example.invalid",
+            sso=f"synthetic-sso-{index}",
+            source="isolated-pipeline-test",
+            force=True,
+        )
+        assert queued, reason
+
+
+def _stop_pipeline(workers, committer) -> None:
+    for _ in workers:
+        panel_app._cpa_q.put(None)
+    panel_app._cpa_q.join()
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    panel_app._cpa_result_q.put(None)
+    panel_app._cpa_result_q.join()
+    committer.join(timeout=2)
+    assert not committer.is_alive()
 
 
 @pytest.mark.parametrize(
@@ -48,3 +121,107 @@ def test_cpa_concurrency_uses_saved_config_without_environment(
     monkeypatch.delenv("CPA_CONCURRENCY", raising=False)
 
     assert panel_app.resolve_cpa_concurrency() == 3
+
+
+def test_parallel_oauth_workers_overlap_but_commit_complete_index(
+    isolated_pipeline, monkeypatch
+):
+    call_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def convert(sso, email="", proxy=""):
+        nonlocal active, max_active
+        with call_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            sequence = int(sso.rsplit("-", 1)[-1])
+            time.sleep(0.025 + (sequence % 3) * 0.005)
+            return {
+                "email": email,
+                "sso": sso,
+                "access_token": "synthetic-access",
+                "refresh_token": "synthetic-refresh",
+                "auth_kind": "oauth",
+            }
+        finally:
+            with call_lock:
+                active -= 1
+
+    monkeypatch.setattr(panel_app, "convert_one", convert)
+    _enqueue_synthetic(24)
+
+    workers, committer = panel_app._start_cpa_pipeline_threads(4)
+    panel_app._cpa_q.join()
+    panel_app._cpa_result_q.join()
+
+    index = json.loads(
+        panel_app.current_cpa_paths().index_path.read_text(encoding="utf-8")
+    )
+    assert max_active >= 2
+    assert len(index["items"]) == 24
+    assert len(list(isolated_pipeline.glob("xai-*.json"))) == 24
+    assert panel_app._cpa_state["ok"] == 24
+    assert panel_app._cpa_state["pending"] == 0
+    assert panel_app._cpa_state["active_workers"] == 0
+    assert panel_app._cpa_state["commit_pending"] == 0
+    assert panel_app._cpa_state["commit_active"] == 0
+    assert not panel_app._cpa_inflight
+
+    _stop_pipeline(workers, committer)
+
+
+def test_fingerprint_remains_inflight_until_serial_commit(
+    isolated_pipeline, monkeypatch
+):
+    monkeypatch.setattr(
+        panel_app,
+        "convert_one",
+        lambda sso, email="", proxy="": {
+            "email": email,
+            "sso": sso,
+            "access_token": "synthetic-access",
+            "refresh_token": "synthetic-refresh",
+            "auth_kind": "oauth",
+        },
+    )
+    sso = "synthetic-pending-commit"
+    first = panel_app.enqueue_cpa_convert(
+        email="pending@example.invalid",
+        sso=sso,
+        source="isolated-pipeline-test",
+        force=True,
+    )
+    fingerprint = panel_app.sso_fingerprint(sso)
+    panel_app._cpa_q.put(None)
+
+    worker = threading.Thread(
+        target=panel_app._cpa_oauth_worker_loop, args=(1,), daemon=True
+    )
+    worker.start()
+    panel_app._cpa_q.join()
+    worker.join(timeout=2)
+
+    second = panel_app.enqueue_cpa_convert(
+        email="pending@example.invalid",
+        sso=sso,
+        source="isolated-pipeline-test",
+        force=True,
+    )
+    assert first == (True, "queued")
+    assert second == (False, "already queued")
+    assert fingerprint in panel_app._cpa_inflight
+    assert panel_app._cpa_state["commit_pending"] == 1
+
+    panel_app._cpa_result_q.put(None)
+    committer = threading.Thread(
+        target=panel_app._cpa_commit_worker_loop, daemon=True
+    )
+    committer.start()
+    panel_app._cpa_result_q.join()
+    committer.join(timeout=2)
+
+    assert fingerprint not in panel_app._cpa_inflight
+    assert fingerprint in panel_app._cpa_done
+    assert panel_app._cpa_state["commit_pending"] == 0

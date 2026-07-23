@@ -561,6 +561,7 @@ def cancel_email_receive_test(test_id: str) -> Tuple[bool, dict]:
 # --------------- CPA auto-convert queue ---------------
 _cpa_lock = threading.Lock()
 _cpa_q: "queue.Queue[Optional[dict]]" = queue.Queue()
+_cpa_result_q: "queue.Queue[Optional[dict]]" = queue.Queue()
 _cpa_state: Dict = {
     "enabled": AUTO_CPA,
     "core_ok": _CPA_CORE_OK,
@@ -582,6 +583,23 @@ _cpa_state: Dict = {
 _cpa_done: Set[str] = set()  # sso fingerprints already converted
 _cpa_inflight: Set[str] = set()
 _cpa_workspace_generation = 0
+_cpa_threads: List[threading.Thread] = []
+_cpa_commit_thread: Optional[threading.Thread] = None
+
+
+def _refresh_cpa_running_locked() -> None:
+    active_workers = max(0, int(_cpa_state.get("active_workers") or 0))
+    _cpa_state["active_workers"] = active_workers
+    _cpa_state["active"] = active_workers > 0
+    _cpa_state["running"] = any(
+        max(0, int(_cpa_state.get(key) or 0)) > 0
+        for key in (
+            "pending",
+            "active_workers",
+            "commit_pending",
+            "commit_active",
+        )
+    )
 
 
 def log_line(msg: str):
@@ -1255,6 +1273,7 @@ def enqueue_cpa_convert(
             generation = _cpa_workspace_generation
             _cpa_inflight.add(fp)
             _cpa_state["pending"] = int(_cpa_state.get("pending") or 0) + 1
+            _refresh_cpa_running_locked()
         _cpa_q.put(
             {
                 "email": email or "",
@@ -1331,17 +1350,17 @@ def enqueue_all_sso_refresh(limit: int = 10000) -> int:
     return n
 
 
-def _cpa_worker_loop():
-    initial_cpa_dir = current_cpa_paths().directory
+def _cpa_oauth_worker_loop(worker_id: int) -> None:
     log_line(
-        f"[CPA] worker start · core={'ok' if _CPA_CORE_OK else 'FAIL'} · auto={AUTO_CPA} · dir={initial_cpa_dir}"
+        f"[CPA] OAuth worker {worker_id} start · "
+        f"core={'ok' if _CPA_CORE_OK else 'FAIL'}"
     )
-    if not _CPA_CORE_OK:
-        log_line(f"[CPA] core import error: {_CPA_CORE_ERR}")
     while True:
         item = _cpa_q.get()
         if item is None:
-            break
+            _cpa_q.task_done()
+            return
+
         email = item.get("email") or ""
         sso = item.get("sso") or ""
         fp = item.get("fp") or sso_fingerprint(sso)
@@ -1349,94 +1368,217 @@ def _cpa_worker_loop():
             item_generation = int(item.get("workspace_generation") or 0)
         except (TypeError, ValueError):
             item_generation = 0
+
         with _cpa_lock:
-            if item_generation != _cpa_workspace_generation:
-                stale_workspace = True
+            _cpa_state["pending"] = max(
+                0, int(_cpa_state.get("pending") or 0) - 1
+            )
+            stale_workspace = item_generation != _cpa_workspace_generation
+            if stale_workspace:
+                _cpa_inflight.discard(fp)
             else:
-                stale_workspace = False
-                _cpa_state["active"] = True
-                _cpa_state["running"] = True
-                _cpa_state["pending"] = max(
-                    0, int(_cpa_state.get("pending") or 0) - 1
+                _cpa_state["active_workers"] = (
+                    int(_cpa_state.get("active_workers") or 0) + 1
                 )
+            _refresh_cpa_running_locked()
+
         if stale_workspace:
             _cpa_q.task_done()
             continue
+
+        entry = None
+        error = None
         try:
             if convert_one is None:
                 raise RuntimeError(f"core missing: {_CPA_CORE_ERR}")
             entry = convert_one(sso, email=email, proxy=PROXY_URL)
-            # keep password if known (not required by CPA, useful for bookkeeping)
-            if item.get("password") and not entry.get("password"):
-                entry["password"] = item["password"]
-            entry["_source"] = "grok-register-auto-cpa"
-            entry["_source_file"] = item.get("source") or ""
-            email_out = entry.get("email") or email or "unknown"
-            fname = f"xai-{cpa_safe_filename(email_out)}.json"
-            cpa_paths = current_cpa_paths()
-            path = cpa_paths.directory / fname
-            if path.exists():
-                try:
-                    old = json.loads(path.read_text(encoding="utf-8"))
-                    old_fp = sso_fingerprint(normalize_sso(old.get("sso") or ""))
-                except Exception:
-                    old_fp = ""
-                if old_fp and old_fp != fp:
-                    fname = f"xai-{cpa_safe_filename(email_out)}-{fp[:8]}.json"
-                    path = cpa_paths.directory / fname
-            _write_json_atomic(path, entry)
-            save_cpa_index_item(
-                fp,
-                {
-                    "email": email_out,
-                    "file": fname,
-                    "at": datetime.now().isoformat(timespec="seconds"),
-                    "auth_kind": entry.get("auth_kind"),
-                },
-            )
-            with _cpa_lock:
-                _cpa_done.add(fp)
-                _cpa_inflight.discard(fp)
-                _cpa_state["ok"] = int(_cpa_state.get("ok") or 0) + 1
-                _cpa_state["last_ok_email"] = email_out
-                _cpa_state["last_error"] = ""
-            log_line(f"[CPA] OK {email_out} -> {fname}")
-        except Exception as e:
-            err = str(e)
-            with _cpa_lock:
-                _cpa_inflight.discard(fp)
-                _cpa_state["fail"] = int(_cpa_state.get("fail") or 0) + 1
-                _cpa_state["last_error"] = err
-            try:
-                with open(current_cpa_paths().failed_path, "a", encoding="utf-8") as f:
-                    f.write(
-                        json.dumps(
-                            {
-                                "at": datetime.now().isoformat(timespec="seconds"),
-                                "email": email,
-                                "fp": fp,
-                                "error": err,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            log_line(f"[CPA] FAIL {email or fp[:12]}: {err}")
+        except Exception as exc:
+            error = exc
         finally:
             with _cpa_lock:
-                _cpa_state["active"] = False
-                _cpa_state["running"] = not _cpa_q.empty()
+                _cpa_state["active_workers"] = max(
+                    0, int(_cpa_state.get("active_workers") or 0) - 1
+                )
+                _cpa_state["commit_pending"] = (
+                    int(_cpa_state.get("commit_pending") or 0) + 1
+                )
+                _refresh_cpa_running_locked()
+            _cpa_result_q.put(
+                {
+                    "item": item,
+                    "entry": entry,
+                    "error": error,
+                    "workspace_generation": item_generation,
+                    "worker_id": worker_id,
+                }
+            )
             if CPA_DELAY > 0:
                 time.sleep(CPA_DELAY)
             _cpa_q.task_done()
 
 
-def start_cpa_worker() -> None:
+def _record_cpa_failure(item: dict, fp: str, error: Exception) -> None:
+    email = item.get("email") or ""
+    err = str(error)
+    with _cpa_lock:
+        _cpa_inflight.discard(fp)
+        _cpa_state["fail"] = int(_cpa_state.get("fail") or 0) + 1
+        _cpa_state["last_error"] = err
+    try:
+        with open(current_cpa_paths().failed_path, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                        "email": email,
+                        "fp": fp,
+                        "error": err,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    log_line(f"[CPA] FAIL {email or fp[:12]}: {err}")
+
+
+def _commit_cpa_result(result: dict) -> None:
+    item = result.get("item") or {}
+    email = item.get("email") or ""
+    sso = item.get("sso") or ""
+    fp = item.get("fp") or sso_fingerprint(sso)
+    try:
+        item_generation = int(result.get("workspace_generation") or 0)
+    except (TypeError, ValueError):
+        item_generation = 0
+
+    with _cpa_lock:
+        stale_workspace = item_generation != _cpa_workspace_generation
+        if stale_workspace:
+            _cpa_inflight.discard(fp)
+    if stale_workspace:
+        log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
+        return
+
+    error = result.get("error")
+    if error is not None:
+        _record_cpa_failure(item, fp, error)
+        return
+
+    try:
+        entry = dict(result.get("entry") or {})
+        if item.get("password") and not entry.get("password"):
+            entry["password"] = item["password"]
+        entry["_source"] = "grok-register-auto-cpa"
+        entry["_source_file"] = item.get("source") or ""
+        email_out = entry.get("email") or email or "unknown"
+        fname = f"xai-{cpa_safe_filename(email_out)}.json"
+        cpa_paths = current_cpa_paths()
+        path = cpa_paths.directory / fname
+        if path.exists():
+            try:
+                old = json.loads(path.read_text(encoding="utf-8"))
+                old_fp = sso_fingerprint(normalize_sso(old.get("sso") or ""))
+            except Exception:
+                old_fp = ""
+            if old_fp and old_fp != fp:
+                fname = f"xai-{cpa_safe_filename(email_out)}-{fp[:8]}.json"
+                path = cpa_paths.directory / fname
+        _write_json_atomic(path, entry)
+        save_cpa_index_item(
+            fp,
+            {
+                "email": email_out,
+                "file": fname,
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "auth_kind": entry.get("auth_kind"),
+            },
+        )
+        with _cpa_lock:
+            _cpa_done.add(fp)
+            _cpa_inflight.discard(fp)
+            _cpa_state["ok"] = int(_cpa_state.get("ok") or 0) + 1
+            _cpa_state["last_ok_email"] = email_out
+            _cpa_state["last_error"] = ""
+        log_line(f"[CPA] OK {email_out} -> {fname}")
+    except Exception as exc:
+        _record_cpa_failure(item, fp, exc)
+
+
+def _cpa_commit_worker_loop() -> None:
+    log_line(f"[CPA] commit worker start · dir={current_cpa_paths().directory}")
+    while True:
+        result = _cpa_result_q.get()
+        if result is None:
+            _cpa_result_q.task_done()
+            return
+        with _cpa_lock:
+            _cpa_state["commit_pending"] = max(
+                0, int(_cpa_state.get("commit_pending") or 0) - 1
+            )
+            _cpa_state["commit_active"] = (
+                int(_cpa_state.get("commit_active") or 0) + 1
+            )
+            _refresh_cpa_running_locked()
+        try:
+            _commit_cpa_result(result)
+        finally:
+            with _cpa_lock:
+                _cpa_state["commit_active"] = max(
+                    0, int(_cpa_state.get("commit_active") or 0) - 1
+                )
+                _refresh_cpa_running_locked()
+            _cpa_result_q.task_done()
+
+
+def _start_cpa_pipeline_threads(
+    concurrency: int,
+) -> Tuple[List[threading.Thread], threading.Thread]:
+    worker_count = normalize_cpa_concurrency(concurrency)
+    committer = threading.Thread(
+        target=_cpa_commit_worker_loop,
+        name="cpa-commit",
+        daemon=True,
+    )
+    workers = [
+        threading.Thread(
+            target=_cpa_oauth_worker_loop,
+            args=(worker_id,),
+            name=f"cpa-oauth-{worker_id}",
+            daemon=True,
+        )
+        for worker_id in range(1, worker_count + 1)
+    ]
+    committer.start()
+    for worker in workers:
+        worker.start()
+    return workers, committer
+
+
+def _cpa_worker_loop() -> None:
+    """Run one request worker plus a local committer for legacy tests/callers."""
+    committer = threading.Thread(target=_cpa_commit_worker_loop, daemon=True)
+    committer.start()
+    _cpa_oauth_worker_loop(1)
+    _cpa_result_q.join()
+    _cpa_result_q.put(None)
+    _cpa_result_q.join()
+    committer.join()
+
+
+def start_cpa_worker(concurrency: Optional[int] = None) -> None:
+    global _cpa_threads, _cpa_commit_thread
     load_cpa_index()
-    th = threading.Thread(target=_cpa_worker_loop, name="cpa-worker", daemon=True)
-    th.start()
+    worker_count = (
+        resolve_cpa_concurrency()
+        if concurrency is None
+        else normalize_cpa_concurrency(concurrency)
+    )
+    with _cpa_lock:
+        _cpa_state["concurrency"] = worker_count
+        _refresh_cpa_running_locked()
+    _cpa_threads, _cpa_commit_thread = _start_cpa_pipeline_threads(worker_count)
 
 
 def to_grok2api_pool(accounts: List[dict]) -> dict:
