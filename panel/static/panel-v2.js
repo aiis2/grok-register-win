@@ -911,8 +911,8 @@
     const refreshAll = document.getElementById('cpa-refresh-all');
     const limit = document.getElementById('cpa-backfill-limit');
     if (pathInput) pathInput.disabled = busy || blocked;
-    if (cpaConcurrency) cpaConcurrency.disabled = busy || blocked;
-    if (save) save.disabled = busy || blocked;
+    if (cpaConcurrency) cpaConcurrency.disabled = busy;
+    if (save) save.disabled = busy;
     if (migrate) migrate.disabled = busy || blocked;
     if (limit) limit.disabled = busy || Boolean(state.job?.running);
     if (backfill) backfill.disabled = busy || Boolean(state.job?.running) || state.cpa?.core_ok === false;

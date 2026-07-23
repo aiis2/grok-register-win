@@ -572,6 +572,8 @@ def test_v2_credentials_javascript_reuses_existing_safe_contracts():
     assert "cpa_oauth_concurrency" in source
     assert "active_workers" in source
     assert "commit_pending" in source
+    assert "cpaConcurrency.disabled = busy;" in source
+    assert "save.disabled = busy;" in source
     assert "失败时保留旧 CPA" in source
 
 

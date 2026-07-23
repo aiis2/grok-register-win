@@ -974,14 +974,12 @@ def save_cpa_index_item(fp: str, meta: dict) -> None:
         except Exception:
             items = {}
     items[fp] = meta
-    index_path.write_text(
-        json.dumps(
-            {"updated_at": datetime.now().isoformat(timespec="seconds"), "items": items},
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_json_atomic(
+        index_path,
+        {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "items": items,
+        },
     )
 
 
@@ -1495,6 +1493,9 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
         attempts = 1
         try:
             entry, error, attempts = _convert_cpa_with_retry(sso, email)
+        except Exception as exc:
+            entry = None
+            error = exc
         finally:
             with _cpa_lock:
                 _cpa_state["active_workers"] = max(
@@ -1569,7 +1570,12 @@ def _commit_cpa_result(result: dict) -> None:
         return
 
     try:
-        entry = dict(result.get("entry") or {})
+        raw_entry = result.get("entry")
+        if not isinstance(raw_entry, dict) or not raw_entry.get(
+            "access_token"
+        ):
+            raise RuntimeError("OAuth 转换返回无效结果")
+        entry = dict(raw_entry)
         if item.get("password") and not entry.get("password"):
             entry["password"] = item["password"]
         entry["_source"] = "grok-register-auto-cpa"
@@ -5876,9 +5882,6 @@ def api_set_credentials_config():
     need = require_login()
     if need:
         return need
-    blocker = credential_change_blocker()
-    if blocker:
-        return jsonify({"ok": False, "error": blocker}), 409
     if not _credential_migration_lock.acquire(blocking=False):
         return jsonify({"ok": False, "error": "凭据迁移正在进行"}), 409
     try:
@@ -5886,7 +5889,11 @@ def api_set_credentials_config():
         cfg = load_config()
         current = current_credential_layout(cfg)
         setting, target = _requested_credentials_layout(data)
-        if target.root != current.root:
+        directory_changed = target.root != current.root
+        if directory_changed:
+            blocker = credential_change_blocker()
+            if blocker:
+                return jsonify({"ok": False, "error": blocker}), 409
             if target.root.exists() and _files_under(target.root):
                 raise ValueError("目标凭据目录非空，请选择空目录或使用迁移")
             if _active_credential_files(current):

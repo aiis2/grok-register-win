@@ -461,3 +461,88 @@ def test_credentials_config_reports_environment_override(
     assert payload["cpa_runtime_concurrency"] == 4
     assert payload["cpa_concurrency_env_override"] is True
     assert payload["cpa_effective_concurrency"] == 4
+
+
+def test_invalid_converter_payload_is_committed_as_failure(
+    isolated_pipeline, monkeypatch
+):
+    monkeypatch.setattr(panel_app, "convert_one", lambda *_args, **_kwargs: None)
+    _enqueue_synthetic(1)
+
+    workers, committer = panel_app._start_cpa_pipeline_threads(2)
+    panel_app._cpa_q.join()
+    panel_app._cpa_result_q.join()
+
+    assert panel_app._cpa_state["ok"] == 0
+    assert panel_app._cpa_state["fail"] == 1
+    assert "无效结果" in panel_app._cpa_state["last_error"]
+    assert not list(isolated_pipeline.glob("xai-*.json"))
+    _stop_pipeline(workers, committer)
+
+
+def test_unexpected_retry_wrapper_error_is_committed_as_failure(
+    isolated_pipeline, monkeypatch
+):
+    monkeypatch.setattr(
+        panel_app,
+        "_convert_cpa_with_retry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("retry wrapper crashed")
+        ),
+    )
+    _enqueue_synthetic(1)
+
+    workers, committer = panel_app._start_cpa_pipeline_threads(1)
+    panel_app._cpa_q.join()
+    panel_app._cpa_result_q.join()
+
+    assert panel_app._cpa_state["ok"] == 0
+    assert panel_app._cpa_state["fail"] == 1
+    assert "retry wrapper crashed" in panel_app._cpa_state["last_error"]
+    assert not list(isolated_pipeline.glob("xai-*.json"))
+    _stop_pipeline(workers, committer)
+
+
+def test_running_pipeline_can_save_next_restart_concurrency_only(
+    isolated_pipeline,
+):
+    panel_app._cpa_state["active_workers"] = 1
+    panel_app._cpa_state["active"] = True
+    panel_app._cpa_state["running"] = True
+
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials",
+        json={
+            "credentials_dir": "vault",
+            "cpa_oauth_concurrency": 3,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    config = json.loads(panel_app.CONFIG_PATH.read_text(encoding="utf-8"))
+    assert config["cpa_oauth_concurrency"] == 3
+    assert payload["cpa_runtime_concurrency"] == 2
+    assert payload["cpa_restart_required"] is True
+
+
+def test_save_cpa_index_uses_atomic_writer(
+    isolated_pipeline, monkeypatch
+):
+    calls = []
+
+    def capture(path, payload):
+        calls.append((path, payload))
+
+    monkeypatch.setattr(panel_app, "_write_json_atomic", capture)
+
+    panel_app.save_cpa_index_item(
+        "synthetic-fingerprint",
+        {"file": "xai-synthetic.json"},
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == panel_app.current_cpa_paths().index_path
+    assert calls[0][1]["items"]["synthetic-fingerprint"]["file"] == (
+        "xai-synthetic.json"
+    )
