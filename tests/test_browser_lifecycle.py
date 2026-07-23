@@ -323,6 +323,12 @@ def test_hidden_mode_is_headed_and_uses_silent_launch(monkeypatch):
     assert not any(arg.startswith("--headless") for arg in options.arguments)
 
 
+def test_browser_options_keep_gpu_available_for_turnstile():
+    options = main.create_browser_options()
+
+    assert "--disable-gpu" not in options.arguments
+
+
 def test_minimized_mode_retains_compatibility_flag(monkeypatch):
     monkeypatch.setattr(
         main, "get_browser_window_mode", lambda: "minimized", raising=False

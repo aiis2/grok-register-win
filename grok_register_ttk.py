@@ -1028,7 +1028,9 @@ def create_browser_options(browser_proxy="", window_mode=None):
         options.set_argument("--silent-launch")
     elif window_mode == WINDOW_MODE_MINIMIZED:
         options.set_argument("--start-minimized")
-    # Server-friendly browser path / flags
+    # Server-friendly browser path / flags. Keep GPU capability available:
+    # current Turnstile builds probe WebGPU during widget bootstrap, and
+    # --disable-gpu leaves the page at the empty 64px placeholder forever.
     for _browser_path in (
         os.environ.get("BROWSER_PATH") or "",
         "/snap/bin/chromium",
@@ -1042,7 +1044,7 @@ def create_browser_options(browser_proxy="", window_mode=None):
             except Exception:
                 pass
             break
-    for _arg in ("--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"):
+    for _arg in ("--no-sandbox", "--disable-dev-shm-usage"):
         try:
             options.set_argument(_arg)
         except Exception:
