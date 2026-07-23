@@ -257,6 +257,7 @@ def test_v2_registration_has_existing_limits_browser_modes_and_worker_region(
     assert 'id="stop-registration"' in html
     assert 'id="worker-grid"' in html
     assert 'id="registration-verification-lanes"' in html
+    assert '<dt>完成轮次</dt><dd id="registration-round">' in html
 
 
 def test_v2_uses_accessible_dialog_instead_of_native_confirm(isolated_v2_panel):
@@ -289,6 +290,7 @@ def test_v2_registration_javascript_reuses_current_backend_contracts():
     assert "Promise.allSettled" in source
     assert "browser.generation" in source
     assert "job.verification_concurrency" in source
+    assert "job.completed_rounds" in source
     assert "workerControlPending" in source
     assert "setInterval" in source
 

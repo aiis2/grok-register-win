@@ -5908,6 +5908,13 @@ def api_job_status():
             for worker in job["workers"]
             if worker.get("pid") is not None and worker.get("status") == "running"
         )
+        completed_rounds = max(0, int(job.get("success") or 0)) + max(
+            0, int(job.get("fail") or 0)
+        )
+        target_count = max(0, int(job.get("count") or 0))
+        job["completed_rounds"] = (
+            min(completed_rounds, target_count) if target_count else completed_rounds
+        )
     return jsonify({"ok": True, "job": job, "logs": list(_logs), "cpa": cpa_stats()})
 
 

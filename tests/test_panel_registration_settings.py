@@ -233,6 +233,10 @@ def test_job_status_exposes_sorted_worker_array_and_effective_concurrency(
     isolated_config, monkeypatch
 ):
     monkeypatch.setitem(panel_app._job, "concurrency", 4)
+    monkeypatch.setitem(panel_app._job, "count", 10)
+    monkeypatch.setitem(panel_app._job, "current_round", 4)
+    monkeypatch.setitem(panel_app._job, "success", 6)
+    monkeypatch.setitem(panel_app._job, "fail", 2)
     monkeypatch.setitem(
         panel_app._job,
         "workers",
@@ -262,6 +266,7 @@ def test_job_status_exposes_sorted_worker_array_and_effective_concurrency(
     assert [worker["worker_id"] for worker in job["workers"]] == [1, 2]
     assert job["effective_concurrency"] == 2
     assert job["active_workers"] == 1
+    assert job["completed_rounds"] == 8
     assert job["outcomes"] == {"1": "success"}
 
 

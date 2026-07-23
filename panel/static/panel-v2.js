@@ -728,13 +728,16 @@
     renderCpaStatus(cpa);
     const running = Boolean(job.running);
     const count = Number(job.count || 0);
-    const current = Math.min(Number(job.current_round || 0), count || Number(job.current_round || 0));
     const success = Number(job.success || 0);
     const fail = Number(job.fail || 0);
+    const completed = Math.min(
+      Number(job.completed_rounds ?? (success + fail)),
+      count || Number(job.completed_rounds ?? (success + fail)),
+    );
     const verificationConcurrency = Number(
       job.verification_concurrency || Math.min(Number(job.concurrency || 1), 3),
     );
-    const percent = count > 0 ? Math.min(100, Math.round((current / count) * 100)) : 0;
+    const percent = count > 0 ? Math.min(100, Math.round((completed / count) * 100)) : 0;
 
     const taskChip = document.getElementById('global-task-status');
     if (taskChip) taskChip.dataset.state = running ? 'running' : 'idle';
@@ -744,7 +747,7 @@
     setText('metric-concurrency', job.active_workers || 0);
     setText('metric-cpa', cpa.files || state.credentials?.stats?.cpa_files || 0);
     setText('overview-progress-label', running ? '注册进行中' : (count ? '最近任务' : '尚未运行任务'));
-    setText('overview-progress-value', `${current} / ${count}`);
+    setText('overview-progress-value', `${completed} / ${count}`);
     setText('overview-progress-detail', running
       ? `并发 ${job.concurrency || 1} · 验证通道 ${verificationConcurrency} · 活跃 Worker ${job.active_workers || 0}`
       : (job.finished_at ? `完成于 ${job.finished_at}` : '进入注册页设置轮数、并发和浏览器模式。'));
@@ -762,7 +765,7 @@
     );
 
     setText('registration-status', statusLabel(job.status));
-    setText('registration-round', `${current} / ${count}`);
+    setText('registration-round', `${completed} / ${count}`);
     setText('registration-success', success);
     setText('registration-fail', fail);
     setText('registration-workers', job.active_workers || 0);
