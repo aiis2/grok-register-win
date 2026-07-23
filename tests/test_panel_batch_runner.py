@@ -479,13 +479,20 @@ def test_stop_kills_current_batch_once_without_fabricating_result():
 
 def test_relaunch_environment_contains_only_remaining_count():
     env = panel_app.build_cli_batch_env(
-        {}, batch_count=2, round_offset=3, total=5, engine="chromium", timeout=90
+        {},
+        batch_count=2,
+        round_offset=3,
+        total=5,
+        engine="chromium",
+        timeout=90,
+        turnstile_gate_ports=(24600, 24601, 24602),
     )
 
     assert env["GROK_REGISTER_COUNT"] == "2"
     assert env["GROK_ROUND_OFFSET"] == "3"
     assert env["GROK_REGISTER_TOTAL"] == "5"
     assert env["ROUND_TIMEOUT_SEC"] == "90"
+    assert env["GROK_TURNSTILE_GATE_PORTS"] == "24600,24601,24602"
 
 
 def test_worker_batch_uses_config_snapshot_without_rewriting_shared_file(
@@ -556,6 +563,13 @@ def test_registration_work_never_creates_empty_workers():
         (1, 1),
         (2, 1),
     ]
+
+
+def test_panel_allocates_at_most_three_shared_turnstile_lanes():
+    ports = panel_app.allocate_turnstile_gate_ports(10)
+
+    assert len(ports) == 3
+    assert len(set(ports)) == 3
 
 
 def test_worker_environment_contains_unique_worker_identity():

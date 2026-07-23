@@ -219,6 +219,8 @@ DEFAULT_CONFIG = {
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
 _email_provider_index = 0
+_turnstile_gate_socket = None
+_turnstile_gate_port = 0
 
 # Turnstile 默认每 8 秒自动重试。给组件一次自动重试机会，再做一次官方 reset；
 # reset 后仍只有 64px 空占位时，不再耗完整个资料页/单账号超时。
@@ -1246,6 +1248,83 @@ def sleep_with_cancel(seconds, cancel_callback=None):
         if remaining <= 0:
             return
         time.sleep(min(0.2, remaining))
+
+
+def configured_turnstile_gate_ports():
+    """Return the panel-provided validation-stage lanes, if any."""
+    ports = []
+    for raw in str(os.environ.get("GROK_TURNSTILE_GATE_PORTS", "") or "").split(","):
+        try:
+            port = int(raw.strip())
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+        if len(ports) >= 10:
+            break
+    return tuple(ports)
+
+
+def _claim_turnstile_gate_port(port):
+    """Atomically claim one localhost lane; the open socket is the lease."""
+    lease = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            lease.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        lease.bind(("127.0.0.1", int(port)))
+        lease.listen(1)
+        return lease
+    except OSError:
+        lease.close()
+        return None
+
+
+def acquire_turnstile_gate(log_callback=None, cancel_callback=None):
+    """Wait for a shared lane before submitting OTP and loading Turnstile."""
+    global _turnstile_gate_socket, _turnstile_gate_port
+    if _turnstile_gate_socket is not None:
+        return True
+
+    ports = configured_turnstile_gate_ports()
+    if not ports:
+        return False
+
+    started_at = time.monotonic()
+    logged_wait = False
+    while True:
+        raise_if_cancelled(cancel_callback)
+        for lane, port in enumerate(ports, start=1):
+            lease = _claim_turnstile_gate_port(port)
+            if lease is None:
+                continue
+            _turnstile_gate_socket = lease
+            _turnstile_gate_port = port
+            if log_callback:
+                waited = time.monotonic() - started_at
+                suffix = f"，排队 {waited:.1f}s" if waited >= 0.1 else ""
+                log_callback(f"[*] 进入验证通道 {lane}/{len(ports)}{suffix}")
+            return True
+        if not logged_wait and log_callback:
+            log_callback(f"[*] 验证阶段排队：最多 {len(ports)} 路并行")
+            logged_wait = True
+        sleep_with_cancel(0.25, cancel_callback)
+
+
+def release_turnstile_gate(log_callback=None):
+    """Release a validation-stage lane. Safe to call repeatedly."""
+    global _turnstile_gate_socket, _turnstile_gate_port
+    lease = _turnstile_gate_socket
+    port = _turnstile_gate_port
+    _turnstile_gate_socket = None
+    _turnstile_gate_port = 0
+    if lease is None:
+        return False
+    try:
+        lease.close()
+    finally:
+        if log_callback:
+            log_callback(f"[*] 已释放验证通道（端口 {port}）")
+    return True
 
 
 def get_domains(api_key=None):
@@ -3395,6 +3474,10 @@ return false;
     if not code:
         raise Exception("获取验证码失败")
     clean_code = str(code).replace("-", "").strip()
+    acquire_turnstile_gate(
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
     deadline = time.time() + timeout
 
     while time.time() < deadline:
@@ -4943,6 +5026,7 @@ class GrokRegisterGUI:
                         log_callback=self.log, cancel_callback=cancel_cb
                     )
                     self.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                    release_turnstile_gate(log_callback=self.log)
                     self.log("[*] 5. 等待落到 grok.com 并提取 sso cookie（优先 grok.com 域）")
                     sso = wait_for_sso_cookie(
                         log_callback=self.log, cancel_callback=cancel_cb
@@ -5001,6 +5085,7 @@ class GrokRegisterGUI:
                     self.log(f"[-] 注册失败: {exc}")
                 finally:
                     self.update_stats()
+                    release_turnstile_gate(log_callback=self.log)
                     cleanup_active_mailbox(log_callback=self.log)
                     if self.should_stop():
                         break
@@ -5015,6 +5100,7 @@ class GrokRegisterGUI:
         except Exception as exc:
             self.log(f"[!] 任务异常: {exc}")
         finally:
+            release_turnstile_gate(log_callback=self.log)
             stop_browser()
             self._set_running_ui(False)
             self.log("[*] 任务结束")
@@ -5191,6 +5277,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                     log_callback=cli_log, cancel_callback=cancel_cb
                 )
                 cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                release_turnstile_gate(log_callback=cli_log)
                 cli_log("[*] 5. 等待落到 grok.com 并提取 sso cookie（优先 grok.com 域）")
                 sso = wait_for_sso_cookie(
                     log_callback=cli_log, cancel_callback=cancel_cb
@@ -5259,6 +5346,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
                         worker_id=worker_id,
                     )
                 )
+                release_turnstile_gate(log_callback=cli_log)
                 cleanup_active_mailbox(log_callback=cli_log)
                 if controller.should_stop():
                     break
@@ -5276,6 +5364,7 @@ def run_registration_cli(count, round_offset=0, total_count=None):
     except Exception as exc:
         cli_log(f"[!] 任务异常: {exc}")
     finally:
+        release_turnstile_gate(log_callback=cli_log)
         cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
         cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
 

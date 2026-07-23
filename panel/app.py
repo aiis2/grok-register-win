@@ -13,6 +13,7 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -322,6 +323,7 @@ _job: Dict = {
     "last_error": "",
     "status": "idle",
     "concurrency": 1,
+    "verification_concurrency": 1,
     "workers": {},
     "outcomes": {},
 }
@@ -332,6 +334,10 @@ LOG_STREAM_HEARTBEAT_SEC = 15.0
 _log_stream_slots = threading.BoundedSemaphore(MAX_LOG_STREAM_CLIENTS)
 _procs: Dict[int, subprocess.Popen] = {}
 _terminated_processes: Set[int] = set()
+TURNSTILE_STAGE_MAX_CONCURRENCY = 3
+TURNSTILE_GATE_PORT_START = 24600
+TURNSTILE_GATE_PORT_END = 24799
+_turnstile_gate_ports: Tuple[int, ...] = ()
 
 # --------------- mailbox receive test state ---------------
 EMAIL_RECEIVE_TEST_TTL_SEC = 600
@@ -2276,6 +2282,40 @@ def partition_registration_work(
     return assignments
 
 
+def allocate_turnstile_gate_ports(requested: int) -> Tuple[int, ...]:
+    """Reserve and return up to three free loopback ports for worker leases."""
+    slot_count = min(
+        TURNSTILE_STAGE_MAX_CONCURRENCY,
+        max(1, int(requested)),
+    )
+    reservations = []
+    ports = []
+    try:
+        for port in range(TURNSTILE_GATE_PORT_START, TURNSTILE_GATE_PORT_END + 1):
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                probe.bind(("127.0.0.1", port))
+                probe.listen(1)
+            except OSError:
+                probe.close()
+                continue
+            reservations.append(probe)
+            ports.append(port)
+            if len(ports) >= slot_count:
+                break
+        if len(ports) < slot_count:
+            raise RuntimeError(
+                f"无法分配 {slot_count} 个本地验证通道（端口范围 "
+                f"{TURNSTILE_GATE_PORT_START}-{TURNSTILE_GATE_PORT_END}）"
+            )
+        return tuple(ports)
+    finally:
+        for probe in reservations:
+            probe.close()
+
+
 def _worker_state_locked(worker_id: int) -> dict:
     workers = _job.setdefault("workers", {})
     key = str(int(worker_id))
@@ -2680,6 +2720,7 @@ def build_cli_batch_env(
     timeout: int,
     worker_id: int = 1,
     window_mode: str = "hidden",
+    turnstile_gate_ports: Tuple[int, ...] = (),
 ) -> dict:
     env = dict(base_env or {})
     env["PYTHONUNBUFFERED"] = "1"
@@ -2690,6 +2731,11 @@ def build_cli_batch_env(
     env["GROK_REGISTER_TOTAL"] = str(int(total))
     env["GROK_WORKER_ID"] = str(normalize_registration_concurrency(worker_id))
     env["GROK_BROWSER_WINDOW_MODE"] = normalize_browser_window_mode(window_mode)
+    ports = tuple(int(port) for port in turnstile_gate_ports)
+    if ports:
+        env["GROK_TURNSTILE_GATE_PORTS"] = ",".join(str(port) for port in ports)
+    else:
+        env.pop("GROK_TURNSTILE_GATE_PORTS", None)
     return env
 
 
@@ -2873,6 +2919,7 @@ def _run_batch(
         timeout=round_timeout,
         worker_id=worker_id,
         window_mode=window_mode,
+        turnstile_gate_ports=_turnstile_gate_ports,
     )
     # Windows / local: use system Chrome/Edge; allow override (chromium engine only)
     if engine == "chromium":
@@ -3250,10 +3297,11 @@ def job_worker(
 ):
     """Run register rounds. Node switching is intentionally not managed here —
     user selects nodes in their own Clash client."""
-    global _job
+    global _job, _turnstile_gate_ports
     try:
         concurrency = normalize_registration_concurrency(concurrency)
         assignments = partition_registration_work(count, concurrency)
+        _turnstile_gate_ports = allocate_turnstile_gate_ports(len(assignments))
         with _job_lock:
             startup_stop = bool(_job.get("stop"))
             _procs.clear()
@@ -3263,6 +3311,7 @@ def job_worker(
             _job["status"] = "running"
             _job["count"] = count
             _job["concurrency"] = concurrency
+            _job["verification_concurrency"] = len(_turnstile_gate_ports)
             _job["success"] = 0
             _job["fail"] = 0
             _job["outcomes"] = {}
@@ -3308,6 +3357,10 @@ def job_worker(
             f"[*] 固定并发槽已分配：请求 {concurrency}，实际 {len(assignments)}；"
             "每槽独立 CLI 进程、浏览器与 Profile"
         )
+        log_line(
+            f"[*] 验证阶段并发限制：最多 {len(_turnstile_gate_ports)} 路；"
+            "邮箱轮询与 SSO 阶段仍保持浏览器并发"
+        )
         summaries = run_worker_assignments(assignments, total=count)
         fatal_workers = sorted(
             worker_id
@@ -3331,6 +3384,7 @@ def job_worker(
             _job["last_error"] = str(e)
     finally:
         terminate_all_worker_processes()
+        _turnstile_gate_ports = ()
         with _job_lock:
             _job["running"] = False
             _job["status"] = "idle"
@@ -3363,6 +3417,11 @@ def start_job(
             _job["status"] = "starting"
             _job["count"] = count
             _job["concurrency"] = concurrency
+            _job["verification_concurrency"] = min(
+                TURNSTILE_STAGE_MAX_CONCURRENCY,
+                concurrency,
+                count,
+            )
             _job["success"] = 0
             _job["fail"] = 0
             _job["outcomes"] = {}

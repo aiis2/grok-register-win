@@ -731,6 +731,9 @@
     const current = Math.min(Number(job.current_round || 0), count || Number(job.current_round || 0));
     const success = Number(job.success || 0);
     const fail = Number(job.fail || 0);
+    const verificationConcurrency = Number(
+      job.verification_concurrency || Math.min(Number(job.concurrency || 1), 3),
+    );
     const percent = count > 0 ? Math.min(100, Math.round((current / count) * 100)) : 0;
 
     const taskChip = document.getElementById('global-task-status');
@@ -743,7 +746,7 @@
     setText('overview-progress-label', running ? '注册进行中' : (count ? '最近任务' : '尚未运行任务'));
     setText('overview-progress-value', `${current} / ${count}`);
     setText('overview-progress-detail', running
-      ? `并发 ${job.concurrency || 1} · 活跃 Worker ${job.active_workers || 0}`
+      ? `并发 ${job.concurrency || 1} · 验证通道 ${verificationConcurrency} · 活跃 Worker ${job.active_workers || 0}`
       : (job.finished_at ? `完成于 ${job.finished_at}` : '进入注册页设置轮数、并发和浏览器模式。'));
     const progressBar = document.getElementById('overview-progress-bar');
     const progressFill = document.getElementById('overview-progress-fill');
@@ -763,9 +766,10 @@
     setText('registration-success', success);
     setText('registration-fail', fail);
     setText('registration-workers', job.active_workers || 0);
+    setText('registration-verification-lanes', verificationConcurrency);
     setText('registration-started', job.started_at || '—');
     setText('registration-message', running
-      ? `任务运行中，目标 ${count} 轮，并发 ${job.concurrency || 1}。`
+      ? `任务运行中，目标 ${count} 轮，并发 ${job.concurrency || 1}，验证通道 ${verificationConcurrency}。`
       : (job.finished_at ? `任务已结束：成功 ${success}，失败 ${fail}。` : '等待启动注册任务。'));
     renderWorkers(Array.isArray(job.workers) ? job.workers : []);
     syncRegistrationControls();
