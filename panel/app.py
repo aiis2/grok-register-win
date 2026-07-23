@@ -285,6 +285,14 @@ def credentials_config_public(cfg: Optional[dict] = None) -> dict:
     data = cfg if isinstance(cfg, dict) else load_config()
     layout = current_credential_layout(data)
     stats = credential_storage_stats(layout)
+    saved_cpa_concurrency = normalize_cpa_concurrency(
+        data.get("cpa_oauth_concurrency", DEFAULT_CPA_CONCURRENCY)
+    )
+    effective_cpa_concurrency = resolve_cpa_concurrency(data)
+    with _cpa_lock:
+        runtime_cpa_concurrency = normalize_cpa_concurrency(
+            _cpa_state.get("concurrency", effective_cpa_concurrency)
+        )
     return {
         "ok": True,
         "configured": str(data.get("credentials_dir") or "data/credentials"),
@@ -297,6 +305,15 @@ def credentials_config_public(cfg: Optional[dict] = None) -> dict:
         "stats": stats,
         "legacy_files": len(_legacy_credential_files()),
         "running": registration_is_running(),
+        "cpa_oauth_concurrency": saved_cpa_concurrency,
+        "cpa_effective_concurrency": effective_cpa_concurrency,
+        "cpa_runtime_concurrency": runtime_cpa_concurrency,
+        "cpa_concurrency_env_override": bool(
+            str(os.environ.get(CPA_CONCURRENCY_ENV) or "").strip()
+        ),
+        "cpa_restart_required": (
+            effective_cpa_concurrency != runtime_cpa_concurrency
+        ),
     }
 
 
@@ -5884,6 +5901,15 @@ def api_set_credentials_config():
                 )
         ensure_layout(target)
         cfg["credentials_dir"] = setting
+        cfg["cpa_oauth_concurrency"] = normalize_cpa_concurrency(
+            data.get(
+                "cpa_oauth_concurrency",
+                cfg.get(
+                    "cpa_oauth_concurrency",
+                    DEFAULT_CPA_CONCURRENCY,
+                ),
+            )
+        )
         save_config_atomic(cfg)
         return jsonify(credentials_config_public(cfg))
     except Exception as exc:

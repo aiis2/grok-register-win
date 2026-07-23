@@ -410,3 +410,54 @@ def test_stale_commit_result_never_writes_into_new_workspace(
     assert not panel_app.current_cpa_paths().index_path.exists()
     assert fingerprint not in panel_app._cpa_inflight
     assert fingerprint not in panel_app._cpa_done
+
+
+def test_credentials_config_exposes_saved_and_runtime_cpa_concurrency(
+    isolated_pipeline,
+):
+    response = panel_app.app.test_client().get("/api/config/credentials")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["cpa_oauth_concurrency"] == 2
+    assert payload["cpa_runtime_concurrency"] == 2
+    assert payload["cpa_concurrency_env_override"] is False
+
+
+def test_credentials_config_saves_bounded_cpa_concurrency(
+    isolated_pipeline,
+):
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials",
+        json={
+            "credentials_dir": "vault",
+            "cpa_oauth_concurrency": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    config = json.loads(panel_app.CONFIG_PATH.read_text(encoding="utf-8"))
+    assert config["cpa_oauth_concurrency"] == 4
+    assert payload["cpa_oauth_concurrency"] == 4
+    assert payload["cpa_runtime_concurrency"] == 2
+    assert payload["cpa_restart_required"] is True
+
+
+def test_credentials_config_reports_environment_override(
+    isolated_pipeline, monkeypatch
+):
+    config = json.loads(panel_app.CONFIG_PATH.read_text(encoding="utf-8"))
+    config["cpa_oauth_concurrency"] = 3
+    panel_app.CONFIG_PATH.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setenv(panel_app.CPA_CONCURRENCY_ENV, "4")
+    panel_app._cpa_state["concurrency"] = 4
+
+    payload = panel_app.app.test_client().get(
+        "/api/config/credentials"
+    ).get_json()
+
+    assert payload["cpa_oauth_concurrency"] == 3
+    assert payload["cpa_runtime_concurrency"] == 4
+    assert payload["cpa_concurrency_env_override"] is True
+    assert payload["cpa_effective_concurrency"] == 4

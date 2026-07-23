@@ -831,6 +831,13 @@
     if (pathInput && document.activeElement !== pathInput) {
       pathInput.value = payload.configured || 'data/credentials';
     }
+    const cpaConcurrency = document.getElementById('cpa-oauth-concurrency');
+    if (cpaConcurrency && document.activeElement !== cpaConcurrency) {
+      cpaConcurrency.value = Number(payload.cpa_oauth_concurrency || 2);
+      cpaConcurrency.title = payload.cpa_concurrency_env_override
+        ? `环境变量当前覆盖为 ${Number(payload.cpa_effective_concurrency || 2)}`
+        : `当前进程运行值 ${Number(payload.cpa_runtime_concurrency || 2)}`;
+    }
     const writable = document.getElementById('credentials-writable');
     if (writable) {
       writable.textContent = payload.writable ? '可写' : '不可写';
@@ -875,6 +882,11 @@
     }
     setText('cpa-done', Number(cpa.done ?? cpa.files ?? 0));
     setText('cpa-pending', Number(cpa.pending || 0));
+    setText(
+      'cpa-worker-state',
+      `${Number(cpa.active_workers || 0)} / ${Number(cpa.concurrency || 1)}`,
+    );
+    setText('cpa-commit-pending', Number(cpa.commit_pending || 0));
     setText('cpa-fail', Number(cpa.fail || 0));
     setText('cpa-last-email', cpa.last_ok_email || '—');
     syncCredentialControls();
@@ -892,12 +904,14 @@
       || Boolean(state.cpa?.running)
       || Number(state.cpa?.pending || 0) > 0;
     const pathInput = document.getElementById('credentials-dir');
+    const cpaConcurrency = document.getElementById('cpa-oauth-concurrency');
     const save = document.getElementById('credentials-save');
     const migrate = document.getElementById('credentials-migrate');
     const backfill = document.getElementById('cpa-backfill');
     const refreshAll = document.getElementById('cpa-refresh-all');
     const limit = document.getElementById('cpa-backfill-limit');
     if (pathInput) pathInput.disabled = busy || blocked;
+    if (cpaConcurrency) cpaConcurrency.disabled = busy || blocked;
     if (save) save.disabled = busy || blocked;
     if (migrate) migrate.disabled = busy || blocked;
     if (limit) limit.disabled = busy || Boolean(state.job?.running);
@@ -911,20 +925,31 @@
 
   async function saveCredentialDirectory() {
     const credentialsDir = requestedCredentialPath();
+    const cpaConcurrencyInput = document.getElementById('cpa-oauth-concurrency');
     if (!credentialsDir) {
       setInlineError('section-credentials-error', '请输入凭据根目录');
       document.getElementById('credentials-dir')?.focus();
       return;
     }
+    if (!cpaConcurrencyInput?.reportValidity()) return;
+    const cpa_oauth_concurrency = Math.max(
+      1,
+      Math.min(4, Number(cpaConcurrencyInput.value || 2)),
+    );
     setBusy('credentials', true);
     setInlineError('section-credentials-error');
     try {
       const payload = await requestJson('/api/config/credentials', {
         method: 'POST',
-        body: { credentials_dir: credentialsDir },
+        body: {
+          credentials_dir: credentialsDir,
+          cpa_oauth_concurrency,
+        },
       });
       renderCredentialSummary(payload);
-      showToast('凭据目录已保存');
+      showToast(payload.cpa_restart_required
+        ? '设置已保存；OAuth 并发度将在重启面板后生效'
+        : '凭据目录与 OAuth 并发设置已保存');
     } catch (error) {
       setInlineError('section-credentials-error', safeErrorMessage(error));
     } finally {
@@ -995,7 +1020,7 @@
     const limit = Math.max(1, Math.min(10000, Number(limitInput.value || 10000)));
     const accepted = await confirmAction({
       title: '刷新当前账号池的全部 SSO 换票？',
-      message: '此操作不会生成新的 Web SSO。系统会重新换取 OAuth/CPA；成功后原子替换旧 CPA，失败时保留旧 CPA，并在后台串行执行。',
+      message: '此操作不会生成新的 Web SSO。系统会有界并行换取 OAuth，并串行提交 CPA；成功后原子替换旧 CPA，失败时保留旧 CPA。',
       acceptLabel: '开始刷新',
     });
     if (!accepted) return;

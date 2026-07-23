@@ -538,12 +538,17 @@ def test_v2_credentials_exposes_storage_migration_and_cpa_controls(
         "credentials-total-bytes",
         "credentials-legacy-files",
         "cpa-status",
+        "cpa-oauth-concurrency",
+        "cpa-worker-state",
+        "cpa-commit-pending",
         "cpa-backfill-limit",
         "cpa-backfill",
         "cpa-refresh-all",
     ):
         assert f'id="{element_id}"' in html
     assert 'max="10000"' in html
+    assert 'id="cpa-oauth-concurrency" type="number" min="1" max="4"' in html
+    assert "重启面板生效" in html
     assert "不会生成新的 Web SSO" in html
     assert "失败保留旧 CPA" in html
 
@@ -564,6 +569,9 @@ def test_v2_credentials_javascript_reuses_existing_safe_contracts():
     assert "confirmAction" in source
     assert "setBusy('credentials'" in source
     assert "async function refreshAllSso()" in source
+    assert "cpa_oauth_concurrency" in source
+    assert "active_workers" in source
+    assert "commit_pending" in source
     assert "失败时保留旧 CPA" in source
 
 
