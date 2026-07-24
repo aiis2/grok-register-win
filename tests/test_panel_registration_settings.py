@@ -52,13 +52,22 @@ def test_legacy_panel_exposes_confirmed_full_sso_refresh_control():
     html = panel_app.INDEX_HTML
 
     assert 'id="btn_cpa_refresh_all"' in html
-    assert "刷新全部 SSO" in html
+    assert "重新生成账号授权" in html
     assert "不会生成新的 Web SSO" in html
     assert "失败保留旧 CPA" in html
     assert "async function refreshAllSso()" in html
-    assert "/api/cpa/refresh-all" in html
+    assert "/api/cpa/reauthorize" in html
     assert "limit:10000" in html
     assert "confirm(message)" in html
+    assert 'id="oauth_target_instance"' in html
+    assert "async function exportOAuthArtifact" in html
+    assert "/api/oauth/export-preflight" in html
+    assert "/api/oauth/export-claim" in html
+    assert "claim.download_url" in html
+    assert (
+        'pattern="[A-Za-z0-9](?:[A-Za-z0-9._]|-){0,63}"'
+        in html
+    )
 
 
 def test_panel_contains_headed_browser_window_mode_and_worker_controls():

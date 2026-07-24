@@ -85,7 +85,7 @@ def test_v1_10_release_documents_combined_bounded_log_console(
         encoding="utf-8"
     )
 
-    assert "version-v1.11.0" in readme
+    assert "version-v1.12.0" in readme
     for phrase in (
         "aiis2",
         "注册与日志",
@@ -115,7 +115,7 @@ def test_v1_10_1_release_documents_turnstile_recovery_and_soak_validation(
         encoding="utf-8"
     )
 
-    assert "version-v1.11.0" in readme
+    assert "version-v1.12.0" in readme
     for phrase in (
         "aiis2",
         "Chromium",
@@ -146,7 +146,7 @@ def test_v1_11_release_documents_parallel_cpa_pipeline_and_registration_stabilit
         encoding="utf-8"
     )
 
-    assert "version-v1.11.0" in readme
+    assert "version-v1.12.0" in readme
     for phrase in (
         "aiis2",
         "默认使用 2 个 worker",
@@ -163,6 +163,36 @@ def test_v1_11_release_documents_parallel_cpa_pipeline_and_registration_stabilit
     for forbidden in (
         "asz798838958",
         "lingxiaoyiyu-hub",
+    ):
+        assert forbidden not in release_lower
+
+
+def test_v1_12_release_documents_oauth_single_instance_ownership(
+    isolated_v2_panel,
+):
+    root = Path(panel_app.__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    release = (root / "docs" / "releases" / "v1.12.0.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "version-v1.12.0" in readme
+    for phrase in (
+        "aiis2",
+        "重新生成账号授权",
+        "authorization-code exchange",
+        "OAuth 单实例归属账本",
+        "SHA-256",
+        "一次性票据",
+        "workspace epoch",
+        "482 passed",
+        "Playwright",
+    ):
+        assert phrase in release
+    release_lower = release.casefold()
+    for forbidden in (
+        "38.147.173.173",
+        "mail.aiis2.shop",
     ):
         assert forbidden not in release_lower
 
@@ -574,6 +604,7 @@ def test_v2_credentials_exposes_storage_migration_and_cpa_controls(
         "cpa-backfill-limit",
         "cpa-backfill",
         "cpa-refresh-all",
+        "oauth-target-instance",
     ):
         assert f'id="{element_id}"' in html
     assert 'max="10000"' in html
@@ -581,6 +612,14 @@ def test_v2_credentials_exposes_storage_migration_and_cpa_controls(
     assert "重启面板生效" in html
     assert "不会生成新的 Web SSO" in html
     assert "失败保留旧 CPA" in html
+    assert "重新生成账号授权" in html
+    assert 'data-oauth-export="cpa.zip"' in html
+    assert 'data-oauth-export="sub2.zip"' in html
+    assert 'data-oauth-export="sub2.json"' in html
+    assert (
+        'pattern="[A-Za-z0-9](?:[A-Za-z0-9._]|-){0,63}"'
+        in html
+    )
 
 
 def test_v2_credentials_javascript_reuses_existing_safe_contracts():
@@ -592,13 +631,19 @@ def test_v2_credentials_javascript_reuses_existing_safe_contracts():
         "/api/config/credentials/migrate",
         "/api/cpa/status",
         "/api/cpa/backfill",
-        "/api/cpa/refresh-all",
+        "/api/cpa/reauthorize",
+        "/api/oauth/export-preflight",
+        "/api/oauth/export-claim",
     ):
         assert endpoint in source
     assert "formatBytes" in source
     assert "confirmAction" in source
     assert "setBusy('credentials'" in source
     assert "async function refreshAllSso()" in source
+    assert "async function exportOAuthArtifact" in source
+    assert "acknowledge_previous_instance_disabled" in source
+    assert "claim.download_url" in source
+    assert "oauth_target_instance" in source
     assert "cpa_oauth_concurrency" in source
     assert "active_workers" in source
     assert "commit_pending" in source

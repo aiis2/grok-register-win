@@ -16,12 +16,31 @@ def isolated_storage(tmp_path, monkeypatch):
     app_root.mkdir()
     config_path = app_root / "config.json"
     config_path.write_text(
-        json.dumps({"credentials_dir": "vault"}), encoding="utf-8"
+        json.dumps(
+            {
+                "credentials_dir": "vault",
+                "oauth_target_instance": "test-primary",
+            }
+        ),
+        encoding="utf-8",
     )
     monkeypatch.setattr(panel_app, "BASE_DIR", app_root)
     monkeypatch.setattr(panel_app, "CONFIG_PATH", config_path)
     monkeypatch.delenv("CPA_DIR", raising=False)
     return app_root, config_path
+
+
+def _download_oauth_artifact(client, artifact: str):
+    claim = client.post(
+        "/api/oauth/export-claim",
+        json={
+            "artifact": artifact,
+            "target_instance": "test-primary",
+            "acknowledge_previous_instance_disabled": False,
+        },
+    )
+    assert claim.status_code == 200
+    return client.get(claim.get_json()["download_url"])
 
 
 def test_account_listing_reads_current_storage_and_legacy_root(isolated_storage):
@@ -86,8 +105,26 @@ def test_cpa_listing_and_zip_include_current_and_legacy_files(isolated_storage):
     legacy_cpa = app_root / "data" / "cpa"
     current_cpa.mkdir(parents=True)
     legacy_cpa.mkdir(parents=True)
-    current_payload = {"email": "current@example.com", "sso": "current-sso"}
-    legacy_payload = {"email": "legacy@example.com", "sso": "legacy-sso"}
+    current_payload = {
+        "email": "current@example.com",
+        "sub": "current-identity",
+        "sso": "current-sso",
+        "access_token": "current-access",
+        "refresh_token": "current-refresh",
+        "_authorization_id": "current-authorization",
+        "_authorization_generation": 1,
+        "_authorized_at": "2026-07-23T01:00:00Z",
+    }
+    legacy_payload = {
+        "email": "legacy@example.com",
+        "sub": "legacy-identity",
+        "sso": "legacy-sso",
+        "access_token": "legacy-access",
+        "refresh_token": "legacy-refresh",
+        "_authorization_id": "legacy-authorization",
+        "_authorization_generation": 1,
+        "_authorized_at": "2026-07-23T01:00:00Z",
+    }
     current_sso = app_root / "vault" / "sso"
     current_sso.mkdir(parents=True)
     (current_sso / "accounts_active.txt").write_text(
@@ -103,7 +140,9 @@ def test_cpa_listing_and_zip_include_current_and_legacy_files(isolated_storage):
     )
 
     files = panel_app.list_cpa_files()
-    response = panel_app.app.test_client().get("/download/cpa.zip")
+    response = _download_oauth_artifact(
+        panel_app.app.test_client(), "cpa.zip"
+    )
 
     assert {path.name for path in files} == {
         "xai-current.json",
@@ -127,15 +166,39 @@ def test_cpa_zip_excludes_credentials_not_owned_by_current_accounts(
         "active@example.com----pw----active-sso\n", encoding="utf-8"
     )
     (cpa_dir / "xai-active.json").write_text(
-        json.dumps({"email": "active@example.com", "sso": "active-sso"}),
+        json.dumps(
+            {
+                "email": "active@example.com",
+                "sub": "active-identity",
+                "sso": "active-sso",
+                "access_token": "active-access",
+                "refresh_token": "active-refresh",
+                "_authorization_id": "active-authorization",
+                "_authorization_generation": 1,
+                "_authorized_at": "2026-07-23T01:00:00Z",
+            }
+        ),
         encoding="utf-8",
     )
     (cpa_dir / "xai-orphan.json").write_text(
-        json.dumps({"email": "old@example.com", "sso": "old-sso"}),
+        json.dumps(
+            {
+                "email": "old@example.com",
+                "sub": "old-identity",
+                "sso": "old-sso",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "_authorization_id": "old-authorization",
+                "_authorization_generation": 1,
+                "_authorized_at": "2026-07-23T01:00:00Z",
+            }
+        ),
         encoding="utf-8",
     )
 
-    response = panel_app.app.test_client().get("/download/cpa.zip")
+    response = _download_oauth_artifact(
+        panel_app.app.test_client(), "cpa.zip"
+    )
 
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
@@ -286,6 +349,27 @@ def test_credentials_status_reports_paths_and_counts_without_contents(
     assert "private-cpa" not in serialized
 
 
+def test_credentials_status_excludes_oauth_lock_from_counts_and_cpa_total(
+    isolated_storage,
+):
+    app_root, _ = isolated_storage
+    cpa_dir = app_root / "vault" / "cpa"
+    cpa_dir.mkdir(parents=True, exist_ok=True)
+    (cpa_dir / "xai-one.json").write_text("credential", encoding="utf-8")
+    (cpa_dir / "oauth_ownership.json").write_text(
+        "ownership", encoding="utf-8"
+    )
+    (cpa_dir / ".oauth_ownership.json.lock").write_bytes(b"\0")
+
+    response = panel_app.app.test_client().get("/api/config/credentials")
+
+    assert response.status_code == 200
+    stats = response.get_json()["stats"]
+    assert stats["cpa_files"] == 1
+    assert stats["total_files"] == 2
+    assert stats["total_bytes"] == len("credentialownership")
+
+
 def test_save_empty_credentials_directory_updates_config_atomically(
     isolated_storage,
 ):
@@ -302,6 +386,66 @@ def test_save_empty_credentials_directory_updates_config_atomically(
     assert saved["credentials_dir"] == "empty-vault"
     assert (app_root / "empty-vault" / "sso").is_dir()
     assert not list(app_root.glob(".*config*.tmp"))
+
+
+def test_failed_credentials_config_save_preserves_workspace_epochs(
+    isolated_storage,
+    monkeypatch,
+):
+    app_root, config_path = isolated_storage
+    source_lock_path = (
+        app_root / "vault" / "cpa" / ".oauth_ownership.json.lock"
+    )
+    target_lock_path = (
+        app_root / "empty-vault" / "cpa" / ".oauth_ownership.json.lock"
+    )
+    epochs_before = (
+        panel_app.interprocess_lock_epoch(source_lock_path),
+        panel_app.interprocess_lock_epoch(target_lock_path),
+    )
+
+    def fail_save(_config):
+        raise OSError("simulated atomic save failure")
+
+    monkeypatch.setattr(panel_app, "save_config_atomic", fail_save)
+
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials",
+        json={"credentials_dir": "empty-vault"},
+    )
+
+    assert response.status_code == 400
+    assert json.loads(config_path.read_text(encoding="utf-8"))[
+        "credentials_dir"
+    ] == "vault"
+    assert (
+        panel_app.interprocess_lock_epoch(source_lock_path),
+        panel_app.interprocess_lock_epoch(target_lock_path),
+    ) == epochs_before
+
+
+def test_save_empty_directory_rejects_other_process_target_workspace_owner(
+    isolated_storage,
+):
+    app_root, config_path = isolated_storage
+    target_cpa = app_root / "empty-vault" / "cpa"
+    external_lock = panel_app.InterProcessFileLock(
+        target_cpa / ".oauth_ownership.json.lock"
+    )
+    assert external_lock.acquire(blocking=False)
+    try:
+        response = panel_app.app.test_client().post(
+            "/api/config/credentials",
+            json={"credentials_dir": "empty-vault"},
+        )
+    finally:
+        external_lock.release()
+
+    assert response.status_code == 409
+    assert "另一个程序实例" in response.get_json()["error"]
+    assert json.loads(config_path.read_text(encoding="utf-8"))[
+        "credentials_dir"
+    ] == "vault"
 
 
 def test_save_directory_requires_migration_when_source_has_credentials(

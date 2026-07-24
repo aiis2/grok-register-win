@@ -151,6 +151,9 @@ def test_parallel_oauth_workers_overlap_but_commit_complete_index(
 
     monkeypatch.setattr(panel_app, "convert_one", convert)
     _enqueue_synthetic(24)
+    workspace_epoch = panel_app.interprocess_lock_epoch(
+        isolated_pipeline / ".oauth_ownership.json.lock"
+    )
 
     workers, committer = panel_app._start_cpa_pipeline_threads(4)
     panel_app._cpa_q.join()
@@ -168,8 +171,32 @@ def test_parallel_oauth_workers_overlap_but_commit_complete_index(
     assert panel_app._cpa_state["commit_pending"] == 0
     assert panel_app._cpa_state["commit_active"] == 0
     assert not panel_app._cpa_inflight
+    assert (
+        panel_app.interprocess_lock_epoch(
+            isolated_pipeline / ".oauth_ownership.json.lock"
+        )
+        == workspace_epoch
+    )
 
     _stop_pipeline(workers, committer)
+
+
+def test_local_oauth_workers_share_workspace_lock_until_last_commit_releases(
+    isolated_pipeline,
+):
+    coordinator = panel_app._CPAWorkspaceLeaseCoordinator()
+    first = coordinator.acquire(isolated_pipeline)
+    second = coordinator.acquire(isolated_pipeline)
+    external = panel_app.InterProcessFileLock(
+        isolated_pipeline / ".oauth_ownership.json.lock"
+    )
+
+    assert external.acquire(blocking=False) is False
+    first.release()
+    assert external.acquire(blocking=False) is False
+    second.release()
+    assert external.acquire(blocking=False) is True
+    external.release()
 
 
 def test_fingerprint_remains_inflight_until_serial_commit(
@@ -442,6 +469,25 @@ def test_credentials_config_saves_bounded_cpa_concurrency(
     assert payload["cpa_oauth_concurrency"] == 4
     assert payload["cpa_runtime_concurrency"] == 2
     assert payload["cpa_restart_required"] is True
+
+
+def test_credentials_config_saves_oauth_target_instance(
+    isolated_pipeline,
+):
+    response = panel_app.app.test_client().post(
+        "/api/config/credentials",
+        json={
+            "credentials_dir": "vault",
+            "cpa_oauth_concurrency": 2,
+            "oauth_target_instance": "sub2api-primary",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    config = json.loads(panel_app.CONFIG_PATH.read_text(encoding="utf-8"))
+    assert config["oauth_target_instance"] == "sub2api-primary"
+    assert payload["oauth_target_instance"] == "sub2api-primary"
 
 
 def test_credentials_config_reports_environment_override(

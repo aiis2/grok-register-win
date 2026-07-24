@@ -6,6 +6,7 @@ __pycache__/
 config.json
 data/logs/*
 data/cpa/*
+data/credentials/
 !data/logs/.gitkeep
 !data/cpa/.gitkeep
 accounts_*.txt

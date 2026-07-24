@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,10 @@ from credential_store import (
     ensure_layout,
     migrate_credentials,
     normalize_credentials_setting,
+)
+from oauth_credential_ownership import (
+    InterProcessFileLock,
+    interprocess_lock_epoch,
 )
 
 
@@ -139,6 +145,36 @@ def _write(path: Path, content: str) -> Path:
     return path
 
 
+def _ownership_payload(
+    identity: str,
+    refresh_token: str,
+    target_instance: str,
+    *,
+    generation: int = 1,
+) -> str:
+    identity_fingerprint = hashlib.sha256(
+        f"sub:{identity}".encode("utf-8")
+    ).hexdigest()
+    credential_fingerprint = hashlib.sha256(
+        refresh_token.encode("utf-8")
+    ).hexdigest()
+    return json.dumps(
+        {
+            "version": 1,
+            "updated_at": "2026-07-23T01:00:00Z",
+            "items": {
+                identity_fingerprint: {
+                    "target_instance": target_instance,
+                    "credential_fingerprint": credential_fingerprint,
+                    "authorization_id": f"authorization-{identity}",
+                    "authorization_generation": generation,
+                    "claimed_at": "2026-07-23T01:00:00Z",
+                }
+            },
+        }
+    )
+
+
 def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tmp_path):
     app_root = tmp_path / "app"
     app_root.mkdir()
@@ -152,6 +188,14 @@ def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tm
         _write(current.sso_dir / "accounts_current.txt", "current-sso"),
         _write(current.mail_dir / "mail_credentials_current.txt", "current-mail"),
         _write(current.cpa_dir / "xai-current.json", "current-cpa"),
+        _write(
+            current.cpa_dir / "oauth_ownership.json",
+            _ownership_payload(
+                "current-identity",
+                "current-refresh",
+                "sub2api-primary",
+            ),
+        ),
         _write(app_root / "accounts_legacy.txt", "legacy-sso"),
         _write(app_root / "mail_credentials.txt", "legacy-mail"),
         _write(app_root / "data" / "cpa" / "xai-legacy.json", "legacy-cpa"),
@@ -164,7 +208,10 @@ def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tm
                 "setting": setting,
                 "sources_exist": all(path.exists() for path in sources),
                 "target_files": sorted(
-                    path.name for path in target.root.rglob("*") if path.is_file()
+                    path.name
+                    for path in target.root.rglob("*")
+                    if path.is_file()
+                    and path.name != ".oauth_ownership.json.lock"
                 ),
             }
         )
@@ -177,7 +224,7 @@ def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tm
         conflict_timestamp="20260719_170000",
     )
 
-    assert result.copied == 6
+    assert result.copied == 7
     assert result.skipped == 0
     assert result.renamed == 0
     assert result.warnings == []
@@ -190,12 +237,231 @@ def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tm
                 "accounts_legacy.txt",
                 "mail_credentials.txt",
                 "mail_credentials_current.txt",
+                "oauth_ownership.json",
                 "xai-current.json",
                 "xai-legacy.json",
             ],
         }
     ]
     assert all(not path.exists() for path in sources)
+
+
+def test_migration_merges_all_live_ownership_registries_into_canonical_file(
+    tmp_path,
+):
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    current = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "old"})
+    )
+    target = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "new"})
+    )
+    current_registry = _write(
+        current.cpa_dir / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-one",
+            "refresh-one",
+            "sub2api-primary",
+        ),
+    )
+    legacy_registry = _write(
+        app_root / "data" / "cpa" / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-two",
+            "refresh-two",
+            "cliproxy-primary",
+        ),
+    )
+    _write(
+        target.cpa_dir / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-three",
+            "refresh-three",
+            "sub2api-secondary",
+        ),
+    )
+    switches = []
+
+    result = migrate_credentials(
+        app_root,
+        current,
+        target,
+        switch_config=switches.append,
+    )
+
+    canonical = target.cpa_dir / "oauth_ownership.json"
+    payload = json.loads(canonical.read_text(encoding="utf-8"))
+    assert len(payload["items"]) == 3
+    assert result.copied == 2
+    assert result.renamed == 0
+    assert switches == [str(Path("new"))]
+    assert not current_registry.exists()
+    assert not legacy_registry.exists()
+    assert not list(target.cpa_dir.glob("oauth_ownership-migrated-*.json"))
+
+
+def test_migration_fails_closed_when_ownership_registries_conflict(tmp_path):
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    current = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "old"})
+    )
+    target = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "new"})
+    )
+    source = _write(
+        current.cpa_dir / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-one",
+            "refresh-one",
+            "sub2api-primary",
+        ),
+    )
+    canonical = _write(
+        target.cpa_dir / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-one",
+            "refresh-two",
+            "sub2api-secondary",
+        ),
+    )
+    canonical_before = canonical.read_bytes()
+    switches = []
+
+    with pytest.raises(
+        CredentialMigrationError,
+        match="OAuth 凭据所有权.*冲突",
+    ):
+        migrate_credentials(
+            app_root,
+            current,
+            target,
+            switch_config=switches.append,
+        )
+
+    assert switches == []
+    assert source.exists()
+    assert canonical.read_bytes() == canonical_before
+    assert not list(target.cpa_dir.glob("oauth_ownership-migrated-*.json"))
+
+
+def test_migration_restores_existing_ownership_registry_if_config_switch_fails(
+    tmp_path,
+):
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    current = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "old"})
+    )
+    target = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "new"})
+    )
+    source_registry = _write(
+        current.cpa_dir / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-one",
+            "refresh-one",
+            "sub2api-primary",
+        ),
+    )
+    source_account = _write(
+        current.sso_dir / "accounts_one.txt",
+        "one@example.com----password----sso-one",
+    )
+    canonical = _write(
+        target.cpa_dir / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-two",
+            "refresh-two",
+            "sub2api-secondary",
+        ),
+    )
+    canonical_before = canonical.read_bytes()
+    current_lock_path = current.cpa_dir / ".oauth_ownership.json.lock"
+    target_lock_path = target.cpa_dir / ".oauth_ownership.json.lock"
+    epochs_before = (
+        interprocess_lock_epoch(current_lock_path),
+        interprocess_lock_epoch(target_lock_path),
+    )
+
+    def fail_switch(_setting):
+        raise RuntimeError("simulated config switch failure")
+
+    with pytest.raises(CredentialMigrationError, match="RuntimeError"):
+        migrate_credentials(
+            app_root,
+            current,
+            target,
+            switch_config=fail_switch,
+        )
+
+    assert canonical.read_bytes() == canonical_before
+    assert source_registry.exists()
+    assert source_account.exists()
+    assert not (target.sso_dir / source_account.name).exists()
+    assert (
+        interprocess_lock_epoch(current_lock_path),
+        interprocess_lock_epoch(target_lock_path),
+    ) == epochs_before
+
+
+def test_migration_fails_closed_when_an_ownership_registry_is_locked(
+    tmp_path,
+):
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    current = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "old"})
+    )
+    target = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "new"})
+    )
+    source_registry = _write(
+        current.cpa_dir / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-one",
+            "refresh-one",
+            "sub2api-primary",
+        ),
+    )
+    source_account = _write(
+        current.sso_dir / "accounts_one.txt",
+        "one@example.com----password----sso-one",
+    )
+    canonical = _write(
+        target.cpa_dir / "oauth_ownership.json",
+        _ownership_payload(
+            "identity-two",
+            "refresh-two",
+            "sub2api-secondary",
+        ),
+    )
+    canonical_before = canonical.read_bytes()
+    lock = InterProcessFileLock(
+        source_registry.with_name(f".{source_registry.name}.lock")
+    )
+    assert lock.acquire(blocking=False)
+    switches = []
+    try:
+        with pytest.raises(
+            CredentialMigrationError,
+            match="其他程序实例.*迁移已取消",
+        ):
+            migrate_credentials(
+                app_root,
+                current,
+                target,
+                switch_config=switches.append,
+            )
+    finally:
+        lock.release()
+
+    assert switches == []
+    assert source_registry.exists()
+    assert source_account.exists()
+    assert canonical.read_bytes() == canonical_before
+    assert not (target.sso_dir / source_account.name).exists()
 
 
 def test_migration_skips_identical_target_and_removes_source(tmp_path):
@@ -309,7 +575,11 @@ def test_verification_failure_rolls_back_new_targets_and_keeps_sources(tmp_path)
     assert switches == []
     assert first.exists()
     assert second.exists()
-    assert not any(path.is_file() for path in target.root.rglob("*"))
+    assert not any(
+        path.is_file()
+        and path.name != ".oauth_ownership.json.lock"
+        for path in target.root.rglob("*")
+    )
 
 
 def test_source_delete_failure_becomes_warning_after_config_switch(

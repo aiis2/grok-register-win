@@ -838,6 +838,10 @@
         ? `环境变量当前覆盖为 ${Number(payload.cpa_effective_concurrency || 2)}`
         : `当前进程运行值 ${Number(payload.cpa_runtime_concurrency || 2)}`;
     }
+    const targetInstance = document.getElementById('oauth-target-instance');
+    if (targetInstance && document.activeElement !== targetInstance) {
+      targetInstance.value = payload.oauth_target_instance || '';
+    }
     const writable = document.getElementById('credentials-writable');
     if (writable) {
       writable.textContent = payload.writable ? '可写' : '不可写';
@@ -905,6 +909,7 @@
       || Number(state.cpa?.pending || 0) > 0;
     const pathInput = document.getElementById('credentials-dir');
     const cpaConcurrency = document.getElementById('cpa-oauth-concurrency');
+    const targetInstance = document.getElementById('oauth-target-instance');
     const save = document.getElementById('credentials-save');
     const migrate = document.getElementById('credentials-migrate');
     const backfill = document.getElementById('cpa-backfill');
@@ -912,6 +917,7 @@
     const limit = document.getElementById('cpa-backfill-limit');
     if (pathInput) pathInput.disabled = busy || blocked;
     if (cpaConcurrency) cpaConcurrency.disabled = busy;
+    if (targetInstance) targetInstance.disabled = busy;
     if (save) save.disabled = busy;
     if (migrate) migrate.disabled = busy || blocked;
     if (limit) limit.disabled = busy || Boolean(state.job?.running);
@@ -923,15 +929,21 @@
     return String(document.getElementById('credentials-dir')?.value || '').trim();
   }
 
+  function requestedOAuthTargetInstance() {
+    return String(document.getElementById('oauth-target-instance')?.value || '').trim();
+  }
+
   async function saveCredentialDirectory() {
     const credentialsDir = requestedCredentialPath();
     const cpaConcurrencyInput = document.getElementById('cpa-oauth-concurrency');
+    const targetInstanceInput = document.getElementById('oauth-target-instance');
     if (!credentialsDir) {
       setInlineError('section-credentials-error', '请输入凭据根目录');
       document.getElementById('credentials-dir')?.focus();
       return;
     }
     if (!cpaConcurrencyInput?.reportValidity()) return;
+    if (targetInstanceInput && !targetInstanceInput.reportValidity()) return;
     const cpa_oauth_concurrency = Math.max(
       1,
       Math.min(4, Number(cpaConcurrencyInput.value || 2)),
@@ -944,12 +956,13 @@
         body: {
           credentials_dir: credentialsDir,
           cpa_oauth_concurrency,
+          oauth_target_instance: requestedOAuthTargetInstance(),
         },
       });
       renderCredentialSummary(payload);
       showToast(payload.cpa_restart_required
         ? '设置已保存；OAuth 并发度将在重启面板后生效'
-        : '凭据目录与 OAuth 并发设置已保存');
+        : '凭据目录、OAuth 并发与目标实例设置已保存');
     } catch (error) {
       setInlineError('section-credentials-error', safeErrorMessage(error));
     } finally {
@@ -966,7 +979,7 @@
     }
     const accepted = await confirmAction({
       title: '迁移全部账号凭据并切换目录？',
-      message: `将当前 SSO、邮箱和 CPA 凭据一起迁移到 ${credentialsDir}。文件会先复制并校验，再切换配置。`,
+      message: `将当前 SSO、邮箱和 CPA 凭据一起迁移到 ${credentialsDir}。系统会先跨进程锁定并安全合并 OAuth 归属账本，再复制校验文件并切换配置；账本冲突或正被其他实例使用时会停止。`,
       acceptLabel: '迁移并切换',
     });
     if (!accepted) return;
@@ -1019,24 +1032,108 @@
     if (!limitInput?.reportValidity()) return;
     const limit = Math.max(1, Math.min(10000, Number(limitInput.value || 10000)));
     const accepted = await confirmAction({
-      title: '刷新当前账号池的全部 SSO 换票？',
-      message: '此操作不会生成新的 Web SSO。系统会有界并行换取 OAuth，并串行提交 CPA；成功后原子替换旧 CPA，失败时保留旧 CPA。',
-      acceptLabel: '开始刷新',
+      title: '重新生成当前账号池的账号授权？',
+      message: '系统将使用保存的 Web SSO 重新执行 OAuth 授权码交换，每个稳定身份只处理一次，并生成新的 access / refresh token。成功后原子替换旧 CPA，失败时保留旧 CPA；旧导出包不能用于新的目标实例。',
+      acceptLabel: '重新生成授权',
     });
     if (!accepted) return;
     setBusy('credentials', true);
     setInlineError('section-credentials-error');
     try {
-      const payload = await requestJson('/api/cpa/refresh-all', {
+      const payload = await requestJson('/api/cpa/reauthorize', {
         method: 'POST',
         body: { limit },
       });
       if (payload.cpa) renderCpaStatus(payload.cpa);
-      showToast(payload.message || `已入队 ${Number(payload.queued || 0)} 个 SSO`);
+      showToast(payload.message || `已入队 ${Number(payload.queued || 0)} 个账号`);
       await Promise.allSettled([loadCpaStatus(), loadJobStatus({ silent: true })]);
       window.setTimeout(() => loadCpaStatus().catch(() => {}), 1200);
     } catch (error) {
       setInlineError('section-credentials-error', safeErrorMessage(error));
+    } finally {
+      setBusy('credentials', false);
+    }
+  }
+
+  async function exportOAuthArtifact(event) {
+    event?.preventDefault();
+    const link = event?.currentTarget;
+    const artifact = String(link?.dataset?.oauthExport || '').trim();
+    const targetInstanceInput = document.getElementById('oauth-target-instance');
+    if (!artifact || !targetInstanceInput?.reportValidity()) return;
+    const targetInstance = requestedOAuthTargetInstance();
+    if (!targetInstance) {
+      setInlineError('section-credentials-error', '请先在凭据页面配置并保存 OAuth 目标实例');
+      showSection('credentials');
+      targetInstanceInput?.focus();
+      return;
+    }
+    setBusy('credentials', true);
+    setInlineError('section-credentials-error');
+    try {
+      const target = encodeURIComponent(targetInstance);
+      const preflight = await requestJson(
+        `/api/oauth/export-preflight?target_instance=${target}`,
+      );
+      if (Number(preflight.credential_conflicts || 0) > 0) {
+        throw new Error('同一 refresh token 已分配给其他实例，请先重新生成账号授权');
+      }
+      if (Number(preflight.invalid || 0) > 0) {
+        throw new Error('存在缺少 refresh token 的账号，请先重新生成账号授权');
+      }
+      if (Number(preflight.legacy_untracked || 0) > 0) {
+        throw new Error('存在升级前生成的旧 CPA，请先重新生成账号授权后再导出');
+      }
+      let acknowledge = false;
+      if (Number(preflight.transfer_required || 0) > 0) {
+        acknowledge = await confirmAction({
+          title: '确认迁移 OAuth 凭据所有权？',
+          message: `有 ${Number(preflight.transfer_required)} 个身份此前属于其他目标实例。仅在旧实例中的对应账号已经停用、不会再刷新这些 token 时继续。`,
+          acceptLabel: '旧实例已停用，继续',
+        });
+        if (!acknowledge) return;
+      }
+      const claim = await requestJson('/api/oauth/export-claim', {
+        method: 'POST',
+        body: {
+          artifact,
+          target_instance: targetInstance,
+          acknowledge_previous_instance_disabled: acknowledge,
+        },
+      });
+      const response = await window.fetch(
+        claim.download_url,
+        { credentials: 'same-origin' },
+      );
+      const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+      if (response.redirected || contentType.includes('text/html')) {
+        throw new Error('面板会话已失效，请重新登录后再导出');
+      }
+      if (!response.ok) {
+        const raw = await response.text();
+        let message = `导出失败（HTTP ${response.status}）`;
+        try {
+          const payload = JSON.parse(raw);
+          if (typeof payload.error === 'string') message = payload.error;
+        } catch (_) {
+          // Keep the bounded HTTP error above.
+        }
+        throw new Error(message);
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const download = document.createElement('a');
+      download.href = objectUrl;
+      download.download = artifact.replace('/', '-');
+      document.body.append(download);
+      download.click();
+      download.remove();
+      URL.revokeObjectURL(objectUrl);
+      showToast(`已生成仅供 ${targetInstance} 使用的 OAuth 凭据包`);
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      setInlineError('section-credentials-error', message);
+      showToast(message, 'error');
     } finally {
       setBusy('credentials', false);
     }
@@ -1818,6 +1915,9 @@
     document.getElementById('credentials-migrate')?.addEventListener('click', migrateCredentialDirectory);
     document.getElementById('cpa-backfill')?.addEventListener('click', backfillCpa);
     document.getElementById('cpa-refresh-all')?.addEventListener('click', refreshAllSso);
+    document.querySelectorAll('[data-oauth-export]').forEach((link) => {
+      link.addEventListener('click', exportOAuthArtifact);
+    });
     document.getElementById('logs-pause')?.addEventListener('click', toggleLogPause);
     document.getElementById('logs-autoscroll')?.addEventListener('change', (event) => {
       state.logs.autoScroll = Boolean(event.target.checked);

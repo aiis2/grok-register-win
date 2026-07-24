@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import secrets
 import shutil
 import hashlib
@@ -8,6 +10,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
+
+try:
+    from .oauth_credential_ownership import (
+        InterProcessFileLock,
+    )
+except ImportError:  # Imported as a top-level module by panel/app.py.
+    from oauth_credential_ownership import (
+        InterProcessFileLock,
+    )
 
 
 DEFAULT_CREDENTIALS_DIR = Path("data") / "credentials"
@@ -271,7 +282,12 @@ def _migration_sources(
                 ),
                 (
                     current.cpa_dir,
-                    ("xai-*.json", "index.json", "failed.jsonl"),
+                    (
+                        "xai-*.json",
+                        "index.json",
+                        "failed.jsonl",
+                        "oauth_ownership.json",
+                    ),
                     target.cpa_dir,
                 ),
             ]
@@ -282,7 +298,12 @@ def _migration_sources(
             (app_root, ("mail_credentials*.txt",), target.mail_dir),
             (
                 app_root / "data" / "cpa",
-                ("xai-*.json", "index.json", "failed.jsonl"),
+                (
+                    "xai-*.json",
+                    "index.json",
+                    "failed.jsonl",
+                    "oauth_ownership.json",
+                ),
                 target.cpa_dir,
             ),
         ]
@@ -337,7 +358,212 @@ def _conflict_destination(
     raise CredentialMigrationError(f"无法为冲突文件生成目标名称: {source.name}")
 
 
+_OAUTH_OWNERSHIP_FILENAME = "oauth_ownership.json"
+_OAUTH_OWNERSHIP_VERSION = 1
+_OAUTH_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+_OAUTH_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _read_oauth_ownership_registry(path: Path) -> dict:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise CredentialMigrationError(
+            f"OAuth 凭据所有权登记损坏，迁移已取消: {Path(path).name}"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _OAUTH_OWNERSHIP_VERSION
+        or not isinstance(payload.get("items"), dict)
+    ):
+        raise CredentialMigrationError(
+            f"OAuth 凭据所有权登记损坏，迁移已取消: {Path(path).name}"
+        )
+
+    normalized_items: dict[str, dict] = {}
+    credential_owners: dict[str, str] = {}
+    for identity, raw_item in payload["items"].items():
+        if (
+            not isinstance(identity, str)
+            or not _OAUTH_FINGERPRINT_RE.fullmatch(identity)
+            or not isinstance(raw_item, dict)
+        ):
+            raise CredentialMigrationError(
+                "OAuth 凭据所有权登记损坏，迁移已取消"
+            )
+        item = dict(raw_item)
+        credential = str(item.get("credential_fingerprint") or "").strip()
+        target_instance = str(item.get("target_instance") or "").strip()
+        if (
+            not _OAUTH_FINGERPRINT_RE.fullmatch(credential)
+            or not _OAUTH_TARGET_RE.fullmatch(target_instance)
+        ):
+            raise CredentialMigrationError(
+                "OAuth 凭据所有权登记损坏，迁移已取消"
+            )
+        previous_identity = credential_owners.get(credential)
+        if previous_identity and previous_identity != identity:
+            raise CredentialMigrationError(
+                "OAuth 凭据所有权登记存在 refresh token 归属冲突，"
+                "迁移已取消"
+            )
+        credential_owners[credential] = identity
+        item["credential_fingerprint"] = credential
+        item["target_instance"] = target_instance
+        normalized_items[identity] = item
+
+    return {
+        "version": _OAUTH_OWNERSHIP_VERSION,
+        "updated_at": str(payload.get("updated_at") or "").strip(),
+        "items": normalized_items,
+    }
+
+
+def _ownership_item_recency(item: Mapping[str, object]) -> tuple[int, str]:
+    try:
+        generation = max(
+            0, int(item.get("authorization_generation") or 0)
+        )
+    except (TypeError, ValueError):
+        generation = 0
+    return generation, str(item.get("claimed_at") or "")
+
+
+def _merge_oauth_ownership_registries(paths: Iterable[Path]) -> dict:
+    merged_items: dict[str, dict] = {}
+    credential_owners: dict[str, str] = {}
+    updated_at = ""
+    for path in paths:
+        payload = _read_oauth_ownership_registry(path)
+        updated_at = max(updated_at, str(payload.get("updated_at") or ""))
+        for identity, item in payload["items"].items():
+            credential = str(item["credential_fingerprint"])
+            target_instance = str(item["target_instance"])
+            previous_identity = credential_owners.get(credential)
+            if previous_identity and previous_identity != identity:
+                raise CredentialMigrationError(
+                    "OAuth 凭据所有权登记存在 refresh token 归属冲突，"
+                    "迁移已取消"
+                )
+            existing = merged_items.get(identity)
+            if existing is not None:
+                if (
+                    str(existing.get("credential_fingerprint")) != credential
+                    or str(existing.get("target_instance")) != target_instance
+                ):
+                    raise CredentialMigrationError(
+                        "OAuth 凭据所有权登记存在身份归属冲突，迁移已取消"
+                    )
+                if _ownership_item_recency(item) > _ownership_item_recency(
+                    existing
+                ):
+                    merged_items[identity] = dict(item)
+            else:
+                merged_items[identity] = dict(item)
+            credential_owners[credential] = identity
+
+    return {
+        "version": _OAUTH_OWNERSHIP_VERSION,
+        "updated_at": updated_at
+        or datetime.now().astimezone().isoformat(timespec="seconds"),
+        "items": merged_items,
+    }
+
+
+def _replace_file_bytes_atomic(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.migrate-{secrets.token_hex(4)}.tmp"
+    )
+    try:
+        temporary.write_bytes(content)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _migration_ownership_registry_paths(
+    app_root: Path,
+    current: CredentialLayout,
+    target: CredentialLayout,
+) -> list[Path]:
+    candidates = [
+        current.cpa_dir / _OAUTH_OWNERSHIP_FILENAME,
+        target.cpa_dir / _OAUTH_OWNERSHIP_FILENAME,
+    ]
+    legacy_directory = Path(app_root).resolve() / "data" / "cpa"
+    if legacy_directory.is_dir():
+        candidates.append(legacy_directory / _OAUTH_OWNERSHIP_FILENAME)
+
+    unique: dict[str, Path] = {}
+    for registry_path in candidates:
+        lock_path = registry_path.with_name(f".{registry_path.name}.lock")
+        resolved = lock_path.resolve()
+        unique[os.path.normcase(str(resolved))] = resolved
+    return [unique[key] for key in sorted(unique)]
+
+
 def migrate_credentials(
+    app_root: Path,
+    current: CredentialLayout,
+    target: CredentialLayout,
+    *,
+    switch_config: Callable[[str], None],
+    verify_file: Callable[[Path, Path], bool] = verify_sha256,
+    conflict_timestamp: str | None = None,
+) -> MigrationResult:
+    resolved_app_root = Path(app_root).resolve()
+    if current.root != target.root and (
+        _is_relative_to(target.root, current.root)
+        or _is_relative_to(current.root, target.root)
+    ):
+        raise CredentialMigrationError("新旧凭据目录不能互相嵌套")
+    ensured_target = ensure_layout(target)
+    lock_paths = _migration_ownership_registry_paths(
+        resolved_app_root,
+        current,
+        ensured_target,
+    )
+    locks: list[InterProcessFileLock] = []
+    previous_epochs: list[tuple[InterProcessFileLock, int]] = []
+    epochs_committed = False
+    try:
+        for lock_path in lock_paths:
+            lock = InterProcessFileLock(lock_path)
+            if not lock.acquire(blocking=False):
+                raise CredentialMigrationError(
+                    "OAuth 凭据所有权登记正在被其他程序实例使用，"
+                    "迁移已取消"
+                )
+            locks.append(lock)
+        previous_epochs = [(lock, lock.epoch()) for lock in locks]
+        for lock in locks:
+            lock.bump_epoch()
+        result = _migrate_credentials_locked(
+            resolved_app_root,
+            current,
+            ensured_target,
+            switch_config=switch_config,
+            verify_file=verify_file,
+            conflict_timestamp=conflict_timestamp,
+        )
+        epochs_committed = True
+        return result
+    finally:
+        if previous_epochs and not epochs_committed:
+            for lock, previous_epoch in reversed(previous_epochs):
+                try:
+                    lock.set_epoch(previous_epoch)
+                except Exception:
+                    pass
+        for lock in reversed(locks):
+            lock.release()
+
+
+def _migrate_credentials_locked(
     app_root: Path,
     current: CredentialLayout,
     target: CredentialLayout,
@@ -358,15 +584,48 @@ def migrate_credentials(
     sources = _migration_sources(
         resolved_app_root, current=current, target=ensured_target
     )
+    target_registry = ensured_target.cpa_dir / _OAUTH_OWNERSHIP_FILENAME
+    registry_sources = [
+        source
+        for source, destination_dir in sources
+        if source.name == _OAUTH_OWNERSHIP_FILENAME
+        and destination_dir.resolve() == ensured_target.cpa_dir.resolve()
+    ]
+    ordinary_sources = [
+        (source, destination_dir)
+        for source, destination_dir in sources
+        if not (
+            source.name == _OAUTH_OWNERSHIP_FILENAME
+            and destination_dir.resolve() == ensured_target.cpa_dir.resolve()
+        )
+    ]
+    registry_target_existed = target_registry.exists()
+    if registry_target_existed and not target_registry.is_file():
+        raise CredentialMigrationError(
+            "OAuth 凭据所有权登记目标不是文件，迁移已取消"
+        )
+    previous_registry_bytes = (
+        target_registry.read_bytes() if registry_target_existed else None
+    )
+    merged_registry_bytes: bytes | None = None
+    if registry_sources:
+        registry_inputs = (
+            [target_registry] if registry_target_existed else []
+        ) + registry_sources
+        merged_registry = _merge_oauth_ownership_registries(registry_inputs)
+        merged_registry_bytes = (
+            json.dumps(merged_registry, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
     created: list[Path] = []
     temporary: list[Path] = []
     completed_sources: list[Path] = []
     copied = 0
     skipped = 0
     renamed = 0
+    registry_write_attempted = False
 
     try:
-        for source, destination_dir in sources:
+        for source, destination_dir in ordinary_sources:
             destination_dir.mkdir(parents=True, exist_ok=True)
             destination, identical, conflict = _conflict_destination(
                 source, destination_dir, timestamp
@@ -393,6 +652,16 @@ def migrate_credentials(
             completed_sources.append(source)
             copied += 1
 
+        if merged_registry_bytes is not None:
+            registry_write_attempted = True
+            _replace_file_bytes_atomic(target_registry, merged_registry_bytes)
+            if target_registry.read_bytes() != merged_registry_bytes:
+                raise CredentialMigrationError(
+                    "OAuth 凭据所有权登记写入校验失败，迁移已取消"
+                )
+            completed_sources.extend(registry_sources)
+            copied += len(registry_sources)
+
         target_setting = normalize_credentials_setting(
             resolved_app_root, str(ensured_target.root)
         )
@@ -406,6 +675,16 @@ def migrate_credentials(
         for destination in reversed(created):
             try:
                 destination.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if registry_write_attempted:
+            try:
+                if previous_registry_bytes is None:
+                    target_registry.unlink(missing_ok=True)
+                else:
+                    _replace_file_bytes_atomic(
+                        target_registry, previous_registry_bytes
+                    )
             except Exception:
                 pass
         if isinstance(exc, CredentialMigrationError):

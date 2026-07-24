@@ -158,6 +158,20 @@ from mail_providers import (  # type: ignore
     provider_ready,
     resolved_provider_config,
 )
+from oauth_credential_ownership import (  # type: ignore
+    InterProcessFileLock,
+    OAuthCredentialOwnershipRegistry,
+    OAuthOwnershipConflict,
+    bump_interprocess_lock_version,
+    credential_fingerprint,
+    identity_fingerprint,
+    interprocess_lock_epoch,
+    interprocess_lock_version,
+    normalize_target_instance,
+    select_latest_credentials,
+    stamp_authorization,
+    sub2_ownership_extra,
+)
 from lib.browser_window import (
     BrowserWindowRef,
     WindowControlResult,
@@ -195,6 +209,19 @@ MAX_CREDENTIAL_IMPORT_BYTES = 30 * 1024 * 1024
 
 app = Flask(__name__)
 app.secret_key = SECRET
+
+
+@app.after_request
+def prevent_oauth_export_caching(response):
+    if request.path.startswith("/api/oauth/") or request.path in {
+        "/download/cpa.zip",
+        "/download/sub2.zip",
+        "/download/sub2.json",
+    }:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 @dataclass(frozen=True)
@@ -255,11 +282,30 @@ def _files_under(directory: Path) -> List[Path]:
     return [path for path in directory.rglob("*") if path.is_file()]
 
 
+def _credential_material_files(directory: Path) -> List[Path]:
+    return [
+        path
+        for path in _files_under(directory)
+        if path.name != ".oauth_ownership.json.lock"
+    ]
+
+
 def credential_storage_stats(layout: CredentialLayout) -> dict:
     sso_files = _files_under(layout.sso_dir)
     mail_files = _files_under(layout.mail_dir)
-    cpa_files = _files_under(layout.cpa_dir)
-    all_files = [*sso_files, *mail_files, *cpa_files]
+    cpa_storage_files = [
+        path
+        for path in _files_under(layout.cpa_dir)
+        if path.name != ".oauth_ownership.json.lock"
+        and not path.name.endswith(".tmp")
+    ]
+    cpa_files = [
+        path
+        for path in cpa_storage_files
+        if path.name.lower().startswith("xai-")
+        and path.suffix.lower() == ".json"
+    ]
+    all_files = [*sso_files, *mail_files, *cpa_storage_files]
     return {
         "sso_files": len(sso_files),
         "mail_files": len(mail_files),
@@ -276,7 +322,12 @@ def _legacy_credential_files() -> List[Path]:
         path for path in BASE_DIR.glob("mail_credentials*.txt") if path.is_file()
     )
     legacy_cpa = BASE_DIR / "data" / "cpa"
-    for pattern in ("xai-*.json", "index.json", "failed.jsonl"):
+    for pattern in (
+        "xai-*.json",
+        "index.json",
+        "failed.jsonl",
+        "oauth_ownership.json",
+    ):
         candidates.extend(path for path in legacy_cpa.glob(pattern) if path.is_file())
     return candidates
 
@@ -314,6 +365,9 @@ def credentials_config_public(cfg: Optional[dict] = None) -> dict:
         "cpa_restart_required": (
             effective_cpa_concurrency != runtime_cpa_concurrency
         ),
+        "oauth_target_instance": str(
+            data.get("oauth_target_instance") or ""
+        ).strip(),
     }
 
 
@@ -332,12 +386,15 @@ def credential_change_blocker() -> str:
 
 
 def _active_credential_files(layout: CredentialLayout) -> List[Path]:
-    candidates = [*_files_under(layout.root), *_legacy_credential_files()]
+    candidates = [
+        *_credential_material_files(layout.root),
+        *_legacy_credential_files(),
+    ]
     cpa_directory = current_cpa_paths().directory
     try:
         cpa_directory.relative_to(layout.root)
     except ValueError:
-        candidates.extend(_files_under(cpa_directory))
+        candidates.extend(_credential_material_files(cpa_directory))
     unique: Dict[Path, Path] = {}
     for path in candidates:
         unique[path.resolve()] = path
@@ -383,6 +440,10 @@ TURNSTILE_STAGE_MAX_CONCURRENCY = 3
 TURNSTILE_GATE_PORT_START = 24600
 TURNSTILE_GATE_PORT_END = 24799
 _turnstile_gate_ports: Tuple[int, ...] = ()
+OAUTH_EXPORT_TICKET_TTL_SEC = 60.0
+OAUTH_EXPORT_ARTIFACTS = frozenset({"cpa.zip", "sub2.zip", "sub2.json"})
+_oauth_export_ticket_lock = threading.Lock()
+_oauth_export_tickets: Dict[str, Dict] = {}
 
 # --------------- mailbox receive test state ---------------
 EMAIL_RECEIVE_TEST_TTL_SEC = 600
@@ -604,6 +665,188 @@ _cpa_threads: List[threading.Thread] = []
 _cpa_commit_thread: Optional[threading.Thread] = None
 _cpa_cooldown_until = 0.0
 _cpa_sleep = time.sleep
+_cpa_authorization_index_lock = threading.Lock()
+_cpa_authorization_index_key: Optional[Tuple[str, int, int]] = None
+_cpa_authorization_index: Dict[str, dict] = {}
+
+
+def _cpa_workspace_directory(directory: Path) -> Path:
+    normalized = os.path.normcase(os.path.abspath(os.fspath(directory)))
+    if normalized.startswith("\\\\?\\UNC\\"):
+        normalized = "\\\\" + normalized[8:]
+    elif normalized.startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return Path(os.path.normpath(normalized))
+
+
+def _cpa_workspace_lock_path(directory: Optional[Path] = None) -> Path:
+    resolved = _cpa_workspace_directory(
+        Path(directory)
+        if directory is not None
+        else current_cpa_paths().directory
+    )
+    return resolved / ".oauth_ownership.json.lock"
+
+
+def _cpa_paths_for_directory(directory: Path) -> CpaPaths:
+    resolved = _cpa_workspace_directory(Path(directory))
+    return CpaPaths(
+        directory=resolved,
+        index_path=resolved / "index.json",
+        failed_path=resolved / "failed.jsonl",
+    )
+
+
+def _bump_cpa_workspace_version(lock_path: Path) -> int:
+    return bump_interprocess_lock_version(Path(lock_path))
+
+
+class _CPAWorkspaceLease:
+    def __init__(
+        self,
+        coordinator: "_CPAWorkspaceLeaseCoordinator",
+        directory: Path,
+    ):
+        self._coordinator = coordinator
+        self.directory = _cpa_workspace_directory(Path(directory))
+        self.lock_path = _cpa_workspace_lock_path(self.directory)
+        self._released = False
+
+    def bump_version(self) -> int:
+        if self._released:
+            raise RuntimeError("OAuth 凭据工作区租约已经释放")
+        return _bump_cpa_workspace_version(self.lock_path)
+
+    def epoch(self) -> int:
+        if self._released:
+            raise RuntimeError("OAuth 凭据工作区租约已经释放")
+        return self._coordinator.epoch(self.directory)
+
+    def bump_epoch(self) -> int:
+        if self._released:
+            raise RuntimeError("OAuth 凭据工作区租约已经释放")
+        return self._coordinator.bump_epoch(self.directory)
+
+    def set_epoch(self, value: int) -> int:
+        if self._released:
+            raise RuntimeError("OAuth 凭据工作区租约已经释放")
+        return self._coordinator.set_epoch(self.directory, value)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._coordinator.release(self.directory)
+
+
+class _CPAWorkspaceLeaseCoordinator:
+    """One OS lock per process, shared by this process's OAuth workers."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._directory: Optional[Path] = None
+        self._lock: Optional[InterProcessFileLock] = None
+        self._leases = 0
+        self._acquiring = False
+
+    def acquire(self, directory: Path) -> _CPAWorkspaceLease:
+        resolved = _cpa_workspace_directory(Path(directory))
+        with self._condition:
+            while self._acquiring:
+                self._condition.wait()
+            if self._leases:
+                if self._directory != resolved:
+                    raise RuntimeError(
+                        "OAuth 凭据目录在授权过程中发生变化；本次授权已取消"
+                    )
+                self._leases += 1
+                return _CPAWorkspaceLease(self, resolved)
+            self._acquiring = True
+
+        candidate = InterProcessFileLock(_cpa_workspace_lock_path(resolved))
+        acquired = False
+        try:
+            acquired = candidate.acquire(blocking=False)
+        finally:
+            with self._condition:
+                self._acquiring = False
+                if acquired:
+                    self._directory = resolved
+                    self._lock = candidate
+                    self._leases = 1
+                self._condition.notify_all()
+
+        if not acquired:
+            raise OAuthOwnershipConflict(
+                "另一个程序实例正在生成、迁移或导出 OAuth 凭据；"
+                "为避免同一身份的 refresh token 被多个实例使用，"
+                "本次授权已取消"
+            )
+        return _CPAWorkspaceLease(self, resolved)
+
+    def release(self, directory: Path) -> None:
+        resolved = _cpa_workspace_directory(Path(directory))
+        with self._condition:
+            if self._leases <= 0 or self._directory != resolved:
+                return
+            self._leases -= 1
+            if self._leases == 0:
+                lock = self._lock
+                if lock is not None:
+                    lock.release()
+                self._lock = None
+                self._directory = None
+
+    def epoch(self, directory: Path) -> int:
+        resolved = _cpa_workspace_directory(Path(directory))
+        with self._condition:
+            if (
+                self._leases <= 0
+                or self._directory != resolved
+                or self._lock is None
+            ):
+                raise RuntimeError("尚未持有 OAuth 凭据工作区租约")
+            return self._lock.epoch()
+
+    def bump_epoch(self, directory: Path) -> int:
+        resolved = _cpa_workspace_directory(Path(directory))
+        with self._condition:
+            if (
+                self._leases <= 0
+                or self._directory != resolved
+                or self._lock is None
+            ):
+                raise RuntimeError("尚未持有 OAuth 凭据工作区租约")
+            return self._lock.bump_epoch()
+
+    def set_epoch(self, directory: Path, value: int) -> int:
+        resolved = _cpa_workspace_directory(Path(directory))
+        with self._condition:
+            if (
+                self._leases <= 0
+                or self._directory != resolved
+                or self._lock is None
+            ):
+                raise RuntimeError("尚未持有 OAuth 凭据工作区租约")
+            return self._lock.set_epoch(value)
+
+
+_cpa_workspace_leases = _CPAWorkspaceLeaseCoordinator()
+
+
+def _acquire_current_cpa_workspace_lease() -> _CPAWorkspaceLease:
+    for _attempt in range(3):
+        directory = _cpa_workspace_directory(
+            current_cpa_paths().directory
+        )
+        lease = _cpa_workspace_leases.acquire(directory)
+        if (
+            _cpa_workspace_directory(current_cpa_paths().directory)
+            == directory
+        ):
+            return lease
+        lease.release()
+    raise RuntimeError("OAuth 凭据目录持续变化；本次授权已取消")
 
 
 def _refresh_cpa_running_locked() -> None:
@@ -963,9 +1206,11 @@ def load_cpa_index() -> None:
             _cpa_state["ok"] = len(done)
 
 
-def save_cpa_index_item(fp: str, meta: dict) -> None:
+def save_cpa_index_item(
+    fp: str, meta: dict, *, cpa_paths: Optional[CpaPaths] = None
+) -> None:
     items: Dict[str, dict] = {}
-    index_path = current_cpa_paths().index_path
+    index_path = (cpa_paths or current_cpa_paths()).index_path
     if index_path.exists():
         try:
             data = json.loads(index_path.read_text(encoding="utf-8"))
@@ -1245,7 +1490,15 @@ def _credential_import_archive_sources(
         groups.append(("sso", directory, ("accounts_*.txt",)))
     for directory in _cpa_read_directories():
         groups.append(
-            ("cpa", directory, ("xai-*.json", "index.json", "failed.jsonl"))
+            (
+                "cpa",
+                directory,
+                (
+                    "xai-*.json",
+                    "index.json",
+                    "failed.jsonl",
+                ),
+            )
         )
 
     sources: List[Tuple[str, Path]] = []
@@ -1367,26 +1620,48 @@ def enqueue_cpa_convert(
         return False, "empty sso"
     fp = sso_fingerprint(sso)
     with _credential_import_lock:
-        with _cpa_lock:
-            if fp in _cpa_inflight:
-                return False, "already queued"
-            if not force and fp in _cpa_done:
-                return False, "already converted"
-            generation = _cpa_workspace_generation
-            _cpa_inflight.add(fp)
-            _cpa_state["pending"] = int(_cpa_state.get("pending") or 0) + 1
-            _refresh_cpa_running_locked()
-        _cpa_q.put(
-            {
-                "email": email or "",
-                "sso": sso,
-                "password": password or "",
-                "source": source or "",
-                "fp": fp,
-                "force": force,
-                "workspace_generation": generation,
-            }
-        )
+        try:
+            workspace_lease = _acquire_current_cpa_workspace_lease()
+        except Exception as exc:
+            return False, f"oauth workspace unavailable: {exc}"
+        try:
+            workspace_directory = str(workspace_lease.directory)
+            workspace_epoch = workspace_lease.epoch()
+            with _cpa_lock:
+                if fp in _cpa_inflight:
+                    return False, "already queued"
+                if not force and fp in _cpa_done:
+                    return False, "already converted"
+                generation = _cpa_workspace_generation
+                _cpa_inflight.add(fp)
+                _cpa_state["pending"] = (
+                    int(_cpa_state.get("pending") or 0) + 1
+                )
+                _refresh_cpa_running_locked()
+            try:
+                _cpa_q.put(
+                    {
+                        "email": email or "",
+                        "sso": sso,
+                        "password": password or "",
+                        "source": source or "",
+                        "fp": fp,
+                        "force": force,
+                        "workspace_generation": generation,
+                        "workspace_directory": workspace_directory,
+                        "workspace_epoch": workspace_epoch,
+                    }
+                )
+            except Exception:
+                with _cpa_lock:
+                    _cpa_inflight.discard(fp)
+                    _cpa_state["pending"] = max(
+                        0, int(_cpa_state.get("pending") or 0) - 1
+                    )
+                    _refresh_cpa_running_locked()
+                raise
+        finally:
+            workspace_lease.release()
     return True, "queued"
 
 
@@ -1426,23 +1701,52 @@ def enqueue_missing_accounts(limit: int = 500) -> int:
     return n
 
 
-def enqueue_all_sso_refresh(limit: int = 10000) -> int:
-    """Queue a fresh CPA exchange for each available Web SSO credential."""
+def _reauthorization_identity(account: dict, sso: str) -> str:
+    email = str(account.get("email") or "").strip().casefold()
+    meta = decode_sso_meta(sso)
+    subject = str(meta.get("sub") or "").strip()
+    if subject:
+        return f"subject:{subject}"
+    if email and email != "unknown":
+        return f"email:{email}"
+    return f"sso:{sso_fingerprint(sso)}"
+
+
+def _reauthorization_candidates(
+    limit: int = 10000,
+) -> Tuple[List[dict], int]:
     try:
         safe_limit = max(1, min(int(limit), 10000))
     except (TypeError, ValueError):
         safe_limit = 10000
+    selected: List[dict] = []
+    seen_identities: Set[str] = set()
+    duplicates_skipped = 0
+    for account in unique_accounts():
+        sso = normalize_sso(account.get("sso") or "")
+        if not sso:
+            continue
+        identity = _reauthorization_identity(account, sso)
+        if identity in seen_identities:
+            duplicates_skipped += 1
+            continue
+        seen_identities.add(identity)
+        if len(selected) < safe_limit:
+            candidate = dict(account)
+            candidate["sso"] = sso
+            selected.append(candidate)
+    return selected, duplicates_skipped
+
+
+def enqueue_all_sso_refresh(limit: int = 10000) -> int:
+    """Queue a fresh CPA exchange for each available Web SSO credential."""
     with _credential_import_lock:
         n = 0
-        for acc in unique_accounts():
-            if n >= safe_limit:
-                break
-            sso = normalize_sso(acc.get("sso") or "")
-            if not sso:
-                continue
+        candidates, _duplicates_skipped = _reauthorization_candidates(limit)
+        for acc in candidates:
             ok, _ = enqueue_cpa_convert(
                 email=acc.get("email") or "",
-                sso=sso,
+                sso=acc.get("sso") or "",
                 password=acc.get("password") or "",
                 source=acc.get("source") or "",
                 force=True,
@@ -1491,20 +1795,51 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
         entry = None
         error = None
         attempts = 1
+        workspace_lease: Optional[_CPAWorkspaceLease] = None
+        workspace_lock_failed = False
+        durable_workspace_stale = False
         try:
-            entry, error, attempts = _convert_cpa_with_retry(sso, email)
+            workspace_lease = _acquire_current_cpa_workspace_lease()
+            try:
+                queued_directory = _cpa_workspace_directory(
+                    Path(str(item.get("workspace_directory") or ""))
+                )
+                queued_epoch = int(item["workspace_epoch"])
+                durable_workspace_stale = (
+                    queued_directory != workspace_lease.directory
+                    or queued_epoch != workspace_lease.epoch()
+                )
+            except (KeyError, TypeError, ValueError, OSError):
+                durable_workspace_stale = True
+            if not durable_workspace_stale:
+                entry, error, attempts = _convert_cpa_with_retry(sso, email)
         except Exception as exc:
             entry = None
             error = exc
-        finally:
+            workspace_lock_failed = workspace_lease is None
+
+        if durable_workspace_stale and error is None:
             with _cpa_lock:
                 _cpa_state["active_workers"] = max(
                     0, int(_cpa_state.get("active_workers") or 0) - 1
                 )
-                _cpa_state["commit_pending"] = (
-                    int(_cpa_state.get("commit_pending") or 0) + 1
-                )
+                _cpa_inflight.discard(fp)
                 _refresh_cpa_running_locked()
+            if workspace_lease is not None:
+                workspace_lease.release()
+            log_line(f"[CPA] SKIP stale durable workspace {fp[:12]}")
+            _cpa_q.task_done()
+            continue
+
+        with _cpa_lock:
+            _cpa_state["active_workers"] = max(
+                0, int(_cpa_state.get("active_workers") or 0) - 1
+            )
+            _cpa_state["commit_pending"] = (
+                int(_cpa_state.get("commit_pending") or 0) + 1
+            )
+            _refresh_cpa_running_locked()
+        try:
             _cpa_result_q.put(
                 {
                     "item": item,
@@ -1513,37 +1848,132 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
                     "workspace_generation": item_generation,
                     "worker_id": worker_id,
                     "attempts": attempts,
+                    "_workspace_lease": workspace_lease,
+                    "_workspace_lock_failed": workspace_lock_failed,
                 }
             )
-            if CPA_DELAY > 0:
-                time.sleep(CPA_DELAY)
-            _cpa_q.task_done()
+        except Exception:
+            if workspace_lease is not None:
+                workspace_lease.release()
+            raise
+        if CPA_DELAY > 0:
+            time.sleep(CPA_DELAY)
+        _cpa_q.task_done()
 
 
-def _record_cpa_failure(item: dict, fp: str, error: Exception) -> None:
+def _record_cpa_failure(
+    item: dict,
+    fp: str,
+    error: Exception,
+    *,
+    cpa_paths: Optional[CpaPaths] = None,
+    persist: bool = True,
+) -> None:
     email = item.get("email") or ""
     err = str(error)
     with _cpa_lock:
         _cpa_inflight.discard(fp)
         _cpa_state["fail"] = int(_cpa_state.get("fail") or 0) + 1
         _cpa_state["last_error"] = err
-    try:
-        with open(current_cpa_paths().failed_path, "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "at": datetime.now().isoformat(timespec="seconds"),
-                        "email": email,
-                        "fp": fp,
-                        "error": err,
-                    },
-                    ensure_ascii=False,
+    if persist:
+        try:
+            paths = cpa_paths or current_cpa_paths()
+            with open(paths.failed_path, "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "at": datetime.now().isoformat(timespec="seconds"),
+                            "email": email,
+                            "fp": fp,
+                            "error": err,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-    except Exception:
-        pass
+        except Exception:
+            pass
     log_line(f"[CPA] FAIL {email or fp[:12]}: {err}")
+
+
+def _authorization_recency(candidate: dict) -> Tuple[int, str]:
+    try:
+        generation = max(
+            0,
+            int(candidate.get("_authorization_generation") or 0),
+        )
+    except (TypeError, ValueError):
+        generation = 0
+    return generation, str(candidate.get("_authorized_at") or "")
+
+
+def _authorization_index_cache_key() -> Tuple[str, int, int]:
+    directory = _cpa_workspace_directory(current_cpa_paths().directory)
+    return (
+        str(directory),
+        int(_cpa_workspace_generation),
+        interprocess_lock_version(_cpa_workspace_lock_path(directory)),
+    )
+
+
+def _find_previous_authorization_for_identity(entry: dict) -> Optional[dict]:
+    global _cpa_authorization_index_key, _cpa_authorization_index
+    identity = identity_fingerprint(entry)
+    if not identity:
+        return None
+    cache_key = _authorization_index_cache_key()
+    with _cpa_authorization_index_lock:
+        if _cpa_authorization_index_key != cache_key:
+            latest: Dict[str, dict] = {}
+            for candidate_path in list_cpa_files():
+                try:
+                    candidate = json.loads(
+                        candidate_path.read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    continue
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_identity = identity_fingerprint(candidate)
+                if not candidate_identity:
+                    continue
+                current = latest.get(candidate_identity)
+                if (
+                    current is None
+                    or _authorization_recency(candidate)
+                    > _authorization_recency(current)
+                ):
+                    latest[candidate_identity] = candidate
+            _cpa_authorization_index = latest
+            _cpa_authorization_index_key = cache_key
+        previous = _cpa_authorization_index.get(identity)
+        return dict(previous) if isinstance(previous, dict) else None
+
+
+def _remember_authorization(
+    entry: dict, *, adopt_workspace_version: bool = False
+) -> None:
+    global _cpa_authorization_index_key
+    identity = identity_fingerprint(entry)
+    if not identity:
+        return
+    cache_key = _authorization_index_cache_key()
+    with _cpa_authorization_index_lock:
+        if _cpa_authorization_index_key != cache_key:
+            if (
+                not adopt_workspace_version
+                or _cpa_authorization_index_key is None
+                or _cpa_authorization_index_key[:2] != cache_key[:2]
+            ):
+                return
+            _cpa_authorization_index_key = cache_key
+        current = _cpa_authorization_index.get(identity)
+        if (
+            not isinstance(current, dict)
+            or _authorization_recency(entry)
+            > _authorization_recency(current)
+        ):
+            _cpa_authorization_index[identity] = dict(entry)
 
 
 def _commit_cpa_result(result: dict) -> None:
@@ -1551,25 +1981,60 @@ def _commit_cpa_result(result: dict) -> None:
     email = item.get("email") or ""
     sso = item.get("sso") or ""
     fp = item.get("fp") or sso_fingerprint(sso)
+    workspace_lease = result.get("_workspace_lease")
+    if not isinstance(workspace_lease, _CPAWorkspaceLease):
+        workspace_lease = None
+    cpa_paths: Optional[CpaPaths] = None
     try:
         item_generation = int(result.get("workspace_generation") or 0)
     except (TypeError, ValueError):
         item_generation = 0
 
-    with _cpa_lock:
-        stale_workspace = item_generation != _cpa_workspace_generation
-        if stale_workspace:
-            _cpa_inflight.discard(fp)
-    if stale_workspace:
-        log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
-        return
-
-    error = result.get("error")
-    if error is not None:
-        _record_cpa_failure(item, fp, error)
-        return
-
     try:
+        with _cpa_lock:
+            stale_workspace = item_generation != _cpa_workspace_generation
+            if stale_workspace:
+                _cpa_inflight.discard(fp)
+        if stale_workspace:
+            log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
+            return
+
+        error = result.get("error")
+        if error is not None:
+            if workspace_lease is not None:
+                cpa_paths = _cpa_paths_for_directory(
+                    workspace_lease.directory
+                )
+            _record_cpa_failure(
+                item,
+                fp,
+                error,
+                cpa_paths=cpa_paths,
+                persist=(
+                    workspace_lease is not None
+                    and not bool(result.get("_workspace_lock_failed"))
+                ),
+            )
+            return
+
+        if workspace_lease is None:
+            workspace_lease = _acquire_current_cpa_workspace_lease()
+        cpa_paths = _cpa_paths_for_directory(workspace_lease.directory)
+        if (
+            _cpa_workspace_directory(current_cpa_paths().directory)
+            != cpa_paths.directory
+        ):
+            raise RuntimeError(
+                "OAuth 凭据目录在写入前发生变化；本次授权已取消"
+            )
+        with _cpa_lock:
+            stale_workspace = item_generation != _cpa_workspace_generation
+            if stale_workspace:
+                _cpa_inflight.discard(fp)
+        if stale_workspace:
+            log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
+            return
+
         raw_entry = result.get("entry")
         if not isinstance(raw_entry, dict) or not raw_entry.get(
             "access_token"
@@ -1582,18 +2047,39 @@ def _commit_cpa_result(result: dict) -> None:
         entry["_source_file"] = item.get("source") or ""
         email_out = entry.get("email") or email or "unknown"
         fname = f"xai-{cpa_safe_filename(email_out)}.json"
-        cpa_paths = current_cpa_paths()
         path = cpa_paths.directory / fname
+        previous_entry: Optional[dict] = None
         if path.exists():
             try:
                 old = json.loads(path.read_text(encoding="utf-8"))
                 old_fp = sso_fingerprint(normalize_sso(old.get("sso") or ""))
+                if isinstance(old, dict):
+                    previous_entry = old
             except Exception:
                 old_fp = ""
             if old_fp and old_fp != fp:
                 fname = f"xai-{cpa_safe_filename(email_out)}-{fp[:8]}.json"
                 path = cpa_paths.directory / fname
+                if path.exists():
+                    try:
+                        candidate = json.loads(
+                            path.read_text(encoding="utf-8")
+                        )
+                        if isinstance(candidate, dict):
+                            previous_entry = candidate
+                    except Exception:
+                        previous_entry = None
+        indexed_previous = _find_previous_authorization_for_identity(entry)
+        if isinstance(indexed_previous, dict) and (
+            not isinstance(previous_entry, dict)
+            or _authorization_recency(indexed_previous)
+            > _authorization_recency(previous_entry)
+        ):
+            previous_entry = indexed_previous
+        entry = stamp_authorization(entry, previous=previous_entry)
+        workspace_lease.bump_version()
         _write_json_atomic(path, entry)
+        _remember_authorization(entry, adopt_workspace_version=True)
         save_cpa_index_item(
             fp,
             {
@@ -1602,6 +2088,7 @@ def _commit_cpa_result(result: dict) -> None:
                 "at": datetime.now().isoformat(timespec="seconds"),
                 "auth_kind": entry.get("auth_kind"),
             },
+            cpa_paths=cpa_paths,
         )
         with _cpa_lock:
             _cpa_done.add(fp)
@@ -1611,7 +2098,16 @@ def _commit_cpa_result(result: dict) -> None:
             _cpa_state["last_error"] = ""
         log_line(f"[CPA] OK {email_out} -> {fname}")
     except Exception as exc:
-        _record_cpa_failure(item, fp, exc)
+        _record_cpa_failure(
+            item,
+            fp,
+            exc,
+            cpa_paths=cpa_paths,
+            persist=workspace_lease is not None,
+        )
+    finally:
+        if workspace_lease is not None:
+            workspace_lease.release()
 
 
 def _cpa_commit_worker_loop() -> None:
@@ -3922,8 +4418,8 @@ INDEX_HTML = r"""
     </div>
     <div class="actions">
       <a class="btn primary" href="/download/sso.txt" title="email----password----sso">⬇ 下载 SSO (TXT)</a>
-      <a class="btn ok" href="/download/cpa.zip" title="CPA OAuth JSON（CLIProxyAPI 可用）">⬇ 下载 CPA (JSON)</a>
-      <a class="btn sub2" href="/download/sub2.zip" title="Sub2API 官方导入包 type=sub2api-data：单账号 JSON + all 合集">⬇ 下载 Sub2 (JSON)</a>
+      <a class="btn ok" href="/download/cpa.zip" onclick="exportOAuthArtifact(event,'cpa.zip')" title="目标实例专用 CPA OAuth JSON">⬇ 下载 CPA (JSON)</a>
+      <a class="btn sub2" href="/download/sub2.zip" onclick="exportOAuthArtifact(event,'sub2.zip')" title="目标实例专用 Sub2API 导入包">⬇ 下载 Sub2 (JSON)</a>
     </div>
   </header>
 
@@ -3962,11 +4458,11 @@ INDEX_HTML = r"""
       <button class="btn ok" id="btn_start" onclick="startJob()">▶ 开始注册</button>
       <button class="btn danger" id="btn_stop" onclick="stopJob()">■ 停止</button>
       <button class="btn" onclick="backfillCpa()" title="把尚未转成 CPA 的历史 SSO 入队">补转未转换 CPA</button>
-      <button class="btn" id="btn_cpa_refresh_all" onclick="refreshAllSso()" title="使用已有 Web SSO 重新换取 OAuth/CPA">刷新全部 SSO</button>
+      <button class="btn" id="btn_cpa_refresh_all" onclick="refreshAllSso()" title="使用已有 Web SSO 重新执行 OAuth 授权码交换">重新生成账号授权</button>
     </div>
     <div class="control-note">
       并发度支持 1–10。每个槽使用独立 CLI 进程、有头浏览器和临时 Profile；“隐藏有头”不是无头模式，窗口默认不显示且不进入任务栏，可在对应 Worker 卡片中手动显示或隐藏。任务结束后浏览器立即退出。
-      SSO 刷新不会生成新的 Web SSO；成功原子替换，失败保留旧 CPA。
+      重新生成授权不会生成新的 Web SSO；每个稳定身份只处理一次，成功原子替换，失败保留旧 CPA。升级前未登记授权代次的 CPA 必须先重新生成授权。
     </div>
     <div class="muted" style="margin-top:10px;font-size:12px" id="cpa_hint">
       代理走本机 Clash（config.json 的 proxy，常见 7897）。节点在 Clash 里选。注册成功后自动转 CPA。
@@ -3992,6 +4488,12 @@ INDEX_HTML = r"""
         <label>凭据根目录
           <input type="text" id="credentials_dir" spellcheck="false" placeholder="data/credentials 或绝对路径"/>
         </label>
+        <label>OAuth 目标实例
+          <input type="text" id="oauth_target_instance" maxlength="64" pattern="[A-Za-z0-9](?:[A-Za-z0-9._]|-){0,63}" spellcheck="false" placeholder="例如 sub2api-primary"/>
+        </label>
+        <div class="muted" style="font-size:11px;line-height:1.45">
+          同一身份的 refresh token 只能分配给一个目标实例；CPA / Sub2 导出前必须先保存此标识。
+        </div>
         <div class="storage-actions">
           <button class="btn primary" type="button" id="credential_save" onclick="saveCredentialPath()">保存新路径</button>
           <button class="btn ok" type="button" id="credential_migrate" onclick="migrateCredentialPath()">迁移并切换</button>
@@ -4005,7 +4507,7 @@ INDEX_HTML = r"""
         <div class="storage-stat"><div class="label">CPA 文件</div><div class="value" id="cred_cpa_files">0</div></div>
         <div class="storage-stat"><div class="label">总量 / 空间</div><div class="value" id="cred_total_files">0</div><div class="muted" id="cred_total_bytes" style="font-size:10.5px;margin-top:2px">0 B</div></div>
         <div class="storage-warning" id="credential_warning">
-          “迁移并切换”按复制 → SHA-256 校验 → 配置切换 → 删除来源执行；不会覆盖同名异内容文件，冲突文件会自动改名。
+          “迁移并切换”会先跨进程锁定 OAuth 归属账本，再按复制 → SHA-256 校验 → 配置切换 → 删除来源执行；普通冲突文件会自动改名，账本归属冲突时停止迁移。
           <span id="cred_legacy">历史位置待迁移：0 个文件</span>
         </div>
       </div>
@@ -4481,6 +4983,8 @@ function setCredentialActionsDisabled(blocked){
   });
   const input=document.getElementById('credentials_dir');
   if(input) input.disabled=credentialActionBusy||credentialControlsBlocked;
+  const target=document.getElementById('oauth_target_instance');
+  if(target) target.disabled=credentialActionBusy;
 }
 function setCredentialState(text, bad){
   const state=document.getElementById('credential_state');
@@ -4491,6 +4995,7 @@ function setCredentialState(text, bad){
 function renderCredentialConfig(data){
   const stats=data.stats||{};
   _set('credentials_dir',data.configured||'data/credentials');
+  _set('oauth_target_instance',data.oauth_target_instance||'');
   const resolved=document.getElementById('credential_resolved');
   if(resolved) resolved.textContent='当前解析路径 · '+(data.resolved_path||'—');
   const values={
@@ -4524,12 +5029,15 @@ async function loadCredentialConfig(){
 }
 async function saveCredentialPath(){
   const credentials_dir=_val('credentials_dir').trim();
+  const oauth_target_instance=_val('oauth_target_instance').trim();
+  const target=document.getElementById('oauth_target_instance');
+  if(target&&!target.reportValidity()) return;
   credentialActionBusy=true; setCredentialActionsDisabled(credentialControlsBlocked);
   try{
     const data=await api('/api/config/credentials',{
-      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credentials_dir})
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credentials_dir,oauth_target_instance})
     });
-    renderCredentialConfig(data); toast('凭据目录已保存');
+    renderCredentialConfig(data); toast('凭据目录与 OAuth 目标实例已保存');
   }catch(e){setCredentialState('保存失败: '+e.message,true);toast('保存失败: '+e.message)}
   finally{credentialActionBusy=false;setCredentialActionsDisabled(credentialControlsBlocked)}
 }
@@ -5034,15 +5542,75 @@ async function backfillCpa(){
   }catch(e){toast('补转失败: '+e.message)}
 }
 async function refreshAllSso(){
-  const message='确认刷新当前账号池的全部 SSO？\n\n此操作不会生成新的 Web SSO；系统会重新换取 OAuth/CPA，成功原子替换，失败保留旧 CPA。任务会在后台串行执行。';
+  const message='确认重新生成当前账号池的账号授权？\n\n此操作不会生成新的 Web SSO；系统会按稳定身份去重，重新执行 OAuth 授权码交换并生成新的 access / refresh token。成功原子替换，失败保留旧 CPA。旧导出包不能用于新的目标实例。';
   if(!confirm(message)) return;
   const button=document.getElementById('btn_cpa_refresh_all');
   if(button) button.disabled=true;
   try{
-    const j=await api('/api/cpa/refresh-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:10000})});
-    toast(j.message||('已入队 '+(j.queued||0)+' 个 SSO'));
-  }catch(e){toast('SSO 刷新失败: '+e.message)}
+    const j=await api('/api/cpa/reauthorize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:10000})});
+    toast(j.message||('已入队 '+(j.queued||0)+' 个账号'));
+  }catch(e){toast('重新生成账号授权失败: '+e.message)}
   finally{await poll()}
+}
+async function exportOAuthArtifact(event,artifact){
+  if(event) event.preventDefault();
+  const targetInput=document.getElementById('oauth_target_instance');
+  if(targetInput&&!targetInput.reportValidity()) return false;
+  const target=_val('oauth_target_instance').trim();
+  if(!target){
+    toast('请先在凭据仓库配置并保存 OAuth 目标实例');
+    if(targetInput) targetInput.focus();
+    return false;
+  }
+  try{
+    const encoded=encodeURIComponent(target);
+    const preflight=await api('/api/oauth/export-preflight?target_instance='+encoded);
+    if(Number(preflight.credential_conflicts||0)>0){
+      throw new Error('同一 refresh token 已分配给其他实例，请先重新生成账号授权');
+    }
+    if(Number(preflight.invalid||0)>0){
+      throw new Error('存在缺少 refresh token 的账号，请先重新生成账号授权');
+    }
+    if(Number(preflight.legacy_untracked||0)>0){
+      throw new Error('存在升级前生成的旧 CPA，请先重新生成账号授权后再导出');
+    }
+    let acknowledge=false;
+    if(Number(preflight.transfer_required||0)>0){
+      acknowledge=confirm(
+        '检测到账号授权此前属于其他目标实例。\n\n'
+        +'只有在旧实例中的对应账号已经停用、不会再使用这些 token 时才能继续迁移。'
+      );
+      if(!acknowledge) return false;
+    }
+    const claim=await api('/api/oauth/export-claim',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        artifact,
+        target_instance:target,
+        acknowledge_previous_instance_disabled:acknowledge
+      })
+    });
+    const response=await fetch(claim.download_url,{credentials:'same-origin'});
+    const contentType=String(response.headers.get('content-type')||'').toLowerCase();
+    if(response.redirected||contentType.includes('text/html')){
+      throw new Error('面板会话已失效，请重新登录后再导出');
+    }
+    if(!response.ok){
+      const raw=await response.text();
+      let message='导出失败（HTTP '+response.status+'）';
+      try{const payload=JSON.parse(raw);if(typeof payload.error==='string')message=payload.error}catch(_){}
+      throw new Error(message);
+    }
+    const blob=await response.blob();
+    const objectUrl=URL.createObjectURL(blob);
+    const download=document.createElement('a');
+    download.href=objectUrl;download.download=artifact.replace('/','-');
+    document.body.appendChild(download);download.click();download.remove();
+    URL.revokeObjectURL(objectUrl);
+    toast('已生成仅供 '+target+' 使用的 OAuth 凭据包');
+  }catch(e){toast('导出失败: '+e.message)}
+  return false;
 }
 let lastLogLen=0;
 async function poll(){
@@ -5327,7 +5895,13 @@ def download_cpa_zip():
     need = require_login()
     if need:
         return need
-    files = list_active_cpa_files()
+    try:
+        target_instance, entries, name_hints = (
+            _consume_oauth_export_ticket("cpa.zip")
+        )
+    except Exception as exc:
+        return _oauth_export_error(exc)
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         readme = (
@@ -5337,19 +5911,34 @@ def download_cpa_zip():
             "2) auth_kind=oauth，可直接放进 CLIProxyAPI auth-dir。\n"
             "3) 由注册成功后的 web SSO 自动换票生成。\n"
             "4) all.json 为全部账号数组；failed.jsonl 为转换失败记录（若有）。\n"
-            "5) 若 zip 为空：先注册，或点「补转未转换 CPA」。\n"
+            f"5) 本包只允许导入目标实例：{target_instance}。\n"
+            "6) 不要在多个实例中同时使用同一身份的 refresh token。\n"
+            "7) 切换实例前，先重新生成账号授权并停用旧实例中的对应账号。\n"
         )
         zf.writestr("README.txt", readme)
-        all_entries = []
-        for i, p in enumerate(files, 1):
-            try:
-                raw = p.read_text(encoding="utf-8")
-                obj = json.loads(raw)
-                all_entries.append(obj)
-                # keep original filename
-                zf.writestr(p.name, raw if raw.endswith("\n") else raw + "\n")
-            except Exception as e:
-                zf.writestr(f"BAD-{p.name}.txt", str(e))
+        all_entries: List[dict] = []
+        used_names: Set[str] = set()
+        for index, entry in enumerate(entries):
+            exported = dict(entry)
+            exported["_export_target_instance"] = target_instance
+            all_entries.append(exported)
+            hint = name_hints[index] if index < len(name_hints) else ""
+            base = cpa_safe_filename(
+                hint
+                or str(exported.get("email") or "")
+                or str(exported.get("sub") or "")
+                or f"oauth-{index + 1}"
+            )
+            arcname = f"xai-{base}.json"
+            sequence = 2
+            while arcname in used_names:
+                arcname = f"xai-{base}-{sequence}.json"
+                sequence += 1
+            used_names.add(arcname)
+            zf.writestr(
+                arcname,
+                json.dumps(exported, ensure_ascii=False, indent=2) + "\n",
+            )
         zf.writestr(
             "all.json",
             json.dumps(all_entries, ensure_ascii=False, indent=2) + "\n",
@@ -5360,11 +5949,6 @@ def download_cpa_zip():
                 zf.write(failed_path, arcname="failed.jsonl")
             except Exception:
                 pass
-        if not files:
-            zf.writestr(
-                "EMPTY.txt",
-                "暂无已转换的 CPA 文件。注册成功后会自动转换，或点击面板「补转未转换 CPA」。\n",
-            )
     buf.seek(0)
     fname = f"cpa_oauth_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     return send_file(
@@ -5374,20 +5958,24 @@ def download_cpa_zip():
 
 def _load_cpa_entries_for_sub2() -> Tuple[List[dict], List[str]]:
     """Read existing CPA JSON files for Sub2 export. No re-OAuth."""
-    entries: List[dict] = []
-    name_hints: List[str] = []
+    candidates: List[dict] = []
     for p in list_active_cpa_files():
         try:
             obj = json.loads(p.read_text(encoding="utf-8"))
             if not isinstance(obj, dict):
                 continue
-            entries.append(obj)
             # xai-email.json → email hint; strip optional -fingerprint suffix
             stem = p.stem
             hint = stem[4:] if stem.lower().startswith("xai-") else stem
-            name_hints.append(hint or "")
+            candidate = dict(obj)
+            candidate["_export_name_hint"] = hint or ""
+            candidates.append(candidate)
         except Exception:
             continue
+    entries, _skipped = select_latest_credentials(candidates)
+    name_hints = [
+        str(entry.pop("_export_name_hint", "") or "") for entry in entries
+    ]
     return entries, name_hints
 
 
@@ -5442,14 +6030,211 @@ def _fallback_sub2_payload(cpa_entries: List[dict], name_hints: List[str]) -> di
 
 
 def _build_sub2_accounts(
-    cpa_entries: List[dict], name_hints: List[str]
+    cpa_entries: List[dict],
+    name_hints: List[str],
+    *,
+    target_instance: str = "",
 ) -> List[dict]:
     """Map CPA entries → Sub2 DataAccount list (no re-OAuth)."""
-    if build_sub2_payload is not None:
-        payload = build_sub2_payload(cpa_entries, name_hints=name_hints)
-        return list(payload.get("accounts") or [])
-    payload = _fallback_sub2_payload(cpa_entries, name_hints)
-    return list(payload.get("accounts") or [])
+    accounts: List[dict] = []
+    for index, entry in enumerate(cpa_entries):
+        hint = name_hints[index] if index < len(name_hints) else ""
+        account = None
+        if cpa_to_sub2_account is not None:
+            account = cpa_to_sub2_account(entry, name_hint=hint)
+        else:
+            payload = _fallback_sub2_payload([entry], [hint])
+            mapped = list(payload.get("accounts") or [])
+            account = mapped[0] if mapped else None
+        if not isinstance(account, dict):
+            continue
+        if target_instance:
+            extra = account.get("extra")
+            merged_extra = dict(extra) if isinstance(extra, dict) else {}
+            merged_extra.update(
+                sub2_ownership_extra(entry, target_instance)
+            )
+            account["extra"] = merged_extra
+        accounts.append(account)
+    return accounts
+
+
+def current_oauth_ownership_registry() -> OAuthCredentialOwnershipRegistry:
+    return OAuthCredentialOwnershipRegistry(
+        current_cpa_paths().directory / "oauth_ownership.json"
+    )
+
+
+def _requested_oauth_target_instance() -> str:
+    requested = str(request.args.get("target_instance") or "").strip()
+    if not requested:
+        requested = str(
+            load_config().get("oauth_target_instance") or ""
+        ).strip()
+    if not requested:
+        raise ValueError(
+            "请先在凭据页面配置本次 OAuth 凭据的目标实例标识"
+        )
+    return normalize_target_instance(requested)
+
+
+def _oauth_export_snapshot(
+    entries: List[dict], name_hints: List[str]
+) -> str:
+    records = []
+    for index, entry in enumerate(entries):
+        records.append(
+            {
+                "identity": identity_fingerprint(entry),
+                "credential": credential_fingerprint(entry),
+                "authorization_id": str(
+                    entry.get("_authorization_id") or ""
+                ),
+                "authorization_generation": int(
+                    entry.get("_authorization_generation") or 0
+                ),
+                "authorized_at": str(entry.get("_authorized_at") or ""),
+                "name_hint": (
+                    str(name_hints[index] or "")
+                    if index < len(name_hints)
+                    else ""
+                ),
+            }
+        )
+    serialized = json.dumps(
+        sorted(records, key=lambda item: (item["identity"], item["credential"])),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _issue_oauth_export_ticket(
+    artifact: str,
+    target_instance: str,
+    entries: List[dict],
+    name_hints: List[str],
+) -> str:
+    ticket = uuid.uuid4().hex + uuid.uuid4().hex
+    now = time.monotonic()
+    with _oauth_export_ticket_lock:
+        expired = [
+            key
+            for key, value in _oauth_export_tickets.items()
+            if float(value.get("expires_at") or 0) <= now
+        ]
+        for key in expired:
+            _oauth_export_tickets.pop(key, None)
+        _oauth_export_tickets[ticket] = {
+            "artifact": artifact,
+            "target_instance": target_instance,
+            "snapshot": _oauth_export_snapshot(entries, name_hints),
+            "expires_at": now + OAUTH_EXPORT_TICKET_TTL_SEC,
+        }
+    return ticket
+
+
+def _consume_oauth_export_ticket(
+    artifact: str,
+) -> Tuple[str, List[dict], List[str]]:
+    ticket = str(request.args.get("ticket") or "").strip()
+    if not ticket:
+        raise ValueError(
+            "缺少 OAuth 导出票据；请从凭据页面重新发起导出"
+        )
+    now = time.monotonic()
+    with _oauth_export_ticket_lock:
+        record = _oauth_export_tickets.pop(ticket, None)
+    if not isinstance(record, dict):
+        raise OAuthOwnershipConflict("OAuth 导出票据无效或已使用")
+    if float(record.get("expires_at") or 0) <= now:
+        raise OAuthOwnershipConflict("OAuth 导出票据已过期，请重新发起导出")
+    if str(record.get("artifact") or "") != artifact:
+        raise OAuthOwnershipConflict("OAuth 导出票据与下载类型不匹配")
+
+    entries, name_hints = _load_cpa_entries_for_sub2()
+    if _oauth_export_snapshot(entries, name_hints) != str(
+        record.get("snapshot") or ""
+    ):
+        raise OAuthOwnershipConflict(
+            "OAuth 凭据在领取票据后发生变化，请重新发起导出"
+        )
+    return (
+        str(record.get("target_instance") or ""),
+        entries,
+        name_hints,
+    )
+
+
+def _oauth_export_error(exc: Exception):
+    status = 409 if isinstance(exc, OAuthOwnershipConflict) else 400
+    return jsonify({"ok": False, "error": str(exc)}), status
+
+
+@app.post("/api/oauth/export-claim")
+def api_oauth_export_claim():
+    need = require_login()
+    if need:
+        return need
+    if not request.is_json:
+        return jsonify(
+            {"ok": False, "error": "OAuth 导出领取必须使用 JSON POST"}
+        ), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "请求体格式无效"}), 400
+    try:
+        artifact = str(data.get("artifact") or "").strip()
+        if artifact not in OAUTH_EXPORT_ARTIFACTS:
+            raise ValueError("不支持的 OAuth 导出类型")
+        target_instance = normalize_target_instance(
+            str(data.get("target_instance") or "").strip()
+        )
+        entries, name_hints = _load_cpa_entries_for_sub2()
+        summary = current_oauth_ownership_registry().claim(
+            entries,
+            target_instance,
+            acknowledge_previous_instance_disabled=(
+                data.get("acknowledge_previous_instance_disabled") is True
+            ),
+        )
+        ticket = _issue_oauth_export_ticket(
+            artifact,
+            target_instance,
+            entries,
+            name_hints,
+        )
+        download_url = (
+            f"/download/{artifact}?"
+            + urllib.parse.urlencode({"ticket": ticket})
+        )
+        return jsonify(
+            {
+                "ok": True,
+                **summary,
+                "download_url": download_url,
+                "expires_in": int(OAUTH_EXPORT_TICKET_TTL_SEC),
+            }
+        )
+    except Exception as exc:
+        return _oauth_export_error(exc)
+
+
+@app.get("/api/oauth/export-preflight")
+def api_oauth_export_preflight():
+    need = require_login()
+    if need:
+        return need
+    try:
+        target_instance = _requested_oauth_target_instance()
+        entries, _name_hints = _load_cpa_entries_for_sub2()
+        summary = current_oauth_ownership_registry().preflight(
+            entries, target_instance
+        )
+        return jsonify({"ok": True, **summary})
+    except Exception as exc:
+        return _oauth_export_error(exc)
 
 
 def _sub2_package(accounts: List[dict]) -> dict:
@@ -5500,8 +6285,17 @@ def download_sub2_zip():
     need = require_login()
     if need:
         return need
-    cpa_entries, name_hints = _load_cpa_entries_for_sub2()
-    accounts = _build_sub2_accounts(cpa_entries, name_hints)
+    try:
+        target_instance, cpa_entries, name_hints = (
+            _consume_oauth_export_ticket("sub2.zip")
+        )
+        accounts = _build_sub2_accounts(
+            cpa_entries,
+            name_hints,
+            target_instance=target_instance,
+        )
+    except Exception as exc:
+        return _oauth_export_error(exc)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -5514,7 +6308,9 @@ def download_sub2_zip():
             "3) type=sub2api-data / version=1 / platform=grok / type=oauth\n"
             "4) 由已转换的 CPA OAuth 凭证现场映射，不重新注册/换票。\n"
             "5) proxies 为空；导入后请在 Sub2API 里绑定分组/代理。\n"
-            "6) 若 zip 为空：先注册，或点面板「补转未转换 CPA」。\n"
+            f"6) 本包只允许导入目标实例：{target_instance}。\n"
+            "7) 不要把同一包导入其他实例；切换实例必须先停用旧实例账号并重新生成授权。\n"
+            "8) 若 zip 为空：先注册，或点面板「补转未转换 CPA」。\n"
         )
         zf.writestr("README.txt", readme)
 
@@ -5557,8 +6353,17 @@ def download_sub2_json():
     need = require_login()
     if need:
         return need
-    cpa_entries, name_hints = _load_cpa_entries_for_sub2()
-    accounts = _build_sub2_accounts(cpa_entries, name_hints)
+    try:
+        target_instance, cpa_entries, name_hints = (
+            _consume_oauth_export_ticket("sub2.json")
+        )
+        accounts = _build_sub2_accounts(
+            cpa_entries,
+            name_hints,
+            target_instance=target_instance,
+        )
+    except Exception as exc:
+        return _oauth_export_error(exc)
     payload = _sub2_package(accounts)
     body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     fname = f"sub2api_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -5735,6 +6540,12 @@ def api_import_credentials():
     staged: Optional[Path] = None
     activity_acquired = False
     migration_acquired = False
+    workspace_lease: Optional[_CPAWorkspaceLease] = None
+    legacy_workspace_locks: List[InterProcessFileLock] = []
+    workspace_epoch_before: Optional[int] = None
+    legacy_epochs_before: List[Tuple[InterProcessFileLock, int]] = []
+    epoch_transaction_started = False
+    epoch_transaction_committed = False
     switch_snapshot: Optional[Tuple[int, List[dict]]] = None
     try:
         uploaded = request.files.get("file")
@@ -5774,6 +6585,36 @@ def api_import_credentials():
         if current_credential_layout().root != layout.root:
             raise CredentialImportBusy("凭据目录已变化，请重新选择文件导入")
 
+        try:
+            workspace_lease = _cpa_workspace_leases.acquire(layout.cpa_dir)
+        except OAuthOwnershipConflict as exc:
+            raise CredentialImportBusy(str(exc)) from exc
+        if current_credential_layout().root != layout.root:
+            raise CredentialImportBusy("凭据目录已变化，请重新选择文件导入")
+        for cpa_directory in _cpa_read_directories():
+            normalized = _cpa_workspace_directory(cpa_directory)
+            if normalized == workspace_lease.directory:
+                continue
+            legacy_lock = InterProcessFileLock(
+                _cpa_workspace_lock_path(normalized)
+            )
+            if not legacy_lock.acquire(blocking=False):
+                raise CredentialImportBusy(
+                    "另一个程序实例正在使用历史 CPA 凭据目录，"
+                    "不能安全激活导入批次"
+                )
+            legacy_workspace_locks.append(legacy_lock)
+
+        workspace_epoch_before = workspace_lease.epoch()
+        legacy_epochs_before = [
+            (legacy_lock, legacy_lock.epoch())
+            for legacy_lock in legacy_workspace_locks
+        ]
+        epoch_transaction_started = True
+        workspace_lease.bump_epoch()
+        for legacy_lock in legacy_workspace_locks:
+            legacy_lock.bump_epoch()
+
         switch_snapshot = _begin_cpa_workspace_switch()
         previous_generation, drained_items = switch_snapshot
         live_name = (
@@ -5781,18 +6622,14 @@ def api_import_credentials():
             f"_{batch_id[:8]}.txt"
         )
         live_file = layout.sso_dir / live_name
-        try:
-            activation = activate_credential_import(
-                layout,
-                staged,
-                live_file,
-                _credential_import_archive_sources(layout),
-                batch_id=batch_id,
-            )
-        except Exception:
-            _restore_cpa_workspace_switch(previous_generation, drained_items)
-            switch_snapshot = None
-            raise
+        activation = activate_credential_import(
+            layout,
+            staged,
+            live_file,
+            _credential_import_archive_sources(layout),
+            batch_id=batch_id,
+        )
+        epoch_transaction_committed = True
 
         _reset_cpa_workspace_state()
         invalidate_account_catalog()
@@ -5855,8 +6692,25 @@ def api_import_credentials():
             500,
         )
     finally:
+        if epoch_transaction_started and not epoch_transaction_committed:
+            for legacy_lock, previous_epoch in reversed(
+                legacy_epochs_before
+            ):
+                try:
+                    legacy_lock.set_epoch(previous_epoch)
+                except Exception:
+                    pass
+            if workspace_lease is not None and workspace_epoch_before is not None:
+                try:
+                    workspace_lease.set_epoch(workspace_epoch_before)
+                except Exception:
+                    pass
         if switch_snapshot is not None:
             _restore_cpa_workspace_switch(*switch_snapshot)
+        for legacy_lock in reversed(legacy_workspace_locks):
+            legacy_lock.release()
+        if workspace_lease is not None:
+            workspace_lease.release()
         if migration_acquired:
             _credential_migration_lock.release()
         if activity_acquired:
@@ -5884,6 +6738,9 @@ def api_set_credentials_config():
         return need
     if not _credential_migration_lock.acquire(blocking=False):
         return jsonify({"ok": False, "error": "凭据迁移正在进行"}), 409
+    workspace_locks: List[InterProcessFileLock] = []
+    workspace_epochs_before: List[Tuple[InterProcessFileLock, int]] = []
+    workspace_epochs_committed = False
     try:
         data = request.get_json(force=True, silent=True) or {}
         cfg = load_config()
@@ -5894,7 +6751,46 @@ def api_set_credentials_config():
             blocker = credential_change_blocker()
             if blocker:
                 return jsonify({"ok": False, "error": blocker}), 409
-            if target.root.exists() and _files_under(target.root):
+            cpa_directories = [current.cpa_dir, target.cpa_dir]
+            legacy_cpa_directory = (BASE_DIR / "data" / "cpa").resolve()
+            if legacy_cpa_directory.is_dir():
+                cpa_directories.append(legacy_cpa_directory)
+            lock_paths = {
+                str(_cpa_workspace_lock_path(directory)): (
+                    _cpa_workspace_lock_path(directory)
+                )
+                for directory in cpa_directories
+            }
+            for key in sorted(lock_paths, key=os.path.normcase):
+                workspace_lock = InterProcessFileLock(lock_paths[key])
+                if not workspace_lock.acquire(blocking=False):
+                    return (
+                        jsonify(
+                            {
+                                "ok": False,
+                                "error": (
+                                    "另一个程序实例正在生成、迁移或导出 "
+                                    "OAuth 凭据，不能切换凭据目录"
+                                ),
+                            }
+                        ),
+                        409,
+                    )
+                workspace_locks.append(workspace_lock)
+            if current_credential_layout(load_config()).root != current.root:
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "error": "凭据目录已被其他程序实例修改，请重试",
+                        }
+                    ),
+                    409,
+                )
+            if (
+                target.root.exists()
+                and _credential_material_files(target.root)
+            ):
                 raise ValueError("目标凭据目录非空，请选择空目录或使用迁移")
             if _active_credential_files(current):
                 return (
@@ -5917,11 +6813,41 @@ def api_set_credentials_config():
                 ),
             )
         )
+        target_instance = str(
+            data.get(
+                "oauth_target_instance",
+                cfg.get("oauth_target_instance") or "",
+            )
+            or ""
+        ).strip()
+        cfg["oauth_target_instance"] = (
+            normalize_target_instance(target_instance)
+            if target_instance
+            else ""
+        )
+        if directory_changed:
+            workspace_epochs_before = [
+                (workspace_lock, workspace_lock.epoch())
+                for workspace_lock in workspace_locks
+            ]
+            for workspace_lock in workspace_locks:
+                workspace_lock.bump_epoch()
         save_config_atomic(cfg)
+        workspace_epochs_committed = True
         return jsonify(credentials_config_public(cfg))
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     finally:
+        if workspace_epochs_before and not workspace_epochs_committed:
+            for workspace_lock, previous_epoch in reversed(
+                workspace_epochs_before
+            ):
+                try:
+                    workspace_lock.set_epoch(previous_epoch)
+                except Exception:
+                    pass
+        for workspace_lock in reversed(workspace_locks):
+            workspace_lock.release()
         _credential_migration_lock.release()
 
 
@@ -6303,6 +7229,7 @@ def api_cpa_backfill():
 
 
 @app.post("/api/cpa/refresh-all")
+@app.post("/api/cpa/reauthorize")
 def api_cpa_refresh_all():
     need = require_login()
     if need:
@@ -6321,39 +7248,53 @@ def api_cpa_refresh_all():
         return jsonify({"ok": False, "error": "凭据导入正在进行，请稍后重试"}), 409
     activity_acquired = False
     migration_acquired = False
+    workspace_lease: Optional[_CPAWorkspaceLease] = None
     try:
         if not _activity_lock.acquire(blocking=False):
             return jsonify({"ok": False, "error": "注册活动正在切换，请稍后重试"}), 409
         activity_acquired = True
         if registration_is_running():
-            return jsonify({"ok": False, "error": "注册任务运行中，不能刷新 SSO"}), 409
+            return jsonify(
+                {"ok": False, "error": "注册任务运行中，不能重新生成账号授权"}
+            ), 409
         if not _credential_migration_lock.acquire(blocking=False):
             return jsonify({"ok": False, "error": "凭据迁移正在进行，请稍后重试"}), 409
         migration_acquired = True
 
-        fingerprints: Set[str] = set()
-        for account in unique_accounts():
-            sso = normalize_sso(account.get("sso") or "")
-            if sso:
-                fingerprints.add(sso_fingerprint(sso))
-        if not fingerprints:
-            return jsonify({"ok": False, "error": "当前凭据目录没有可刷新的 SSO"}), 400
+        try:
+            workspace_lease = _acquire_current_cpa_workspace_lease()
+        except OAuthOwnershipConflict as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        candidates, duplicates_skipped = _reauthorization_candidates(limit)
+        if not candidates:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "当前凭据目录没有可用于重新授权的 Web SSO",
+                }
+            ), 400
 
-        total = min(len(fingerprints), limit)
+        total = len(candidates)
         queued = enqueue_all_sso_refresh(limit=limit)
         skipped = max(0, total - queued)
-        log_line(f"[CPA] 全部 SSO 刷新入队: {queued} · 跳过: {skipped}")
+        log_line(
+            "[CPA] 重新生成账号授权入队: "
+            f"{queued} · 队列跳过: {skipped} · 身份去重: {duplicates_skipped}"
+        )
         return jsonify(
             {
                 "ok": True,
                 "total": total,
                 "queued": queued,
                 "skipped": skipped,
-                "message": f"已将 {queued} 个 SSO 加入刷新队列",
+                "duplicates_skipped": duplicates_skipped,
+                "message": f"已将 {queued} 个账号加入重新生成账号授权队列",
                 "cpa": cpa_stats(),
             }
         )
     finally:
+        if workspace_lease is not None:
+            workspace_lease.release()
         if migration_acquired:
             _credential_migration_lock.release()
         if activity_acquired:

@@ -69,6 +69,7 @@ def test_upload_batch_stages_archives_and_queues_without_echoing_sso(
     old_account = sso_dir / "accounts_old.txt"
     old_cpa = cpa_dir / "xai-old.json"
     old_index = cpa_dir / "index.json"
+    old_ownership = cpa_dir / "oauth_ownership.json"
     old_account.write_text(
         "old@example.com----old-password----old-sso\n", encoding="utf-8"
     )
@@ -77,6 +78,10 @@ def test_upload_batch_stages_archives_and_queues_without_echoing_sso(
         encoding="utf-8",
     )
     old_index.write_text(json.dumps({"items": {}}), encoding="utf-8")
+    old_ownership.write_text(
+        json.dumps({"items": {"hashed-identity": {"target_instance": "old"}}}),
+        encoding="utf-8",
+    )
     queued = []
 
     def capture_enqueue(**record):
@@ -137,12 +142,59 @@ def test_upload_batch_stages_archives_and_queues_without_echoing_sso(
     assert not old_account.exists()
     assert not old_cpa.exists()
     assert not old_index.exists()
+    assert old_ownership.exists()
     archive = app_root / "vault" / "archive"
     assert any(path.name == old_account.name for path in archive.rglob("*.txt"))
     assert any(path.name == old_cpa.name for path in archive.rglob("*.json"))
     assert any(path.name == old_index.name for path in archive.rglob("*.json"))
+    assert not any(path.name == old_ownership.name for path in archive.rglob("*.json"))
     assert not list((app_root / "vault").glob(".staging-*"))
     assert invalidations == [True]
+
+
+def test_upload_preserves_oauth_owner_and_requires_ack_for_new_target(
+    isolated_workspace, monkeypatch
+):
+    app_root = isolated_workspace
+    sso_dir = app_root / "vault" / "sso"
+    sso_dir.mkdir(parents=True)
+    (sso_dir / "accounts_old.txt").write_text(
+        "one@example.com----password----web-sso-one\n",
+        encoding="utf-8",
+    )
+    registry = panel_app.current_oauth_ownership_registry()
+    previous = {
+        "email": "one@example.com",
+        "sub": "identity-one",
+        "refresh_token": "refresh-old",
+        "_authorization_id": "authorization-old",
+        "_authorization_generation": 1,
+        "_authorized_at": "2026-07-23T01:00:00Z",
+    }
+    registry.claim([previous], "sub2api-primary")
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_cpa_convert",
+        lambda **_record: (True, "queued"),
+    )
+
+    response = _upload(
+        panel_app.app.test_client(),
+        b"one@example.com----password----web-sso-one\n",
+    )
+
+    assert response.status_code == 200
+    assert registry.path.is_file()
+    fresh = {
+        **previous,
+        "refresh_token": "refresh-new",
+        "_authorization_id": "authorization-new",
+        "_authorization_generation": 2,
+        "_authorized_at": "2026-07-23T02:00:00Z",
+    }
+    preflight = registry.preflight([fresh], "sub2api-secondary")
+    assert preflight["transfer_required"] == 1
+    assert preflight["can_export"] is False
 
 
 def test_upload_json_preserves_password_and_deduplicates_sso(
@@ -247,6 +299,143 @@ def test_upload_rejects_concurrent_migration_without_mutation(
     assert response.status_code == 409
     assert old.exists()
     assert not list((isolated_workspace / "vault").glob(".staging-*"))
+
+
+def test_upload_rejects_other_process_workspace_owner_without_mutation(
+    isolated_workspace,
+):
+    old = isolated_workspace / "vault" / "sso" / "accounts_old.txt"
+    old.parent.mkdir(parents=True)
+    old.write_text("old@example.com----pw----old-sso\n", encoding="utf-8")
+    cpa_dir = isolated_workspace / "vault" / "cpa"
+    cpa_dir.mkdir(parents=True, exist_ok=True)
+    external_lock = panel_app.InterProcessFileLock(
+        cpa_dir / ".oauth_ownership.json.lock"
+    )
+    assert external_lock.acquire(blocking=False)
+    try:
+        response = _upload(
+            panel_app.app.test_client(),
+            b"new@example.com----pw----new-sso",
+        )
+    finally:
+        external_lock.release()
+
+    assert response.status_code == 409
+    assert "另一个程序实例" in response.get_json()["error"]
+    assert old.read_text(encoding="utf-8").startswith("old@example.com")
+    assert not list(old.parent.glob("accounts_import_*.txt"))
+    assert not list((isolated_workspace / "vault").glob(".staging-*"))
+
+
+def test_upload_locks_legacy_cpa_workspace_before_archiving(
+    isolated_workspace,
+):
+    old = isolated_workspace / "vault" / "sso" / "accounts_old.txt"
+    old.parent.mkdir(parents=True)
+    old.write_text("old@example.com----pw----old-sso\n", encoding="utf-8")
+    legacy_cpa = isolated_workspace / "data" / "cpa"
+    current_lock_path = (
+        isolated_workspace
+        / "vault"
+        / "cpa"
+        / ".oauth_ownership.json.lock"
+    )
+    epoch_before = panel_app.interprocess_lock_epoch(current_lock_path)
+    external_lock = panel_app.InterProcessFileLock(
+        legacy_cpa / ".oauth_ownership.json.lock"
+    )
+    assert external_lock.acquire(blocking=False)
+    try:
+        response = _upload(
+            panel_app.app.test_client(),
+            b"new@example.com----pw----new-sso",
+        )
+    finally:
+        external_lock.release()
+
+    assert response.status_code == 409
+    assert "另一个程序实例" in response.get_json()["error"]
+    assert panel_app.interprocess_lock_epoch(current_lock_path) == epoch_before
+    assert old.read_text(encoding="utf-8").startswith("old@example.com")
+    assert not list(old.parent.glob("accounts_import_*.txt"))
+
+
+def test_failed_batch_activation_restores_epoch_before_requeuing_old_jobs(
+    isolated_workspace,
+    monkeypatch,
+):
+    monkeypatch.setattr(panel_app, "_cpa_lock", threading.Lock())
+    monkeypatch.setattr(panel_app, "_cpa_result_q", queue.Queue())
+    monkeypatch.setattr(panel_app, "_CPA_CORE_OK", True)
+    monkeypatch.setattr(panel_app, "CPA_DELAY", 0)
+    converted = threading.Event()
+    worker_holder = []
+
+    def convert(sso, email="", proxy=""):
+        converted.set()
+        return {
+            "email": email,
+            "sso": sso,
+            "sub": "identity-old",
+            "access_token": "access-old",
+            "refresh_token": "refresh-old",
+            "auth_kind": "oauth",
+        }
+
+    monkeypatch.setattr(panel_app, "convert_one", convert)
+    queued, reason = panel_app.enqueue_cpa_convert(
+        email="old@example.com",
+        sso="old-queued-sso",
+        source="old-workspace",
+        force=True,
+    )
+    assert (queued, reason) == (True, "queued")
+
+    original_restore = panel_app._restore_cpa_workspace_switch
+
+    def restore_and_wait(previous_generation, drained_items):
+        original_restore(previous_generation, drained_items)
+        converted.wait(timeout=2)
+
+    monkeypatch.setattr(
+        panel_app,
+        "_restore_cpa_workspace_switch",
+        restore_and_wait,
+    )
+
+    def fail_activation(*_args, **_kwargs):
+        worker = threading.Thread(
+            target=panel_app._cpa_worker_loop,
+            daemon=True,
+        )
+        worker.start()
+        worker_holder.append(worker)
+        raise panel_app.CredentialImportError("simulated activation failure")
+
+    monkeypatch.setattr(
+        panel_app,
+        "activate_credential_import",
+        fail_activation,
+    )
+
+    try:
+        response = _upload(
+            panel_app.app.test_client(),
+            b"new@example.com----pw----new-sso",
+        )
+    finally:
+        panel_app._cpa_q.put(None)
+        for worker in worker_holder:
+            worker.join(timeout=5)
+
+    assert response.status_code == 500
+    assert converted.is_set()
+    assert all(not worker.is_alive() for worker in worker_holder)
+    assert panel_app._cpa_state["ok"] == 1
+    assert panel_app._cpa_state["fail"] == 0
+    assert not panel_app._cpa_inflight
+    assert len(list((isolated_workspace / "vault" / "cpa").glob("xai-*.json"))) == 1
 
 
 def test_upload_rejects_another_import_without_reading_or_mutating_workspace(

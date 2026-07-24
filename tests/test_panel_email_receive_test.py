@@ -341,7 +341,7 @@ def test_documentation_describes_mailbox_receive_testing_and_safe_defaults():
         "不会回显",
     ):
         assert phrase in readme
-    assert "version-v1.11.0" in readme
+    assert "version-v1.12.0" in readme
     assert example["mail_test_direct_mx_enabled"] is False
     assert example["mail_test_sender_mode"] == "auto"
     for feature in (

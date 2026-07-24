@@ -205,9 +205,9 @@
       <div class="download-strip" aria-label="账号与凭据下载">
         <a href="/download/accounts.json"><strong>账号 JSON</strong><span>完整账号备份</span></a>
         <a href="/download/all.zip"><strong>全部批次 ZIP</strong><span>原始 TXT 文件</span></a>
-        <a href="/download/cpa.zip"><strong>CPA ZIP</strong><span>OAuth 凭据</span></a>
-        <a href="/download/sub2.zip"><strong>Sub2 ZIP</strong><span>分文件导入</span></a>
-        <a href="/download/sub2.json"><strong>Sub2 JSON</strong><span>合并数据包</span></a>
+        <a href="/download/cpa.zip" data-oauth-export="cpa.zip"><strong>CPA ZIP</strong><span>目标实例专用</span></a>
+        <a href="/download/sub2.zip" data-oauth-export="sub2.zip"><strong>Sub2 ZIP</strong><span>目标实例专用</span></a>
+        <a href="/download/sub2.json" data-oauth-export="sub2.json"><strong>Sub2 JSON</strong><span>目标实例专用</span></a>
         <a href="/download/grok2api.json"><strong>grok2api JSON</strong><span>Token pool</span></a>
       </div>
 
@@ -268,7 +268,7 @@
               <small>最多 30 MiB；按 SSO 去重</small>
               <input id="credential-import-file" name="file" type="file" accept=".txt,.json,text/plain,application/json" required data-busy-group="accounts">
             </label>
-            <p class="form-note">导入会归档当前账号和 CPA 文件，再激活新批次。原数据可从凭据目录的 archive 恢复。</p>
+            <p class="form-note">导入会归档当前账号和 CPA 文件，再激活新批次；OAuth 实例归属账本会保留，防止导入后重复分发旧身份。原数据可从凭据目录的 archive 恢复。</p>
             <button class="button button--secondary" type="submit" data-busy-group="accounts">确认并导入</button>
           </form>
         </article>
@@ -419,7 +419,7 @@
           <div class="form-stack">
             <label class="field" for="credentials-dir"><span>凭据根目录</span><input id="credentials-dir" type="text" data-busy-group="credentials"><small>相对路径以应用目录为基准，也支持绝对路径</small></label>
             <div class="resolved-path"><span>当前解析路径</span><code id="credentials-resolved-path">—</code></div>
-            <div class="workspace-warning"><strong id="credentials-legacy-files">历史位置待迁移：0 个文件</strong><p>迁移按复制、SHA-256 校验、配置切换、删除来源执行；同名异内容文件会自动改名。</p></div>
+            <div class="workspace-warning"><strong id="credentials-legacy-files">历史位置待迁移：0 个文件</strong><p>迁移先跨进程锁定 OAuth 归属账本，再执行复制、SHA-256 校验、配置切换和来源删除；普通冲突文件会改名，账本归属冲突时停止迁移。</p></div>
             <div class="form-actions">
               <button class="button button--secondary" id="credentials-save" type="button" data-busy-group="credentials">保存空目录</button>
               <button class="button button--primary" id="credentials-migrate" type="button" data-busy-group="credentials">迁移并切换</button>
@@ -437,11 +437,12 @@
             <div><dt>最近账号</dt><dd id="cpa-last-email">—</dd></div>
           </dl>
           <div class="form-stack cpa-actions">
+            <label class="field" for="oauth-target-instance"><span>OAuth 目标实例</span><input id="oauth-target-instance" type="text" maxlength="64" pattern="[A-Za-z0-9](?:[A-Za-z0-9._]|-){0,63}" placeholder="例如 sub2api-primary"><small>同一身份的 refresh token 只能分配给一个目标实例；保存后 CPA / Sub2 导出均受保护</small></label>
             <label class="field" for="cpa-oauth-concurrency"><span>OAuth 并发度</span><input id="cpa-oauth-concurrency" type="number" min="1" max="4" step="1" value="2"><small>保存后重启面板生效；环境变量 CPA_CONCURRENCY 优先</small></label>
             <label class="field" for="cpa-backfill-limit"><span>处理上限</span><input id="cpa-backfill-limit" type="number" min="1" max="10000" value="10000" data-busy-group="credentials"></label>
             <button class="button button--secondary" id="cpa-backfill" type="button" data-busy-group="credentials">扫描并补转缺失 CPA</button>
-            <button class="button button--primary" id="cpa-refresh-all" type="button" data-busy-group="credentials">刷新全部 SSO 换票</button>
-            <p class="form-note">此操作不会生成新的 Web SSO；OAuth 有界并行，凭据串行提交；成功原子替换，失败保留旧 CPA。</p>
+            <button class="button button--primary" id="cpa-refresh-all" type="button" data-busy-group="credentials">重新生成账号授权</button>
+            <p class="form-note">此操作不会生成新的 Web SSO，而是使用现有 Web SSO 重新执行 OAuth 授权码交换，每个稳定身份只处理一次；成功生成新授权代次并原子替换，失败保留旧 CPA。升级前未登记授权代次的 CPA 必须先执行此操作；迁移到新目标实例前必须先停用旧实例账号。</p>
           </div>
         </article>
       </div>
