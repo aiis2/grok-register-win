@@ -28,6 +28,7 @@ class _SourceRecord:
     count: int
     mtime: str
     mtime_ns: int
+    identities: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -90,19 +91,13 @@ class AccountCatalog:
             stat = path.stat()
             mtime = _iso_mtime(path)
             lines = [line.strip() for line in self._read_lines(path) if line.strip()]
-            source_rows.append(
-                _SourceRecord(
-                    name=path.name,
-                    count=len(lines),
-                    mtime=mtime,
-                    mtime_ns=stat.st_mtime_ns,
-                )
-            )
+            source_identities: list[tuple[str, str]] = []
             for line_index, line in enumerate(lines):
                 parts = line.split("----")
                 email = str(parts[0] if parts else "").strip().casefold()
                 sso = "----".join(parts[2:]).strip() if len(parts) >= 3 else ""
                 fingerprint = self._fingerprint(sso) if sso else ""
+                source_identities.append((email, fingerprint))
                 identity = email or fingerprint
                 if not identity or identity in seen_accounts:
                     continue
@@ -117,6 +112,15 @@ class AccountCatalog:
                         sso_fingerprint=fingerprint,
                     )
                 )
+            source_rows.append(
+                _SourceRecord(
+                    name=path.name,
+                    count=len(lines),
+                    mtime=mtime,
+                    mtime_ns=stat.st_mtime_ns,
+                    identities=tuple(source_identities),
+                )
+            )
 
         return _Snapshot(accounts=tuple(account_rows), sources=tuple(source_rows))
 
@@ -165,6 +169,8 @@ class AccountCatalog:
         source: str,
         status: str,
         sort: str,
+        disabled_emails: set[str] | None = None,
+        disabled_fingerprints: set[str] | None = None,
     ) -> dict:
         snapshot = self._get_snapshot(files)
         normalized_query = str(q or "").strip().casefold()
@@ -172,6 +178,16 @@ class AccountCatalog:
         normalized_status = str(status or "all").strip().casefold()
         normalized_sort = str(sort or "newest").strip().casefold()
         source_names = {item.name for item in snapshot.sources}
+        blocked_emails = {
+            str(value or "").strip().casefold()
+            for value in (disabled_emails or set())
+            if str(value or "").strip()
+        }
+        blocked_fingerprints = {
+            str(value or "").strip()
+            for value in (disabled_fingerprints or set())
+            if str(value or "").strip()
+        }
         self._validate_query(
             page=page,
             page_size=page_size,
@@ -183,7 +199,17 @@ class AccountCatalog:
         )
 
         projected: list[tuple[_AccountRecord, str]] = []
+        active_account_count = 0
         for account in snapshot.accounts:
+            if (
+                account.email in blocked_emails
+                or (
+                    account.sso_fingerprint
+                    and account.sso_fingerprint in blocked_fingerprints
+                )
+            ):
+                continue
+            active_account_count += 1
             account_status = (
                 "ready"
                 if account.sso_fingerprint
@@ -247,7 +273,7 @@ class AccountCatalog:
                 "total_pages": total_pages,
             },
             "summary": {
-                "total_accounts": len(snapshot.accounts),
+                "total_accounts": active_account_count,
             },
             "filters": {
                 "sources": [item.name for item in snapshot.sources],
@@ -255,7 +281,15 @@ class AccountCatalog:
             "files": [
                 {
                     "name": item.name,
-                    "count": item.count,
+                    "count": sum(
+                        1
+                        for email, fingerprint in item.identities
+                        if email not in blocked_emails
+                        and (
+                            not fingerprint
+                            or fingerprint not in blocked_fingerprints
+                        )
+                    ),
                     "mtime": item.mtime,
                 }
                 for item in snapshot.sources

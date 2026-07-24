@@ -263,6 +263,23 @@ def test_reauthorization_identity_ignores_rotating_session_ids_for_same_email(
     assert duplicates == 1
 
 
+def test_reauthorization_preflight_prefers_oldest_established_candidate(
+    isolated_refresh_state,
+):
+    candidates = [
+        {"email": "newest@example.com", "sso": "sso-newest"},
+        {"email": "middle@example.com", "sso": "sso-middle"},
+        {"email": "oldest@example.com", "sso": "sso-oldest"},
+    ]
+
+    index, candidate = panel_app._select_reauthorization_preflight_candidate(
+        candidates
+    )
+
+    assert index == 2
+    assert candidate["email"] == "oldest@example.com"
+
+
 def test_refresh_worker_failure_preserves_existing_cpa_byte_for_byte(
     isolated_refresh_state, monkeypatch
 ):
@@ -656,11 +673,21 @@ def test_refresh_all_route_queues_available_sso_without_exposing_secrets(
             {"email": "empty@example.com", "sso": ""},
         ],
     )
-    requested_limits = []
+    preflight_emails = []
     monkeypatch.setattr(
         panel_app,
-        "enqueue_all_sso_refresh",
-        lambda limit: (requested_limits.append(limit) or 1),
+        "_run_cpa_reauthorization_preflight",
+        lambda candidate, _batch_id: (
+            preflight_emails.append(candidate["email"]) or True,
+            "",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_reauthorization_candidates",
+        lambda _candidates, _batch_id: 0,
+        raising=False,
     )
 
     response = panel_app.app.test_client().post(
@@ -674,7 +701,7 @@ def test_refresh_all_route_queues_available_sso_without_exposing_secrets(
     assert payload["queued"] == 1
     assert payload["skipped"] == 0
     assert payload["cpa"]["pending"] == 0
-    assert requested_limits == [10000]
+    assert preflight_emails == ["one@example.com"]
     serialized = response.get_data(as_text=True)
     assert secret not in serialized
     assert password not in serialized
@@ -727,8 +754,15 @@ def test_reauthorize_route_deduplicates_stable_identity_and_uses_new_wording(
     )
     monkeypatch.setattr(
         panel_app,
-        "enqueue_all_sso_refresh",
-        lambda limit: 1,
+        "_run_cpa_reauthorization_preflight",
+        lambda _candidate, _batch_id: (True, ""),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_reauthorization_candidates",
+        lambda _candidates, _batch_id: 0,
+        raising=False,
     )
 
     response = panel_app.app.test_client().post(
@@ -750,16 +784,26 @@ def test_reauthorize_route_deduplicates_stable_identity_and_uses_new_wording(
 def test_refresh_all_route_normalizes_limit(
     isolated_refresh_state, monkeypatch, requested, expected
 ):
-    monkeypatch.setattr(
-        panel_app,
-        "unique_accounts",
-        lambda: [{"email": "one@example.com", "sso": "sso-one"}],
-    )
     limits = []
     monkeypatch.setattr(
         panel_app,
-        "enqueue_all_sso_refresh",
-        lambda limit: (limits.append(limit) or 1),
+        "_reauthorization_candidates",
+        lambda limit: (
+            limits.append(limit)
+            or ([{"email": "one@example.com", "sso": "sso-one"}], 0)
+        ),
+    )
+    monkeypatch.setattr(
+        panel_app,
+        "_run_cpa_reauthorization_preflight",
+        lambda _candidate, _batch_id: (True, ""),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_reauthorization_candidates",
+        lambda _candidates, _batch_id: 0,
+        raising=False,
     )
 
     response = panel_app.app.test_client().post(
@@ -768,6 +812,156 @@ def test_refresh_all_route_normalizes_limit(
 
     assert response.status_code == 200
     assert limits == [expected]
+
+
+def test_reauthorize_route_quarantines_access_denied_preflight_and_continues(
+    isolated_refresh_state, monkeypatch
+):
+    monkeypatch.setattr(
+        panel_app,
+        "unique_accounts",
+        lambda: [
+            {"email": f"user-{index}@example.com", "sso": f"sso-{index}"}
+            for index in range(4)
+        ],
+    )
+    preflight_calls = []
+    bulk_calls = []
+
+    def preflight(candidate, _batch_id):
+        preflight_calls.append(candidate["email"])
+        if len(preflight_calls) == 1:
+            return False, "consent 失败: Access denied"
+        return True, ""
+
+    monkeypatch.setattr(
+        panel_app,
+        "_run_cpa_reauthorization_preflight",
+        preflight,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_reauthorization_candidates",
+        lambda candidates, batch_id: (
+            bulk_calls.append((list(candidates), batch_id))
+            or len(candidates)
+        ),
+        raising=False,
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/cpa/reauthorize",
+        json={"limit": 10000},
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["preflight"]["ok"] is True
+    assert payload["queued"] == 3
+    assert payload["disabled"] == 1
+    assert preflight_calls == [
+        "user-3@example.com",
+        "user-2@example.com",
+    ]
+    assert [item["email"] for item in bulk_calls[0][0]] == [
+        "user-0@example.com",
+        "user-1@example.com",
+    ]
+
+
+def test_reauthorize_route_quarantines_all_access_denied_candidates(
+    isolated_refresh_state, monkeypatch
+):
+    monkeypatch.setattr(
+        panel_app,
+        "unique_accounts",
+        lambda: [
+            {"email": f"user-{index}@example.com", "sso": f"sso-{index}"}
+            for index in range(2)
+        ],
+    )
+    preflight_calls = []
+    bulk_calls = []
+
+    def preflight(candidate, _batch_id):
+        preflight_calls.append(candidate["email"])
+        return False, "consent 失败: Access denied"
+
+    monkeypatch.setattr(
+        panel_app,
+        "_run_cpa_reauthorization_preflight",
+        preflight,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_reauthorization_candidates",
+        lambda candidates, batch_id: bulk_calls.append(
+            (list(candidates), batch_id)
+        ),
+        raising=False,
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/cpa/reauthorize",
+        json={"limit": 10000},
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["preflight"]["ok"] is False
+    assert payload["queued"] == 0
+    assert payload["disabled"] == 2
+    assert payload["skipped"] == 2
+    assert bulk_calls == []
+    assert preflight_calls == [
+        "user-1@example.com",
+        "user-0@example.com",
+    ]
+    assert payload["cpa"]["run_status"] == "completed_with_failures"
+
+
+def test_reauthorize_route_still_aborts_on_systemic_preflight_failure(
+    isolated_refresh_state, monkeypatch
+):
+    monkeypatch.setattr(
+        panel_app,
+        "unique_accounts",
+        lambda: [
+            {"email": f"user-{index}@example.com", "sso": f"sso-{index}"}
+            for index in range(3)
+        ],
+    )
+    monkeypatch.setattr(
+        panel_app,
+        "_run_cpa_reauthorization_preflight",
+        lambda _candidate, _batch_id: (
+            False,
+            "consent 响应缺少 code",
+        ),
+    )
+    bulk_calls = []
+    monkeypatch.setattr(
+        panel_app,
+        "enqueue_reauthorization_candidates",
+        lambda candidates, batch_id: bulk_calls.append(
+            (list(candidates), batch_id)
+        ),
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/cpa/reauthorize",
+        json={"limit": 10000},
+    )
+
+    assert response.status_code == 422
+    payload = response.get_json()
+    assert payload["preflight"]["ok"] is False
+    assert payload["queued"] == 0
+    assert bulk_calls == []
+    assert payload["cpa"]["run_status"] == "preflight_failed"
 
 
 def test_refresh_all_route_rejects_workspace_without_sso(

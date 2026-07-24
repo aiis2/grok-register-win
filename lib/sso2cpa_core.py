@@ -15,10 +15,11 @@ import re
 import secrets
 import shutil
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 
 def _fix_curl_ca_bundle():
@@ -95,6 +96,7 @@ except ImportError:
 # ---- OAuth constants (Grok CLI / Build) ----
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 OIDC_ISSUER = "https://auth.x.ai"
+ACCOUNTS_ORIGIN = "https://accounts.x.ai"
 TOKEN_URL = f"{OIDC_ISSUER}/oauth2/token"
 AUTHORIZE_URL = f"{OIDC_ISSUER}/oauth2/authorize"
 REDIRECT_URI = "http://127.0.0.1:56121/callback"
@@ -105,36 +107,146 @@ DEFAULT_SCOPE = (
 GROK_REFERRER = "grok-build"
 GROK_VERSION = "0.2.93"
 GROK_TOKEN_UA = f"grok-pager/{GROK_VERSION} grok-shell/{GROK_VERSION} (linux; x86_64)"
-# Fallback action ID; real one is extracted from consent page HTML at runtime
-NEXT_ACTION_ID_FALLBACK = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
 BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
+_CONSENT_ACTION_ID_CACHE = ""
+_CONSENT_ACTION_ID_LOCK = threading.Lock()
+_CONSENT_ROUTER_STATE = [
+    "",
+    {
+        "children": [
+            "(app)",
+            {
+                "children": [
+                    "(auth)",
+                    {
+                        "children": [
+                            "oauth2",
+                            {
+                                "children": [
+                                    "consent",
+                                    {
+                                        "children": [
+                                            "__PAGE__",
+                                            {},
+                                            None,
+                                            None,
+                                            0,
+                                        ]
+                                    },
+                                    None,
+                                    None,
+                                    0,
+                                ]
+                            },
+                            None,
+                            None,
+                            0,
+                        ]
+                    },
+                    None,
+                    None,
+                    0,
+                ]
+            },
+            None,
+            None,
+            0,
+        ]
+    },
+    None,
+    None,
+    16,
+]
+CONSENT_ROUTER_STATE_TREE = quote(
+    json.dumps(_CONSENT_ROUTER_STATE, separators=(",", ":")),
+    # Next.js uses encodeURIComponent, which leaves route-group parentheses.
+    safe="()",
+)
 
-def _extract_next_action_id(html: str) -> str:
-    """Extract Next.js Server Action ID from consent page HTML.
 
-    Next.js embeds action IDs in the page as $ACTION_ID_<id> or in
-    self.__next_f.push data chunks. We try multiple patterns.
+def _extract_next_action_id(source: str) -> str:
+    """Extract the action ID specifically bound to submitOAuth2Consent.
+
+    The ID is a deployment hash and must not be confused with unrelated
+    Server Actions that can coexist in the same JavaScript chunk.
     """
-    if not html:
+    if not source:
         return ""
-    # Pattern 1: $ACTION_ID_<hex>
-    m = re.search(r'\$ACTION_ID_([a-f0-9]{40,})', html)
-    if m:
-        return m.group(1)
-    # Pattern 2: "actionId":"<hex>" or "id":"<hex>" near consent/allow
-    for pat in (
-        r'"actionId"\s*:\s*"([a-f0-9]{30,})"',
-        r'"id"\s*:\s*"([a-f0-9]{40,})"',
-    ):
-        m = re.search(pat, html)
+    patterns = (
+        (
+            r'createServerReference\)\(\s*["\']([0-9a-f]{40,})["\']'
+            r'[^;]{0,400}?["\']submitOAuth2Consent["\']'
+        ),
+        (
+            r'["\']submitOAuth2Consent["\'][^;]{0,400}?'
+            r'["\']([0-9a-f]{40,})["\']'
+        ),
+    )
+    for pattern in patterns:
+        m = re.search(pattern, source, flags=re.DOTALL)
         if m:
             return m.group(1)
-    # Pattern 3: any 40+ char hex string in quotes (Next-Action header value)
-    m = re.search(r'["\']([a-f0-9]{40,})["\']', html)
-    if m:
-        return m.group(1)
     return ""
+
+
+def _discover_consent_action_id(
+    session,
+    consent_html: str,
+    consent_url: str,
+    *,
+    force: bool = False,
+) -> str:
+    """Resolve the current deployment's consent Server Action ID."""
+    global _CONSENT_ACTION_ID_CACHE
+
+    if not force and _CONSENT_ACTION_ID_CACHE:
+        return _CONSENT_ACTION_ID_CACHE
+
+    with _CONSENT_ACTION_ID_LOCK:
+        if not force and _CONSENT_ACTION_ID_CACHE:
+            return _CONSENT_ACTION_ID_CACHE
+
+        action_id = _extract_next_action_id(consent_html)
+        if not action_id:
+            script_sources = re.findall(
+                r'<script[^>]+src=["\']([^"\']+)["\']',
+                consent_html or "",
+                flags=re.IGNORECASE,
+            )
+            seen = set()
+            # Route-specific chunks are emitted near the end of the document.
+            for script_source in reversed(script_sources):
+                script_url = urljoin(consent_url, script_source)
+                parsed = urlparse(script_url)
+                if parsed.hostname != "accounts.x.ai" or script_url in seen:
+                    continue
+                seen.add(script_url)
+                try:
+                    script_response = session.get(
+                        script_url,
+                        headers={
+                            **browser_headers("GET"),
+                            "Accept": "*/*",
+                            "Referer": consent_url,
+                        },
+                        allow_redirects=True,
+                        timeout=20,
+                    )
+                except Exception:
+                    continue
+                if not (200 <= script_response.status_code < 300):
+                    continue
+                action_id = _extract_next_action_id(script_response.text or "")
+                if action_id:
+                    break
+
+        if not action_id:
+            raise ConvertError(
+                "consent 页面协议已变化：未找到 submitOAuth2Consent Server Action"
+            )
+        _CONSENT_ACTION_ID_CACHE = action_id
+        return action_id
 
 
 def _debug_dump_consent_html(html: str, final_url: str) -> None:
@@ -386,11 +498,11 @@ def parse_consent_code(body: str) -> str:
             obj = json.loads(line[idx:])
         except Exception:
             continue
+        if isinstance(obj, dict) and obj.get("success") is False:
+            raise ConvertError(
+                f"consent 失败: {obj.get('error') or obj.get('action') or 'unknown'}"
+            )
         if isinstance(obj, dict) and obj.get("code"):
-            if obj.get("success") is False:
-                raise ConvertError(
-                    f"consent 失败: {obj.get('error') or obj.get('action')}"
-                )
             return str(obj["code"])
         if isinstance(obj, list):
             for it in obj:
@@ -458,46 +570,57 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
             f"impersonate={_IMPERSONATE or 'n/a'}): {final_url}"
         )
 
-    # The consent page has a regular HTML form that POSTs to auth.x.ai/oauth2/authorize
-    # with the OAuth params as form-encoded data. Not a Next.js Server Action.
-    form_data = {
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
+    action_id = _discover_consent_action_id(session, body, final_url)
+    try:
+        prime_response = session.get(
+            f"{ACCOUNTS_ORIGIN}/",
+            headers={
+                **browser_headers("GET"),
+                "Accept": "*/*",
+                "Referer": final_url,
+            },
+            allow_redirects=True,
+            timeout=30,
+        )
+    except Exception as e:
+        raise ConvertError(f"consent 会话初始化失败: {e}") from e
+    if not (200 <= prime_response.status_code < 400):
+        raise ConvertError(
+            f"consent 会话初始化 HTTP {prime_response.status_code}"
+        )
+    action_data = {
+        "action": "allow",
+        "clientId": CLIENT_ID,
+        "redirectUri": REDIRECT_URI,
         "scope": DEFAULT_SCOPE,
         "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
+        "codeChallenge": challenge,
+        "codeChallengeMethod": "S256",
         "nonce": nonce,
-        "principal_type": "User",
-        "principal_id": "",
+        "principalType": "User",
+        "principalId": "",
         "referrer": GROK_REFERRER,
     }
     try:
         cres = session.post(
-            AUTHORIZE_URL,  # https://auth.x.ai/oauth2/authorize
-            data=form_data,
+            final_url,
+            data=json.dumps([action_data], separators=(",", ":")),
             headers={
-                "User-Agent": browser_headers("POST")["User-Agent"],
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                    "*/*;q=0.8"
+                **browser_headers(
+                    "POST",
+                    referer=final_url,
+                    next_action=action_id,
                 ),
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://accounts.x.ai",
-                "Referer": final_url,
-                "Sec-Fetch-Site": "same-site",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Dest": "document",
-                "Upgrade-Insecure-Requests": "1",
-                "Accept-Language": "en-US,en;q=0.9",
+                "Next-Router-State-Tree": CONSENT_ROUTER_STATE_TREE,
             },
-            allow_redirects=False,  # Don't follow redirect to 127.0.0.1
+            allow_redirects=False,
             timeout=30,
         )
     except Exception as e:
         raise ConvertError(f"consent 请求失败: {e}") from e
 
-    # Expect a 302 redirect to http://127.0.0.1:PORT/callback?code=...&state=...
+    # Current Next.js actions return an RSC payload. Retain redirect parsing
+    # for deployments that answer with a loopback callback instead.
     redirect_url = cres.headers.get("Location", "") if cres.status_code in (301, 302, 303, 307, 308) else ""
     if redirect_url:
         code = _extract_code_from_url(redirect_url)

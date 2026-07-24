@@ -146,6 +146,16 @@
       requestGeneration: 0,
       searchTimer: null,
     },
+    disabledAccounts: {
+      loaded: false,
+      loading: false,
+      page: 1,
+      pageSize: 25,
+      totalPages: 0,
+      items: [],
+      controller: null,
+      requestGeneration: 0,
+    },
     logs: {
       lines: [],
       fallbackLines: [],
@@ -239,7 +249,10 @@
     if (updateHash && window.location.hash !== `#${next}`) {
       window.history.pushState(null, '', `#${next}`);
     }
-    if (next === 'accounts') ensureAccountsLoaded();
+    if (next === 'accounts') {
+      ensureAccountsLoaded();
+      ensureDisabledAccountsLoaded();
+    }
     if (next === 'register') {
       renderLogControls();
       scheduleLogRender({ immediate: true });
@@ -320,6 +333,7 @@
     });
     if (group === 'registration') syncRegistrationControls();
     if (group === 'accounts') syncAccountControls();
+    if (group === 'disabled-accounts') syncDisabledAccountControls();
     if (group === 'mail') syncMailControls();
     if (group === 'credentials') syncCredentialControls();
   }
@@ -656,6 +670,152 @@
     loadAccounts().catch(() => {});
   }
 
+  function setDisabledAccountsError(message = '') {
+    const alert = document.getElementById('disabled-accounts-error');
+    if (!alert) return;
+    alert.textContent = message;
+    alert.hidden = !message;
+  }
+
+  function syncDisabledAccountControls() {
+    const disabled = state.disabledAccounts;
+    const busy = disabled.loading || state.busy.has('disabled-accounts');
+    const previous = document.getElementById('disabled-accounts-prev');
+    const next = document.getElementById('disabled-accounts-next');
+    if (previous) previous.disabled = busy || disabled.page <= 1;
+    if (next) {
+      next.disabled = busy
+        || disabled.totalPages === 0
+        || disabled.page >= disabled.totalPages;
+    }
+    document.querySelectorAll('[data-disabled-account-restore]').forEach((button) => {
+      button.disabled = busy;
+    });
+  }
+
+  function renderDisabledAccountRows(items = []) {
+    const body = document.getElementById('disabled-accounts-body');
+    const table = document.getElementById('disabled-accounts-table');
+    const empty = document.getElementById('disabled-accounts-empty');
+    if (!body || !table || !empty) return;
+    body.replaceChildren();
+    items.forEach((record) => {
+      const row = document.createElement('tr');
+      const email = createElement('td', 'account-email', record.email || '—');
+      const source = createElement('td', 'table-muted', record.source || '—');
+      const reasonCell = document.createElement('td');
+      const reason = createElement('span', 'status-badge', 'Access denied');
+      reason.dataset.status = 'disabled';
+      reasonCell.append(reason);
+      const disabledAt = createElement(
+        'td',
+        'table-muted',
+        String(record.disabled_at || '—').replace('T', ' ').replace('Z', ''),
+      );
+      const action = document.createElement('td');
+      const restore = createElement(
+        'button',
+        'button button--secondary',
+        '恢复并重新授权',
+      );
+      restore.type = 'button';
+      restore.dataset.disabledAccountRestore = record.id || '';
+      restore.addEventListener('click', () => restoreDisabledAccount(record));
+      action.append(restore);
+      row.append(email, source, reasonCell, disabledAt, action);
+      body.append(row);
+    });
+    table.hidden = items.length === 0;
+    empty.hidden = items.length !== 0;
+    syncDisabledAccountControls();
+  }
+
+  async function loadDisabledAccounts() {
+    const disabled = state.disabledAccounts;
+    disabled.controller?.abort();
+    disabled.controller = new AbortController();
+    const requestGeneration = ++disabled.requestGeneration;
+    disabled.loading = true;
+    setBusy('disabled-accounts', true);
+    setDisabledAccountsError();
+    const params = new URLSearchParams({
+      page: String(disabled.page),
+      page_size: String(disabled.pageSize),
+    });
+    try {
+      const payload = await requestJson(
+        `/api/disabled-accounts?${params.toString()}`,
+        { signal: disabled.controller.signal },
+      );
+      if (requestGeneration !== disabled.requestGeneration) return;
+      const pagination = payload.pagination || {};
+      const totalPages = Number(pagination.total_pages || 0);
+      if (totalPages > 0 && disabled.page > totalPages) {
+        disabled.page = totalPages;
+        await loadDisabledAccounts();
+        return;
+      }
+      disabled.loaded = true;
+      disabled.totalPages = totalPages;
+      disabled.items = Array.isArray(payload.items) ? payload.items : [];
+      renderDisabledAccountRows(disabled.items);
+      setText('disabled-accounts-count', Number(pagination.total || 0));
+      setText(
+        'disabled-accounts-page-label',
+        totalPages ? `第 ${disabled.page} / ${totalPages} 页` : '第 0 / 0 页',
+      );
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      if (requestGeneration !== disabled.requestGeneration) return;
+      disabled.loaded = false;
+      setDisabledAccountsError(safeErrorMessage(error));
+    } finally {
+      if (requestGeneration === disabled.requestGeneration) {
+        disabled.loading = false;
+        setBusy('disabled-accounts', false);
+      }
+    }
+  }
+
+  function ensureDisabledAccountsLoaded() {
+    const disabled = state.disabledAccounts;
+    if (!disabled.loaded && !disabled.loading) {
+      loadDisabledAccounts().catch(() => {});
+    }
+  }
+
+  async function restoreDisabledAccount(record) {
+    if (!record?.id) return;
+    const accepted = await confirmAction({
+      title: `恢复 ${record.email || '该账号'}？`,
+      message: '账号会重新进入 OAuth 授权队列；旧 CPA 在新授权成功前仍保持禁用。',
+      acceptLabel: '恢复并重新授权',
+    });
+    if (!accepted) return;
+    setBusy('disabled-accounts', true);
+    setDisabledAccountsError();
+    try {
+      const payload = await requestJson(
+        `/api/disabled-accounts/${encodeURIComponent(record.id)}/restore`,
+        { method: 'POST', body: {} },
+      );
+      showToast(payload.message || '账号已恢复并加入重新授权队列');
+      state.disabledAccounts.loaded = false;
+      state.accounts.loaded = false;
+      await Promise.all([
+        loadDisabledAccounts(),
+        loadAccounts(),
+        loadCpaStatus(),
+      ]);
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      setDisabledAccountsError(message);
+      showToast(message, 'error');
+    } finally {
+      setBusy('disabled-accounts', false);
+    }
+  }
+
   async function deleteSelectedAccountFiles() {
     const names = [...state.accounts.selectedFiles];
     if (!names.length) return;
@@ -873,14 +1033,27 @@
       if (cpa.core_ok === false) {
         label = '转换核心不可用';
         tone = 'status-danger';
+      } else if (cpa.circuit_open || cpa.run_status === 'paused') {
+        label = '批次已熔断暂停';
+        tone = 'status-danger';
+      } else if (cpa.run_status === 'preflight_failed') {
+        label = '单账号预检失败';
+        tone = 'status-danger';
+      } else if (cpa.run_status === 'preflight') {
+        label = '单账号预检中';
+        tone = '';
       } else if (cpa.running || Number(cpa.pending || 0) > 0) {
         label = '转换中';
         tone = '';
-      } else if (Number(cpa.fail || 0) > 0) {
-        label = '存在失败';
+      } else if (Number(cpa.run_fail || 0) > 0) {
+        label = '本轮存在失败';
         tone = 'status-danger';
       }
       status.textContent = label;
+      const runTotal = Number(cpa.run_total || 0);
+      status.title = runTotal
+        ? `本轮 ${Number(cpa.run_ok || 0)} 成功 / ${Number(cpa.run_fail || 0)} 失败 / ${Number(cpa.run_skipped || 0)} 跳过，共 ${runTotal}`
+        : '';
       status.classList.toggle('status-success', tone === 'status-success');
       status.classList.toggle('status-danger', tone === 'status-danger');
     }
@@ -891,7 +1064,10 @@
       `${Number(cpa.active_workers || 0)} / ${Number(cpa.concurrency || 1)}`,
     );
     setText('cpa-commit-pending', Number(cpa.commit_pending || 0));
-    setText('cpa-fail', Number(cpa.fail || 0));
+    setText(
+      'cpa-fail',
+      Number(cpa.run_id ? cpa.run_fail : cpa.fail || 0),
+    );
     setText('cpa-last-email', cpa.last_ok_email || '—');
     syncCredentialControls();
   }
@@ -1040,7 +1216,7 @@
     setBusy('credentials', true);
     setInlineError('section-credentials-error');
     try {
-      const payload = await requestJson('/api/cpa/reauthorize', {
+      const payload = await requestJson('/api/cpa/refresh-all', {
         method: 'POST',
         body: { limit },
       });
@@ -1986,6 +2162,16 @@
     });
     document.getElementById('accounts-retry')?.addEventListener('click', () => {
       loadAccounts().catch(() => {});
+    });
+    document.getElementById('disabled-accounts-prev')?.addEventListener('click', () => {
+      if (state.disabledAccounts.page <= 1) return;
+      state.disabledAccounts.page -= 1;
+      loadDisabledAccounts().catch(() => {});
+    });
+    document.getElementById('disabled-accounts-next')?.addEventListener('click', () => {
+      if (state.disabledAccounts.page >= state.disabledAccounts.totalPages) return;
+      state.disabledAccounts.page += 1;
+      loadDisabledAccounts().catch(() => {});
     });
     document.getElementById('account-files-select-all')?.addEventListener('change', (event) => {
       state.accounts.selectedFiles.clear();

@@ -114,6 +114,22 @@ def panel_command() -> list[str]:
     return [python_bin(), "-m", "panel.app"]
 
 
+def panel_environment(proxy: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["GROK_REGISTER_DIR"] = str(ROOT)
+    env["GROK_PROXY"] = proxy
+    env["PANEL_HOST"] = PANEL_HOST
+    env["PANEL_PORT"] = str(PANEL_PORT)
+    env["PANEL_PASSWORD"] = PANEL_PASSWORD
+    env["SSO2CPA_PATH"] = str(ROOT / "lib")
+    env["PANEL_LOG_DIR"] = str(ROOT / "data" / "logs")
+    env["GROK_PYTHON"] = python_bin()
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("CLASH_API", "http://127.0.0.1:9090")
+    env.setdefault("ENABLE_CLASH_UI", "1")
+    return env
+
+
 def check_proxy(proxy: str) -> None:
     proxy = (proxy or "").strip()
     if not proxy:
@@ -154,6 +170,23 @@ def wait_health(timeout: float = 25.0) -> bool:
     return False
 
 
+def reuse_existing_panel() -> bool:
+    if not open_port(PANEL_HOST, PANEL_PORT):
+        return False
+    if not wait_health(2.0):
+        raise RuntimeError(
+            f"{PANEL_HOST}:{PANEL_PORT} 已被其他程序占用，"
+            "为避免启动多个面板实例，本次启动已取消"
+        )
+    url = f"http://{PANEL_HOST}:{PANEL_PORT}/"
+    log(f"[+] panel already running; reuse: {url}")
+    try:
+        webbrowser.open(url)
+    except Exception as exc:
+        log(f"[!] open browser failed: {exc}")
+    return True
+
+
 def main() -> int:
     try:
         return _main_impl()
@@ -170,6 +203,8 @@ def main() -> int:
 def _main_impl() -> int:
     os.chdir(ROOT)
     ensure_dirs()
+    if reuse_existing_panel():
+        return 0
     _apply_playwright_patch()
     cfg = ensure_config()
     proxy = detect_local_proxy(str(cfg.get("proxy") or "").strip())
@@ -193,19 +228,7 @@ def _main_impl() -> int:
     log("======================================")
     check_proxy(proxy)
 
-    env = os.environ.copy()
-    env["GROK_REGISTER_DIR"] = str(ROOT)
-    env["GROK_PROXY"] = proxy
-    env["PANEL_HOST"] = PANEL_HOST
-    env["PANEL_PORT"] = str(PANEL_PORT)
-    env["PANEL_PASSWORD"] = PANEL_PASSWORD
-    env["SSO2CPA_PATH"] = str(ROOT / "lib")
-    env["CPA_DIR"] = str(ROOT / "data" / "cpa")
-    env["PANEL_LOG_DIR"] = str(ROOT / "data" / "logs")
-    env["GROK_PYTHON"] = python_bin()
-    env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("CLASH_API", "http://127.0.0.1:9090")
-    env.setdefault("ENABLE_CLASH_UI", "1")
+    env = panel_environment(proxy)
 
     panel_py = ROOT / "panel" / "app.py"
     if not panel_py.exists():

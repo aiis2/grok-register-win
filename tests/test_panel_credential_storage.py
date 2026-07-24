@@ -340,6 +340,7 @@ def test_credentials_status_reports_paths_and_counts_without_contents(
         "sso_files": 1,
         "mail_files": 1,
         "cpa_files": 1,
+        "disabled_files": 0,
         "total_files": 3,
         "total_bytes": 33,
     }

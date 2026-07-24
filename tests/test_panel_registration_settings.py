@@ -48,6 +48,16 @@ def test_panel_contains_concurrency_worker_and_credential_controls():
     assert "不会覆盖" in html
 
 
+def test_credentials_public_config_exposes_disabled_pool_directory(isolated_config):
+    app_root, _config_path = isolated_config
+
+    payload = panel_app.credentials_config_public()
+
+    assert payload["disabled_dir"] == str(
+        (app_root / "data" / "credentials" / "disabled").resolve()
+    )
+
+
 def test_legacy_panel_exposes_confirmed_full_sso_refresh_control():
     html = panel_app.INDEX_HTML
 
@@ -56,7 +66,7 @@ def test_legacy_panel_exposes_confirmed_full_sso_refresh_control():
     assert "不会生成新的 Web SSO" in html
     assert "失败保留旧 CPA" in html
     assert "async function refreshAllSso()" in html
-    assert "/api/cpa/reauthorize" in html
+    assert "/api/cpa/refresh-all" in html
     assert "limit:10000" in html
     assert "confirm(message)" in html
     assert 'id="oauth_target_instance"' in html

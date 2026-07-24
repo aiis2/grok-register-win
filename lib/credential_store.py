@@ -31,6 +31,7 @@ class CredentialLayout:
     sso_dir: Path
     mail_dir: Path
     cpa_dir: Path
+    disabled_dir: Path
     archive_dir: Path
 
     @classmethod
@@ -55,6 +56,7 @@ class CredentialLayout:
             sso_dir=root / "sso",
             mail_dir=root / "mail",
             cpa_dir=root / "cpa",
+            disabled_dir=root / "disabled",
             archive_dir=root / "archive",
         )
 
@@ -107,6 +109,7 @@ def ensure_layout(layout: CredentialLayout) -> CredentialLayout:
         layout.sso_dir,
         layout.mail_dir,
         layout.cpa_dir,
+        layout.disabled_dir,
         layout.archive_dir,
     ):
         if path.exists() and not path.is_dir():
@@ -290,6 +293,11 @@ def _migration_sources(
                     ),
                     target.cpa_dir,
                 ),
+                (
+                    current.disabled_dir,
+                    ("accounts.json",),
+                    target.disabled_dir,
+                ),
             ]
         )
     groups.extend(
@@ -360,8 +368,95 @@ def _conflict_destination(
 
 _OAUTH_OWNERSHIP_FILENAME = "oauth_ownership.json"
 _OAUTH_OWNERSHIP_VERSION = 1
+_DISABLED_ACCOUNTS_FILENAME = "accounts.json"
+_DISABLED_ACCOUNTS_VERSION = 1
 _OAUTH_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _OAUTH_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _read_disabled_account_registry(path: Path) -> dict:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise CredentialMigrationError(
+            f"禁用账号池损坏，迁移已取消: {Path(path).name}"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _DISABLED_ACCOUNTS_VERSION
+        or not isinstance(payload.get("accounts"), dict)
+    ):
+        raise CredentialMigrationError(
+            f"禁用账号池损坏，迁移已取消: {Path(path).name}"
+        )
+    accounts: dict[str, dict] = {}
+    for record_id, raw_record in payload["accounts"].items():
+        if (
+            not isinstance(record_id, str)
+            or not record_id.strip()
+            or not isinstance(raw_record, dict)
+        ):
+            raise CredentialMigrationError("禁用账号池损坏，迁移已取消")
+        record = dict(raw_record)
+        record["id"] = str(record.get("id") or record_id).strip()
+        if not record["id"]:
+            raise CredentialMigrationError("禁用账号池损坏，迁移已取消")
+        accounts[record_id] = record
+    return {
+        "version": _DISABLED_ACCOUNTS_VERSION,
+        "updated_at": str(payload.get("updated_at") or "").strip(),
+        "accounts": accounts,
+    }
+
+
+def _disabled_record_recency(record: Mapping[str, object]) -> tuple[str, str]:
+    return (
+        str(record.get("last_denied_at") or ""),
+        str(record.get("disabled_at") or ""),
+    )
+
+
+def _merge_disabled_account_registries(paths: Iterable[Path]) -> dict:
+    merged: dict[str, dict] = {}
+    updated_at = ""
+    alias_fields = ("emails", "subjects", "sso_fingerprints")
+    for path in paths:
+        payload = _read_disabled_account_registry(path)
+        updated_at = max(updated_at, str(payload.get("updated_at") or ""))
+        for record_id, incoming in payload["accounts"].items():
+            existing = merged.get(record_id)
+            if existing is None:
+                merged[record_id] = dict(incoming)
+                continue
+            newer, older = (
+                (incoming, existing)
+                if _disabled_record_recency(incoming)
+                >= _disabled_record_recency(existing)
+                else (existing, incoming)
+            )
+            combined = dict(older)
+            combined.update(newer)
+            for field in alias_fields:
+                values = {
+                    str(value).strip()
+                    for source in (existing, incoming)
+                    for value in (
+                        source.get(field)
+                        if isinstance(source.get(field), list)
+                        else []
+                    )
+                    if str(value).strip()
+                }
+                if values:
+                    combined[field] = sorted(values)
+            combined["id"] = str(combined.get("id") or record_id)
+            merged[record_id] = combined
+    return {
+        "version": _DISABLED_ACCOUNTS_VERSION,
+        "updated_at": updated_at
+        or datetime.now().astimezone().isoformat(timespec="seconds"),
+        "accounts": merged,
+    }
 
 
 def _read_oauth_ownership_registry(path: Path) -> dict:
@@ -493,6 +588,8 @@ def _migration_ownership_registry_paths(
     candidates = [
         current.cpa_dir / _OAUTH_OWNERSHIP_FILENAME,
         target.cpa_dir / _OAUTH_OWNERSHIP_FILENAME,
+        current.disabled_dir / _DISABLED_ACCOUNTS_FILENAME,
+        target.disabled_dir / _DISABLED_ACCOUNTS_FILENAME,
     ]
     legacy_directory = Path(app_root).resolve() / "data" / "cpa"
     if legacy_directory.is_dir():
@@ -591,12 +688,29 @@ def _migrate_credentials_locked(
         if source.name == _OAUTH_OWNERSHIP_FILENAME
         and destination_dir.resolve() == ensured_target.cpa_dir.resolve()
     ]
+    target_disabled_registry = (
+        ensured_target.disabled_dir / _DISABLED_ACCOUNTS_FILENAME
+    )
+    disabled_registry_sources = [
+        source
+        for source, destination_dir in sources
+        if source.name == _DISABLED_ACCOUNTS_FILENAME
+        and destination_dir.resolve() == ensured_target.disabled_dir.resolve()
+    ]
     ordinary_sources = [
         (source, destination_dir)
         for source, destination_dir in sources
         if not (
-            source.name == _OAUTH_OWNERSHIP_FILENAME
-            and destination_dir.resolve() == ensured_target.cpa_dir.resolve()
+            (
+                source.name == _OAUTH_OWNERSHIP_FILENAME
+                and destination_dir.resolve()
+                == ensured_target.cpa_dir.resolve()
+            )
+            or (
+                source.name == _DISABLED_ACCOUNTS_FILENAME
+                and destination_dir.resolve()
+                == ensured_target.disabled_dir.resolve()
+            )
         )
     ]
     registry_target_existed = target_registry.exists()
@@ -616,6 +730,37 @@ def _migrate_credentials_locked(
         merged_registry_bytes = (
             json.dumps(merged_registry, ensure_ascii=False, indent=2) + "\n"
         ).encode("utf-8")
+    disabled_registry_target_existed = target_disabled_registry.exists()
+    if (
+        disabled_registry_target_existed
+        and not target_disabled_registry.is_file()
+    ):
+        raise CredentialMigrationError(
+            "禁用账号池目标不是文件，迁移已取消"
+        )
+    previous_disabled_registry_bytes = (
+        target_disabled_registry.read_bytes()
+        if disabled_registry_target_existed
+        else None
+    )
+    merged_disabled_registry_bytes: bytes | None = None
+    if disabled_registry_sources:
+        disabled_registry_inputs = (
+            [target_disabled_registry]
+            if disabled_registry_target_existed
+            else []
+        ) + disabled_registry_sources
+        merged_disabled_registry = _merge_disabled_account_registries(
+            disabled_registry_inputs
+        )
+        merged_disabled_registry_bytes = (
+            json.dumps(
+                merged_disabled_registry,
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+        ).encode("utf-8")
     created: list[Path] = []
     temporary: list[Path] = []
     completed_sources: list[Path] = []
@@ -623,6 +768,7 @@ def _migrate_credentials_locked(
     skipped = 0
     renamed = 0
     registry_write_attempted = False
+    disabled_registry_write_attempted = False
 
     try:
         for source, destination_dir in ordinary_sources:
@@ -662,6 +808,22 @@ def _migrate_credentials_locked(
             completed_sources.extend(registry_sources)
             copied += len(registry_sources)
 
+        if merged_disabled_registry_bytes is not None:
+            disabled_registry_write_attempted = True
+            _replace_file_bytes_atomic(
+                target_disabled_registry,
+                merged_disabled_registry_bytes,
+            )
+            if (
+                target_disabled_registry.read_bytes()
+                != merged_disabled_registry_bytes
+            ):
+                raise CredentialMigrationError(
+                    "禁用账号池写入校验失败，迁移已取消"
+                )
+            completed_sources.extend(disabled_registry_sources)
+            copied += len(disabled_registry_sources)
+
         target_setting = normalize_credentials_setting(
             resolved_app_root, str(ensured_target.root)
         )
@@ -687,6 +849,17 @@ def _migrate_credentials_locked(
                     )
             except Exception:
                 pass
+        if disabled_registry_write_attempted:
+            try:
+                if previous_disabled_registry_bytes is None:
+                    target_disabled_registry.unlink(missing_ok=True)
+                else:
+                    _replace_file_bytes_atomic(
+                        target_disabled_registry,
+                        previous_disabled_registry_bytes,
+                    )
+            except Exception:
+                pass
         if isinstance(exc, CredentialMigrationError):
             raise
         raise CredentialMigrationError(f"凭据迁移失败: {type(exc).__name__}") from exc
@@ -704,6 +877,7 @@ def _migrate_credentials_locked(
         current.sso_dir,
         current.mail_dir,
         current.cpa_dir,
+        current.disabled_dir,
         *sorted(
             (path for path in current.archive_dir.rglob("*") if path.is_dir()),
             key=lambda path: len(path.parts),

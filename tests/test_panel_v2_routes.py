@@ -85,7 +85,7 @@ def test_v1_10_release_documents_combined_bounded_log_console(
         encoding="utf-8"
     )
 
-    assert "version-v1.12.0" in readme
+    assert "version-v1.13.0" in readme
     for phrase in (
         "aiis2",
         "注册与日志",
@@ -115,7 +115,7 @@ def test_v1_10_1_release_documents_turnstile_recovery_and_soak_validation(
         encoding="utf-8"
     )
 
-    assert "version-v1.12.0" in readme
+    assert "version-v1.13.0" in readme
     for phrase in (
         "aiis2",
         "Chromium",
@@ -146,7 +146,7 @@ def test_v1_11_release_documents_parallel_cpa_pipeline_and_registration_stabilit
         encoding="utf-8"
     )
 
-    assert "version-v1.12.0" in readme
+    assert "version-v1.13.0" in readme
     for phrase in (
         "aiis2",
         "默认使用 2 个 worker",
@@ -176,7 +176,7 @@ def test_v1_12_release_documents_oauth_single_instance_ownership(
         encoding="utf-8"
     )
 
-    assert "version-v1.12.0" in readme
+    assert "version-v1.13.0" in readme
     for phrase in (
         "aiis2",
         "重新生成账号授权",
@@ -197,6 +197,30 @@ def test_v1_12_release_documents_oauth_single_instance_ownership(
         assert forbidden not in release_lower
 
 
+def test_v1_13_release_documents_access_denied_disabled_account_pool(
+    isolated_v2_panel,
+):
+    root = Path(panel_app.__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    release = (root / "docs" / "releases" / "v1.13.0.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "version-v1.13.0" in readme
+    for phrase in (
+        "aiis2",
+        "Access denied",
+        "disabled/accounts.json",
+        "手动恢复",
+        "Sub2 ZIP/JSON",
+        "disabled: true",
+        "submitOAuth2Consent",
+        "熔断",
+        "健康面板",
+        "538 passed",
+        "Playwright",
+    ):
+        assert phrase in release
 def test_v2_uses_only_local_assets_and_has_server_rendered_legacy_fallback(
     isolated_v2_panel,
 ):
@@ -273,6 +297,8 @@ def test_v2_css_uses_semantic_tokens_responsive_layout_and_reduced_motion():
     assert "max-width: 1440px" in css
     assert "@media" in css and "768px" in css
     assert "prefers-reduced-motion" in css
+    assert "[hidden]" in css
+    assert "display: none !important" in css
 
 
 def test_v2_screen_reader_only_labels_do_not_expand_mobile_document_width():
@@ -419,6 +445,46 @@ def test_v2_accounts_keeps_all_existing_download_entry_points(isolated_v2_panel)
         "/download/grok2api.json",
     ):
         assert f'href="{path}"' in html
+
+
+def test_v2_accounts_exposes_disabled_pool_and_confirmed_restore(
+    isolated_v2_panel,
+):
+    root = Path(panel_app.__file__).resolve().parent
+    html = panel_app.app.test_client().get("/?ui=modern").get_data(
+        as_text=True
+    )
+    source = (root / "static" / "panel-v2.js").read_text(encoding="utf-8")
+
+    for element_id in (
+        "disabled-accounts-count",
+        "disabled-accounts-error",
+        "disabled-accounts-table",
+        "disabled-accounts-body",
+        "disabled-accounts-empty",
+        "disabled-accounts-prev",
+        "disabled-accounts-next",
+    ):
+        assert f'id="{element_id}"' in html
+    assert "禁用账号池" in html
+    assert "恢复并重新授权" in html
+    for marker in (
+        "disabledAccounts:",
+        "function renderDisabledAccountRows",
+        "async function loadDisabledAccounts",
+        "async function restoreDisabledAccount",
+        "/api/disabled-accounts",
+        "encodeURIComponent(record.id)",
+        "confirmAction",
+        "method: 'POST'",
+    ):
+        assert marker in source
+    restore_logic = source.split(
+        "async function restoreDisabledAccount", 1
+    )[1].split("async function", 1)[0]
+    assert "password" not in restore_logic
+    assert ".sso" not in restore_logic
+    assert ".raw" not in restore_logic
 
 
 def test_v2_accounts_javascript_is_lazy_cancellable_and_debounced():
@@ -631,7 +697,7 @@ def test_v2_credentials_javascript_reuses_existing_safe_contracts():
         "/api/config/credentials/migrate",
         "/api/cpa/status",
         "/api/cpa/backfill",
-        "/api/cpa/reauthorize",
+        "/api/cpa/refresh-all",
         "/api/oauth/export-preflight",
         "/api/oauth/export-claim",
     ):

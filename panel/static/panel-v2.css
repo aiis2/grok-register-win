@@ -58,6 +58,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html {
   min-width: 320px;
   scroll-behavior: smooth;
@@ -983,6 +987,11 @@ a:hover {
   background: color-mix(in srgb, var(--warning), transparent 90%);
 }
 
+.status-badge[data-status="disabled"] {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger), transparent 90%);
+}
+
 .table-empty {
   min-height: 210px;
 }
@@ -1023,6 +1032,26 @@ a:hover {
   grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.55fr);
   gap: 16px;
   margin-top: 16px;
+}
+
+.disabled-account-card {
+  grid-column: 1 / -1;
+}
+
+.card-count {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.card-count strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.disabled-account-table td:last-child {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
 }
 
 .batch-table {

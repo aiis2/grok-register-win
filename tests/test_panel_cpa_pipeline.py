@@ -165,6 +165,14 @@ def test_parallel_oauth_workers_overlap_but_commit_complete_index(
     assert max_active >= 2
     assert len(index["items"]) == 24
     assert len(list(isolated_pipeline.glob("xai-*.json"))) == 24
+    first_cpa = json.loads(
+        next(iter(isolated_pipeline.glob("xai-*.json"))).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert first_cpa["disabled"] is False
+    assert "_disabled_reason" not in first_cpa
+    assert "_disabled_at" not in first_cpa
     assert panel_app._cpa_state["ok"] == 24
     assert panel_app._cpa_state["pending"] == 0
     assert panel_app._cpa_state["active_workers"] == 0
@@ -343,6 +351,236 @@ def test_permanent_oauth_failure_is_not_retried(
     assert "SSO 无效" in str(error)
     assert attempts == 1
     assert calls == 1
+
+
+def test_identical_systemic_batch_failures_open_circuit_and_drain_remainder(
+    isolated_pipeline,
+):
+    batch_id = "reauthorize-batch"
+    panel_app._cpa_state.update(
+        {
+            "run_id": batch_id,
+            "run_kind": "reauthorize",
+            "run_status": "running",
+            "run_total": 8,
+            "run_queued": 8,
+            "run_ok": 0,
+            "run_fail": 0,
+            "run_skipped": 0,
+            "run_error_signature": "",
+            "run_error_streak": 0,
+            "run_last_error": "",
+            "circuit_open": False,
+        }
+    )
+    for index in range(3, 8):
+        item = {
+            "email": f"queued-{index}@example.invalid",
+            "sso": f"queued-sso-{index}",
+            "fp": panel_app.sso_fingerprint(f"queued-sso-{index}"),
+            "batch_id": batch_id,
+        }
+        panel_app._cpa_inflight.add(item["fp"])
+        panel_app._cpa_q.put(item)
+        panel_app._cpa_state["pending"] += 1
+
+    for index in range(3):
+        item = {
+            "email": f"failed-{index}@example.invalid",
+            "sso": f"failed-sso-{index}",
+            "fp": panel_app.sso_fingerprint(f"failed-sso-{index}"),
+            "batch_id": batch_id,
+        }
+        panel_app._cpa_inflight.add(item["fp"])
+        panel_app._record_cpa_failure(
+            item,
+            item["fp"],
+            RuntimeError(
+                "consent 页面协议已变化：未找到 "
+                "submitOAuth2Consent Server Action"
+            ),
+            persist=False,
+        )
+
+    assert panel_app._cpa_state["circuit_open"] is True
+    assert panel_app._cpa_state["run_status"] == "paused"
+    assert panel_app._cpa_state["run_fail"] == 3
+    assert panel_app._cpa_state["run_skipped"] == 5
+    assert panel_app._cpa_state["pending"] == 0
+    assert panel_app._cpa_q.empty()
+    assert not panel_app._cpa_inflight
+
+
+def test_account_specific_access_denied_does_not_open_batch_circuit(
+    isolated_pipeline,
+):
+    batch_id = "account-specific-denial"
+    panel_app._cpa_state.update(
+        {
+            "run_id": batch_id,
+            "run_status": "running",
+            "run_total": 3,
+            "run_fail": 0,
+            "run_skipped": 0,
+            "run_error_signature": "",
+            "run_error_streak": 0,
+            "circuit_open": False,
+        }
+    )
+
+    for index in range(3):
+        sso = f"denied-sso-{index}"
+        item = {
+            "email": f"denied-{index}@example.invalid",
+            "sso": sso,
+            "fp": panel_app.sso_fingerprint(sso),
+            "batch_id": batch_id,
+        }
+        panel_app._record_cpa_failure(
+            item,
+            item["fp"],
+            RuntimeError("consent 失败: Access denied"),
+            persist=False,
+        )
+
+    assert panel_app._cpa_state["run_fail"] == 3
+    assert panel_app._cpa_state["circuit_open"] is False
+
+
+def test_access_denied_quarantines_account_and_disables_existing_cpa(
+    isolated_pipeline,
+):
+    email = "denied@example.invalid"
+    sso = "denied-web-sso"
+    fingerprint = panel_app.sso_fingerprint(sso)
+    cpa_path = isolated_pipeline / "xai-denied.json"
+    isolated_pipeline.mkdir(parents=True, exist_ok=True)
+    cpa_path.write_text(
+        json.dumps(
+            {
+                "email": email,
+                "sso": sso,
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "disabled": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    panel_app._cpa_done.add(fingerprint)
+    panel_app._cpa_inflight.add(fingerprint)
+
+    panel_app._record_cpa_failure(
+        {
+            "email": email,
+            "password": "password-secret",
+            "sso": sso,
+            "source": "accounts_denied.txt",
+        },
+        fingerprint,
+        RuntimeError("consent 失败: Access denied"),
+        cpa_paths=panel_app.current_cpa_paths(),
+    )
+
+    public = panel_app.current_disabled_account_pool().list_public()
+    assert [item["email"] for item in public] == [email]
+    disabled_cpa = json.loads(cpa_path.read_text(encoding="utf-8"))
+    assert disabled_cpa["disabled"] is True
+    assert disabled_cpa["_disabled_reason"] == "access_denied"
+    assert disabled_cpa["_disabled_at"]
+    assert fingerprint not in panel_app._cpa_done
+    assert fingerprint not in panel_app._cpa_inflight
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "401 Client Error: Unauthorized",
+        "token http 403",
+        "consent 响应缺少 code",
+        "Cloudflare challenge",
+        "request timeout",
+    ],
+)
+def test_non_account_specific_failures_never_quarantine(
+    isolated_pipeline,
+    error,
+):
+    sso = f"sso-{error}"
+    panel_app._record_cpa_failure(
+        {
+            "email": "transient@example.invalid",
+            "sso": sso,
+            "source": "accounts_transient.txt",
+        },
+        panel_app.sso_fingerprint(sso),
+        RuntimeError(error),
+        persist=False,
+    )
+
+    assert panel_app.current_disabled_account_pool().list_public() == []
+
+
+def test_disabled_account_is_rejected_before_queueing(isolated_pipeline):
+    email = "disabled@example.invalid"
+    sso = "disabled-sso"
+    panel_app.current_disabled_account_pool().disable(
+        {
+            "email": email,
+            "sso": sso,
+            "source": "accounts_disabled.txt",
+        },
+        "Access denied",
+    )
+
+    result = panel_app.enqueue_cpa_convert(
+        email=email,
+        sso=sso,
+        source="manual-refresh",
+        force=True,
+    )
+
+    assert result == (False, "account disabled")
+    assert panel_app._cpa_q.empty()
+    assert not panel_app._cpa_inflight
+
+
+def test_worker_rechecks_quarantine_after_item_was_queued(
+    isolated_pipeline,
+    monkeypatch,
+):
+    email = "late-disabled@example.invalid"
+    sso = "late-disabled-sso"
+    calls = []
+    monkeypatch.setattr(
+        panel_app,
+        "convert_one",
+        lambda *_args, **_kwargs: calls.append("converted"),
+    )
+    assert panel_app.enqueue_cpa_convert(
+        email=email,
+        sso=sso,
+        source="manual-refresh",
+        force=True,
+    ) == (True, "queued")
+    panel_app.current_disabled_account_pool().disable(
+        {"email": email, "sso": sso, "source": "manual-refresh"},
+        "Access denied",
+    )
+    panel_app._cpa_q.put(None)
+
+    workers, committer = panel_app._start_cpa_pipeline_threads(1)
+    panel_app._cpa_q.join()
+    workers[0].join(timeout=2)
+    panel_app._cpa_result_q.put(None)
+    panel_app._cpa_result_q.join()
+    committer.join(timeout=2)
+
+    assert calls == []
+    assert panel_app._cpa_state["pending"] == 0
+    assert panel_app._cpa_state["active_workers"] == 0
+    assert panel_app._cpa_state["commit_pending"] == 0
+    assert not panel_app._cpa_inflight
 
 
 def test_final_failure_preserves_old_cpa_and_clears_pipeline_state(

@@ -95,6 +95,7 @@ SSO2CPA_PATH = Path(
 ).resolve()
 AUTO_CPA = os.environ.get("AUTO_CPA", "1").strip() not in ("0", "false", "False", "no")
 CPA_DELAY = float(os.environ.get("CPA_DELAY", "1.0"))
+CPA_CIRCUIT_THRESHOLD = 3
 
 
 def normalize_cpa_concurrency(value) -> int:
@@ -143,6 +144,11 @@ from credential_store import (  # type: ignore
     ensure_layout,
     migrate_credentials,
     normalize_credentials_setting,
+)
+from disabled_account_pool import (  # type: ignore
+    DisabledAccountPool,
+    DisabledAccountPoolError,
+    is_access_denied_error,
 )
 from email_receive_test import (  # type: ignore
     ReceiveTestCancelled,
@@ -243,6 +249,12 @@ def current_credential_layout(cfg: Optional[dict] = None) -> CredentialLayout:
     return ensure_layout(CredentialLayout.from_config(BASE_DIR, data))
 
 
+def current_disabled_account_pool(
+    cfg: Optional[dict] = None,
+) -> DisabledAccountPool:
+    return DisabledAccountPool(current_credential_layout(cfg).disabled_dir)
+
+
 def current_cpa_paths(cfg: Optional[dict] = None) -> CpaPaths:
     override_value = str(os.environ.get(CPA_DIR_ENV) or "").strip()
     if override_value:
@@ -293,6 +305,12 @@ def _credential_material_files(directory: Path) -> List[Path]:
 def credential_storage_stats(layout: CredentialLayout) -> dict:
     sso_files = _files_under(layout.sso_dir)
     mail_files = _files_under(layout.mail_dir)
+    disabled_files = [
+        path
+        for path in _files_under(layout.disabled_dir)
+        if path.name != ".accounts.json.lock"
+        and not path.name.endswith(".tmp")
+    ]
     cpa_storage_files = [
         path
         for path in _files_under(layout.cpa_dir)
@@ -305,11 +323,17 @@ def credential_storage_stats(layout: CredentialLayout) -> dict:
         if path.name.lower().startswith("xai-")
         and path.suffix.lower() == ".json"
     ]
-    all_files = [*sso_files, *mail_files, *cpa_storage_files]
+    all_files = [
+        *sso_files,
+        *mail_files,
+        *cpa_storage_files,
+        *disabled_files,
+    ]
     return {
         "sso_files": len(sso_files),
         "mail_files": len(mail_files),
         "cpa_files": len(cpa_files),
+        "disabled_files": len(disabled_files),
         "total_files": len(all_files),
         "total_bytes": sum(path.stat().st_size for path in all_files),
     }
@@ -351,6 +375,7 @@ def credentials_config_public(cfg: Optional[dict] = None) -> dict:
         "sso_dir": str(layout.sso_dir),
         "mail_dir": str(layout.mail_dir),
         "cpa_dir": str(current_cpa_paths(data).directory),
+        "disabled_dir": str(layout.disabled_dir),
         "cpa_env_override": str(os.environ.get(CPA_DIR_ENV) or "").strip(),
         "writable": os.access(layout.root, os.W_OK),
         "stats": stats,
@@ -657,6 +682,20 @@ _cpa_state: Dict = {
     "active": False,
     "last_error": "",
     "last_ok_email": "",
+    "run_id": "",
+    "run_kind": "",
+    "run_status": "idle",
+    "run_total": 0,
+    "run_queued": 0,
+    "run_ok": 0,
+    "run_fail": 0,
+    "run_skipped": 0,
+    "run_error_signature": "",
+    "run_error_streak": 0,
+    "run_last_error": "",
+    "run_started_at": "",
+    "run_finished_at": "",
+    "circuit_open": False,
 }
 _cpa_done: Set[str] = set()  # sso fingerprints already converted
 _cpa_inflight: Set[str] = set()
@@ -1104,7 +1143,7 @@ def invalidate_account_catalog() -> None:
     _account_catalog.invalidate()
 
 
-def collect_all_accounts() -> List[Tuple[str, str]]:
+def collect_stored_accounts() -> List[Tuple[str, str]]:
     items = []
     for f in list_account_files():
         for line in read_account_lines(f):
@@ -1140,6 +1179,105 @@ def decode_sso_meta(sso: str) -> dict:
     if not sso or sso.count(".") < 2:
         return {}
     return _b64url_json(sso.split(".")[1])
+
+
+def _disabled_account_candidate(
+    *,
+    email: str = "",
+    password: str = "",
+    sso: str = "",
+    source: str = "",
+    raw: str = "",
+) -> dict:
+    normalized_sso = normalize_sso(sso)
+    meta = decode_sso_meta(normalized_sso)
+    normalized_email = str(email or "").strip().casefold()
+    return {
+        "email": normalized_email,
+        "password": str(password or ""),
+        "sso": normalized_sso,
+        "subject": str(meta.get("sub") or "").strip(),
+        "source": str(source or ""),
+        "raw": (
+            str(raw or "").strip()
+            or (
+                f"{normalized_email}----{str(password or '')}"
+                f"----{normalized_sso}"
+            )
+        ),
+    }
+
+
+def account_is_disabled(
+    *,
+    email: str = "",
+    sso: str = "",
+) -> bool:
+    normalized_sso = normalize_sso(sso)
+    meta = decode_sso_meta(normalized_sso)
+    return current_disabled_account_pool().matches(
+        email=email,
+        subject=meta.get("sub") or "",
+        sso=normalized_sso,
+    )
+
+
+def _account_info_is_disabled(
+    info: dict,
+    identities: Optional[Tuple[Set[str], Set[str], Set[str]]] = None,
+) -> bool:
+    emails, subjects, fingerprints = (
+        identities
+        if identities is not None
+        else current_disabled_account_pool().identity_sets()
+    )
+    email = str(info.get("email") or "").strip().casefold()
+    if email and email in emails:
+        return True
+    sso = normalize_sso(info.get("sso") or "")
+    meta = decode_sso_meta(sso)
+    subject = str(
+        meta.get("sub")
+        or info.get("sub")
+        or info.get("subject")
+        or ""
+    ).strip()
+    if subject and subject in subjects:
+        return True
+    direct_fingerprint = str(
+        info.get("sso_fingerprint") or info.get("fp") or ""
+    ).strip()
+    if direct_fingerprint and direct_fingerprint in fingerprints:
+        return True
+    return bool(sso and sso_fingerprint(sso) in fingerprints)
+
+
+def active_account_lines(
+    path: Path,
+    identities: Optional[Tuple[Set[str], Set[str], Set[str]]] = None,
+) -> List[str]:
+    disabled_identities = (
+        identities
+        if identities is not None
+        else current_disabled_account_pool().identity_sets()
+    )
+    return [
+        line
+        for line in read_account_lines(path)
+        if not _account_info_is_disabled(
+            parse_line(line),
+            disabled_identities,
+        )
+    ]
+
+
+def collect_all_accounts() -> List[Tuple[str, str]]:
+    identities = current_disabled_account_pool().identity_sets()
+    return [
+        (source, line)
+        for source, line in collect_stored_accounts()
+        if not _account_info_is_disabled(parse_line(line), identities)
+    ]
 
 
 def unique_accounts() -> List[dict]:
@@ -1274,11 +1412,17 @@ def list_active_cpa_files() -> List[Path]:
     emails, fingerprints = active_identity_sets()
     if not emails and not fingerprints:
         return []
+    disabled_identities = current_disabled_account_pool().identity_sets()
     active: List[Path] = []
     for path in list_cpa_files():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
+            continue
+        if payload.get("disabled") is True or _account_info_is_disabled(
+            payload,
+            disabled_identities,
+        ):
             continue
         if cpa_matches_active(payload, emails, fingerprints):
             active.append(path)
@@ -1588,6 +1732,20 @@ def _reset_cpa_workspace_state() -> None:
                 "active": False,
                 "last_error": "",
                 "last_ok_email": "",
+                "run_id": "",
+                "run_kind": "",
+                "run_status": "idle",
+                "run_total": 0,
+                "run_queued": 0,
+                "run_ok": 0,
+                "run_fail": 0,
+                "run_skipped": 0,
+                "run_error_signature": "",
+                "run_error_streak": 0,
+                "run_last_error": "",
+                "run_started_at": "",
+                "run_finished_at": "",
+                "circuit_open": False,
             }
         )
 
@@ -1599,8 +1757,135 @@ def cpa_stats() -> dict:
     files = list_active_cpa_files()
     st["files"] = len(files)
     st["done"] = done_n
+    st["historical_ok"] = done_n
     st["dir"] = str(current_cpa_paths().directory)
     return st
+
+
+def _begin_cpa_run(kind: str, total: int) -> str:
+    run_id = uuid.uuid4().hex
+    now = datetime.now().isoformat(timespec="seconds")
+    with _cpa_lock:
+        _cpa_state.update(
+            {
+                "run_id": run_id,
+                "run_kind": str(kind or ""),
+                "run_status": "preflight",
+                "run_total": max(0, int(total or 0)),
+                "run_queued": 0,
+                "run_ok": 0,
+                "run_fail": 0,
+                "run_skipped": 0,
+                "run_error_signature": "",
+                "run_error_streak": 0,
+                "run_last_error": "",
+                "run_started_at": now,
+                "run_finished_at": "",
+                "circuit_open": False,
+            }
+        )
+    return run_id
+
+
+def _finish_cpa_run_if_complete_locked() -> None:
+    total = max(0, int(_cpa_state.get("run_total") or 0))
+    completed = sum(
+        max(0, int(_cpa_state.get(key) or 0))
+        for key in ("run_ok", "run_fail", "run_skipped")
+    )
+    if not total or completed < total:
+        return
+    status = str(_cpa_state.get("run_status") or "")
+    if status not in ("preflight_failed", "paused"):
+        _cpa_state["run_status"] = (
+            "completed_with_failures"
+            if int(_cpa_state.get("run_fail") or 0) > 0
+            else "completed"
+        )
+    if not _cpa_state.get("run_finished_at"):
+        _cpa_state["run_finished_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+
+
+def _systemic_cpa_error_signature(error: Exception) -> str:
+    text = str(error or "").casefold()
+    if "submitoauth2consent" in text:
+        return "consent_protocol_changed"
+    if "consent 响应缺少 code" in text:
+        return "consent_missing_code"
+    if "cloudflare" in text:
+        return "cloudflare_blocked"
+    match = re.search(r"token http (401|403)", text)
+    if match:
+        return f"token_http_{match.group(1)}"
+    return ""
+
+
+def _drain_cpa_batch(batch_id: str) -> int:
+    if not batch_id:
+        return 0
+    drained: List[dict] = []
+    preserved: List[Optional[dict]] = []
+    while True:
+        try:
+            queued_item = _cpa_q.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            if (
+                queued_item is not None
+                and queued_item.get("batch_id") == batch_id
+            ):
+                drained.append(queued_item)
+            else:
+                preserved.append(queued_item)
+        finally:
+            _cpa_q.task_done()
+    for queued_item in preserved:
+        _cpa_q.put(queued_item)
+
+    if not drained:
+        return 0
+    with _cpa_lock:
+        for item in drained:
+            fp = item.get("fp") or sso_fingerprint(item.get("sso") or "")
+            _cpa_inflight.discard(fp)
+        _cpa_state["pending"] = max(
+            0,
+            int(_cpa_state.get("pending") or 0) - len(drained),
+        )
+        if _cpa_state.get("run_id") == batch_id:
+            _cpa_state["run_skipped"] = (
+                int(_cpa_state.get("run_skipped") or 0) + len(drained)
+            )
+            _finish_cpa_run_if_complete_locked()
+        _refresh_cpa_running_locked()
+    return len(drained)
+
+
+def _trip_cpa_batch_circuit(
+    batch_id: str,
+    signature: str,
+    error: str,
+) -> int:
+    with _cpa_lock:
+        if (
+            not batch_id
+            or _cpa_state.get("run_id") != batch_id
+            or bool(_cpa_state.get("circuit_open"))
+        ):
+            return 0
+        _cpa_state["circuit_open"] = True
+        _cpa_state["run_status"] = "paused"
+        _cpa_state["run_error_signature"] = signature
+        _cpa_state["run_last_error"] = error
+    drained = _drain_cpa_batch(batch_id)
+    log_line(
+        "[CPA] 批次熔断暂停: "
+        f"signature={signature} · 已跳过待执行账号={drained}"
+    )
+    return drained
 
 
 def enqueue_cpa_convert(
@@ -1609,6 +1894,7 @@ def enqueue_cpa_convert(
     password: str = "",
     source: str = "",
     force: bool = False,
+    batch_id: str = "",
 ) -> Tuple[bool, str]:
     """Queue one SSO for real OAuth CPA conversion. Returns (queued, reason)."""
     if not AUTO_CPA and not force:
@@ -1618,6 +1904,11 @@ def enqueue_cpa_convert(
     sso = normalize_sso(sso)
     if not sso:
         return False, "empty sso"
+    try:
+        if account_is_disabled(email=email, sso=sso):
+            return False, "account disabled"
+    except DisabledAccountPoolError as exc:
+        return False, f"disabled account pool unavailable: {exc}"
     fp = sso_fingerprint(sso)
     with _credential_import_lock:
         try:
@@ -1647,6 +1938,7 @@ def enqueue_cpa_convert(
                         "source": source or "",
                         "fp": fp,
                         "force": force,
+                        "batch_id": str(batch_id or ""),
                         "workspace_generation": generation,
                         "workspace_directory": workspace_directory,
                         "workspace_epoch": workspace_epoch,
@@ -1738,22 +2030,136 @@ def _reauthorization_candidates(
     return selected, duplicates_skipped
 
 
-def enqueue_all_sso_refresh(limit: int = 10000) -> int:
+def _select_reauthorization_preflight_candidate(
+    candidates: List[dict],
+) -> Tuple[int, dict]:
+    if not candidates:
+        raise ValueError("没有可用于 OAuth 预检的账号")
+    # Account files are catalogued newest first. An established older account
+    # is a better protocol canary than a just-created account that xAI may
+    # reject individually even when the OAuth implementation is correct.
+    index = len(candidates) - 1
+    return index, candidates[index]
+
+
+def enqueue_reauthorization_candidates(
+    candidates: List[dict],
+    batch_id: str,
+) -> int:
+    """Queue already-deduplicated candidates after a successful preflight."""
+    n = 0
+    for acc in candidates:
+        enqueue_kwargs = {
+            "email": acc.get("email") or "",
+            "sso": acc.get("sso") or "",
+            "password": acc.get("password") or "",
+            "source": acc.get("source") or "",
+            "force": True,
+        }
+        if batch_id:
+            enqueue_kwargs["batch_id"] = batch_id
+        ok, _ = enqueue_cpa_convert(
+            **enqueue_kwargs,
+        )
+        if ok:
+            n += 1
+    return n
+
+
+def enqueue_all_sso_refresh(
+    limit: int = 10000,
+    *,
+    batch_id: str = "",
+) -> int:
     """Queue a fresh CPA exchange for each available Web SSO credential."""
     with _credential_import_lock:
-        n = 0
         candidates, _duplicates_skipped = _reauthorization_candidates(limit)
-        for acc in candidates:
-            ok, _ = enqueue_cpa_convert(
-                email=acc.get("email") or "",
-                sso=acc.get("sso") or "",
-                password=acc.get("password") or "",
-                source=acc.get("source") or "",
-                force=True,
+        return enqueue_reauthorization_candidates(candidates, batch_id)
+
+
+def _run_cpa_reauthorization_preflight(
+    candidate: dict,
+    batch_id: str,
+) -> Tuple[bool, str]:
+    """Convert and atomically commit one account before releasing a batch."""
+    sso = normalize_sso(candidate.get("sso") or "")
+    email = candidate.get("email") or ""
+    if not sso:
+        return False, "预检账号缺少 Web SSO"
+    fp = sso_fingerprint(sso)
+    item = {
+        "email": email,
+        "sso": sso,
+        "password": candidate.get("password") or "",
+        "source": candidate.get("source") or "",
+        "fp": fp,
+        "force": True,
+        "batch_id": batch_id,
+        "workspace_generation": _cpa_workspace_generation,
+    }
+    workspace_lease: Optional[_CPAWorkspaceLease] = None
+    try:
+        workspace_lease = _acquire_current_cpa_workspace_lease()
+        item["workspace_directory"] = str(workspace_lease.directory)
+        item["workspace_epoch"] = workspace_lease.epoch()
+        with _cpa_lock:
+            if fp in _cpa_inflight:
+                return False, "预检账号已在 OAuth 队列中"
+            _cpa_inflight.add(fp)
+            _cpa_state["active_workers"] = (
+                int(_cpa_state.get("active_workers") or 0) + 1
             )
-            if ok:
-                n += 1
-    return n
+            _refresh_cpa_running_locked()
+
+        try:
+            entry, error, attempts = _convert_cpa_with_retry(sso, email)
+        except Exception as exc:
+            entry, error, attempts = None, exc, 1
+        with _cpa_lock:
+            _cpa_state["active_workers"] = max(
+                0, int(_cpa_state.get("active_workers") or 0) - 1
+            )
+            _cpa_state["commit_active"] = (
+                int(_cpa_state.get("commit_active") or 0) + 1
+            )
+            _refresh_cpa_running_locked()
+        try:
+            result = _commit_cpa_result(
+                {
+                    "item": item,
+                    "entry": entry,
+                    "error": error,
+                    "workspace_generation": item["workspace_generation"],
+                    "worker_id": 0,
+                    "attempts": attempts,
+                    "_workspace_lease": workspace_lease,
+                    "_workspace_lock_failed": False,
+                }
+            )
+            workspace_lease = None
+            return result
+        finally:
+            with _cpa_lock:
+                _cpa_state["commit_active"] = max(
+                    0, int(_cpa_state.get("commit_active") or 0) - 1
+                )
+                _refresh_cpa_running_locked()
+    except Exception as exc:
+        with _cpa_lock:
+            _cpa_state["active_workers"] = max(
+                0, int(_cpa_state.get("active_workers") or 0) - 1
+            )
+            _refresh_cpa_running_locked()
+        _record_cpa_failure(
+            item,
+            fp,
+            exc,
+            persist=False,
+        )
+        return False, str(exc)
+    finally:
+        if workspace_lease is not None:
+            workspace_lease.release()
 
 
 def _cpa_oauth_worker_loop(worker_id: int) -> None:
@@ -1774,21 +2180,52 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
             item_generation = int(item.get("workspace_generation") or 0)
         except (TypeError, ValueError):
             item_generation = 0
+        disabled_account = False
+        disabled_check_error = ""
+        try:
+            disabled_account = account_is_disabled(email=email, sso=sso)
+        except Exception as exc:
+            disabled_account = True
+            disabled_check_error = sanitize_log_message(exc)
 
         with _cpa_lock:
             _cpa_state["pending"] = max(
                 0, int(_cpa_state.get("pending") or 0) - 1
             )
             stale_workspace = item_generation != _cpa_workspace_generation
-            if stale_workspace:
+            batch_id = str(item.get("batch_id") or "")
+            circuit_cancelled = bool(
+                batch_id
+                and _cpa_state.get("run_id") == batch_id
+                and _cpa_state.get("circuit_open")
+            )
+            if stale_workspace or circuit_cancelled or disabled_account:
                 _cpa_inflight.discard(fp)
+                if circuit_cancelled or disabled_account:
+                    _cpa_state["run_skipped"] = (
+                        int(_cpa_state.get("run_skipped") or 0) + 1
+                    )
+                    _finish_cpa_run_if_complete_locked()
             else:
                 _cpa_state["active_workers"] = (
                     int(_cpa_state.get("active_workers") or 0) + 1
                 )
             _refresh_cpa_running_locked()
 
-        if stale_workspace:
+        if stale_workspace or circuit_cancelled or disabled_account:
+            if circuit_cancelled:
+                log_line(
+                    f"[CPA] SKIP paused batch {email or fp[:12]}"
+                )
+            elif disabled_account:
+                suffix = (
+                    f" · {disabled_check_error}"
+                    if disabled_check_error
+                    else ""
+                )
+                log_line(
+                    f"[CPA] SKIP disabled {email or fp[:12]}{suffix}"
+                )
             _cpa_q.task_done()
             continue
 
@@ -1861,6 +2298,90 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
         _cpa_q.task_done()
 
 
+def _cpa_matches_disabled_record(payload: dict, record: dict) -> bool:
+    if not isinstance(payload, dict) or not isinstance(record, dict):
+        return False
+    record_emails = {
+        str(value or "").strip().casefold()
+        for value in list(record.get("emails") or [])
+        if str(value or "").strip()
+    }
+    record_email = str(record.get("email") or "").strip().casefold()
+    if record_email:
+        record_emails.add(record_email)
+    record_subjects = {
+        str(value or "").strip()
+        for value in list(record.get("subjects") or [])
+        if str(value or "").strip()
+    }
+    record_subject = str(record.get("subject") or "").strip()
+    if record_subject:
+        record_subjects.add(record_subject)
+    record_fingerprints = {
+        str(value or "").strip()
+        for value in list(record.get("sso_fingerprints") or [])
+        if str(value or "").strip()
+    }
+    record_fingerprint = str(
+        record.get("sso_fingerprint") or ""
+    ).strip()
+    if record_fingerprint:
+        record_fingerprints.add(record_fingerprint)
+
+    email = str(payload.get("email") or "").strip().casefold()
+    if email and email in record_emails:
+        return True
+    subject = str(payload.get("sub") or payload.get("subject") or "").strip()
+    if subject and subject in record_subjects:
+        return True
+    sso = normalize_sso(payload.get("sso") or "")
+    return bool(sso and sso_fingerprint(sso) in record_fingerprints)
+
+
+def _mark_disabled_cpa_files(record: dict) -> int:
+    marked = 0
+    disabled_at = str(
+        record.get("disabled_at")
+        or datetime.now().astimezone().isoformat(timespec="seconds")
+    )
+    for path in list_cpa_files():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not _cpa_matches_disabled_record(payload, record):
+                continue
+            updated = dict(payload)
+            updated["disabled"] = True
+            updated["_disabled_reason"] = "access_denied"
+            updated["_disabled_at"] = disabled_at
+            _write_json_atomic(path, updated)
+            marked += 1
+        except Exception as exc:
+            log_line(
+                "[CPA] 禁用旧凭据失败 "
+                f"{path.name}: {sanitize_log_message(exc)}"
+            )
+    return marked
+
+
+def _quarantine_access_denied_account(item: dict, error: Exception | str) -> dict:
+    candidate = _disabled_account_candidate(
+        email=item.get("email") or "",
+        password=item.get("password") or "",
+        sso=item.get("sso") or "",
+        source=item.get("source") or "",
+        raw=item.get("raw") or "",
+    )
+    record = current_disabled_account_pool().disable(candidate, error)
+    marked = _mark_disabled_cpa_files(record)
+    invalidate_account_catalog()
+    log_line(
+        "[CPA] DISABLED access_denied "
+        f"{record.get('email') or str(record.get('id') or '')[:12]}"
+        f" · CPA={marked}"
+    )
+    return record
+
+
 def _record_cpa_failure(
     item: dict,
     fp: str,
@@ -1871,10 +2392,40 @@ def _record_cpa_failure(
 ) -> None:
     email = item.get("email") or ""
     err = str(error)
+    account_denied = is_access_denied_error(error)
+    batch_id = str(item.get("batch_id") or "")
+    trip_signature = ""
     with _cpa_lock:
         _cpa_inflight.discard(fp)
+        if account_denied:
+            _cpa_done.discard(fp)
         _cpa_state["fail"] = int(_cpa_state.get("fail") or 0) + 1
         _cpa_state["last_error"] = err
+        if batch_id and _cpa_state.get("run_id") == batch_id:
+            _cpa_state["run_fail"] = (
+                int(_cpa_state.get("run_fail") or 0) + 1
+            )
+            _cpa_state["run_last_error"] = err
+            signature = _systemic_cpa_error_signature(error)
+            previous = str(_cpa_state.get("run_error_signature") or "")
+            if signature and signature == previous:
+                _cpa_state["run_error_streak"] = (
+                    int(_cpa_state.get("run_error_streak") or 0) + 1
+                )
+            elif signature:
+                _cpa_state["run_error_signature"] = signature
+                _cpa_state["run_error_streak"] = 1
+            else:
+                _cpa_state["run_error_signature"] = ""
+                _cpa_state["run_error_streak"] = 0
+            if (
+                signature
+                and int(_cpa_state.get("run_error_streak") or 0)
+                >= CPA_CIRCUIT_THRESHOLD
+                and not bool(_cpa_state.get("circuit_open"))
+            ):
+                trip_signature = signature
+            _finish_cpa_run_if_complete_locked()
     if persist:
         try:
             paths = cpa_paths or current_cpa_paths()
@@ -1894,6 +2445,16 @@ def _record_cpa_failure(
         except Exception:
             pass
     log_line(f"[CPA] FAIL {email or fp[:12]}: {err}")
+    if account_denied:
+        try:
+            _quarantine_access_denied_account(item, error)
+        except Exception as exc:
+            log_line(
+                "[CPA] 禁用账号池写入失败: "
+                f"{sanitize_log_message(exc)}"
+            )
+    if trip_signature:
+        _trip_cpa_batch_circuit(batch_id, trip_signature, err)
 
 
 def _authorization_recency(candidate: dict) -> Tuple[int, str]:
@@ -1976,7 +2537,7 @@ def _remember_authorization(
             _cpa_authorization_index[identity] = dict(entry)
 
 
-def _commit_cpa_result(result: dict) -> None:
+def _commit_cpa_result(result: dict) -> Tuple[bool, str]:
     item = result.get("item") or {}
     email = item.get("email") or ""
     sso = item.get("sso") or ""
@@ -1997,7 +2558,7 @@ def _commit_cpa_result(result: dict) -> None:
                 _cpa_inflight.discard(fp)
         if stale_workspace:
             log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
-            return
+            return False, "OAuth 凭据目录已切换"
 
         error = result.get("error")
         if error is not None:
@@ -2015,7 +2576,7 @@ def _commit_cpa_result(result: dict) -> None:
                     and not bool(result.get("_workspace_lock_failed"))
                 ),
             )
-            return
+            return False, str(error)
 
         if workspace_lease is None:
             workspace_lease = _acquire_current_cpa_workspace_lease()
@@ -2033,7 +2594,7 @@ def _commit_cpa_result(result: dict) -> None:
                 _cpa_inflight.discard(fp)
         if stale_workspace:
             log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
-            return
+            return False, "OAuth 凭据目录已切换"
 
         raw_entry = result.get("entry")
         if not isinstance(raw_entry, dict) or not raw_entry.get(
@@ -2041,6 +2602,9 @@ def _commit_cpa_result(result: dict) -> None:
         ):
             raise RuntimeError("OAuth 转换返回无效结果")
         entry = dict(raw_entry)
+        entry["disabled"] = False
+        entry.pop("_disabled_reason", None)
+        entry.pop("_disabled_at", None)
         if item.get("password") and not entry.get("password"):
             entry["password"] = item["password"]
         entry["_source"] = "grok-register-auto-cpa"
@@ -2096,7 +2660,16 @@ def _commit_cpa_result(result: dict) -> None:
             _cpa_state["ok"] = int(_cpa_state.get("ok") or 0) + 1
             _cpa_state["last_ok_email"] = email_out
             _cpa_state["last_error"] = ""
+            batch_id = str(item.get("batch_id") or "")
+            if batch_id and _cpa_state.get("run_id") == batch_id:
+                _cpa_state["run_ok"] = (
+                    int(_cpa_state.get("run_ok") or 0) + 1
+                )
+                _cpa_state["run_error_signature"] = ""
+                _cpa_state["run_error_streak"] = 0
+                _finish_cpa_run_if_complete_locked()
         log_line(f"[CPA] OK {email_out} -> {fname}")
+        return True, ""
     except Exception as exc:
         _record_cpa_failure(
             item,
@@ -2105,6 +2678,7 @@ def _commit_cpa_result(result: dict) -> None:
             cpa_paths=cpa_paths,
             persist=workspace_lease is not None,
         )
+        return False, str(exc)
     finally:
         if workspace_lease is not None:
             workspace_lease.release()
@@ -5547,7 +6121,7 @@ async function refreshAllSso(){
   const button=document.getElementById('btn_cpa_refresh_all');
   if(button) button.disabled=true;
   try{
-    const j=await api('/api/cpa/reauthorize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:10000})});
+    const j=await api('/api/cpa/refresh-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:10000})});
     toast(j.message||('已入队 '+(j.queued||0)+' 个账号'));
   }catch(e){toast('重新生成账号授权失败: '+e.message)}
   finally{await poll()}
@@ -5637,15 +6211,22 @@ async function poll(){
       document.getElementById('st_cpa_ok').textContent=String(cpa.files||0);
     }
     if(document.getElementById('st_cpa_q')){
+      const runSummary = cpa.run_id
+        ? `${cpa.run_ok||0}成 / ${cpa.run_fail||0}败 / ${cpa.run_skipped||0}跳`
+        : `${cpa.ok||0}成 / ${cpa.fail||0}败`;
       document.getElementById('st_cpa_q').textContent=
-        `${cpa.pending||0}待 / ${cpa.ok||0}成 / ${cpa.fail||0}败`;
+        `${cpa.pending||0}待 / ${runSummary}`;
     }
     if(document.getElementById('cpa_hint')){
       const core = cpa.core_ok ? 'core就绪' : ('core失败: '+(cpa.core_error||''));
       const last = cpa.last_ok_email ? (' · 最近OK: '+cpa.last_ok_email) : '';
       const err = cpa.last_error ? (' · 最近错: '+cpa.last_error) : '';
+      const run = cpa.run_id
+        ? ` · 本轮 ${cpa.run_status||'idle'} (${cpa.run_ok||0}/${cpa.run_fail||0}/${cpa.run_skipped||0})`
+        : '';
+      const circuit = cpa.circuit_open ? ' · 已熔断暂停' : '';
       document.getElementById('cpa_hint').textContent =
-        `代理走本机 Clash · 自动CPA: ${cpa.enabled?'开':'关'} · ${core} · 文件 ${cpa.files||0}${last}${err}`;
+        `代理走本机 Clash · 自动CPA: ${cpa.enabled?'开':'关'} · ${core} · 文件 ${cpa.files||0}${run}${circuit}${last}${err}`;
     }
     const box=document.getElementById('logbox');
     const logs=j.logs||[];
@@ -5741,7 +6322,7 @@ def index():
     files_meta = []
     total = 0
     for p in list_account_files():
-        lines = read_account_lines(p)
+        lines = active_account_lines(p)
         total += len(lines)
         files_meta.append(
             {
@@ -5790,10 +6371,11 @@ def preview_file(name: str):
     path = safe_name(name)
     if not path:
         return "文件不存在", 404
+    lines = active_account_lines(path)
     return render_template_string(
         PREVIEW_HTML,
         name=path.name,
-        content=path.read_text(encoding="utf-8", errors="replace"),
+        content="\n".join(lines) + ("\n" if lines else ""),
     )
 
 
@@ -5805,11 +6387,14 @@ def download_file(name: str):
     path = safe_name(name)
     if not path:
         return "文件不存在", 404
-    return send_file(
-        path,
-        as_attachment=True,
-        download_name=path.name,
+    lines = active_account_lines(path)
+    body = "\n".join(lines) + ("\n" if lines else "")
+    return Response(
+        body,
         mimetype="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{path.name}"'
+        },
     )
 
 
@@ -5855,7 +6440,11 @@ def download_zip():
         if not files:
             zf.writestr("README.txt", "暂无 accounts_*.txt\n")
         for p in files:
-            zf.write(p, arcname=p.name)
+            lines = active_account_lines(p)
+            zf.writestr(
+                p.name,
+                "\n".join(lines) + ("\n" if lines else ""),
+            )
         seen = set()
         merged = []
         for _, line in collect_all_accounts():
@@ -5887,6 +6476,36 @@ def download_accounts_json():
         mimetype="application/json; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+def _active_cpa_failure_lines(path: Path) -> List[str]:
+    identities = current_disabled_account_pool().identity_sets()
+    active: List[str] = []
+    try:
+        lines = path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        normalized = line.strip()
+        if not normalized:
+            continue
+        try:
+            payload = json.loads(normalized)
+        except json.JSONDecodeError:
+            # A malformed failure record could contain credentials. Do not
+            # copy it into a public export when it cannot be classified.
+            continue
+        if isinstance(payload, dict) and not _account_info_is_disabled(
+            payload,
+            identities,
+        ):
+            active.append(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            )
+    return active
 
 
 @app.get("/download/cpa.zip")
@@ -5946,7 +6565,12 @@ def download_cpa_zip():
         failed_path = current_cpa_paths().failed_path
         if failed_path.exists():
             try:
-                zf.write(failed_path, arcname="failed.jsonl")
+                failure_lines = _active_cpa_failure_lines(failed_path)
+                if failure_lines:
+                    zf.writestr(
+                        "failed.jsonl",
+                        "\n".join(failure_lines) + "\n",
+                    )
             except Exception:
                 pass
     buf.seek(0)
@@ -6420,6 +7044,11 @@ def api_v2_accounts():
         page_size = int(request.args.get("page_size", "25"))
         with _cpa_lock:
             completed = set(_cpa_done)
+        (
+            disabled_emails,
+            _disabled_subjects,
+            disabled_fingerprints,
+        ) = current_disabled_account_pool().identity_sets()
         payload = _account_catalog.query(
             list_account_files(),
             completed,
@@ -6429,10 +7058,12 @@ def api_v2_accounts():
             source=request.args.get("source", "all"),
             status=request.args.get("status", "all"),
             sort=request.args.get("sort", "newest"),
+            disabled_emails=disabled_emails,
+            disabled_fingerprints=disabled_fingerprints,
         )
     except (AccountQueryError, TypeError, ValueError) as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    except OSError as exc:
+    except (OSError, DisabledAccountPoolError) as exc:
         return (
             jsonify(
                 {
@@ -6443,6 +7074,164 @@ def api_v2_accounts():
             500,
         )
     return jsonify({"ok": True, **payload})
+
+
+@app.get("/api/disabled-accounts")
+def api_disabled_accounts():
+    need = require_login()
+    if need:
+        return need
+    try:
+        page = int(request.args.get("page", "1"))
+        page_size = int(request.args.get("page_size", "25"))
+        if page < 1:
+            raise ValueError("page 必须大于或等于 1")
+        if page_size not in (25, 50, 100):
+            raise ValueError("page_size 必须是 25、50 或 100")
+        query = str(request.args.get("q") or "").strip().casefold()
+        if len(query) > 200:
+            raise ValueError("q 不能超过 200 个字符")
+        records = current_disabled_account_pool().list_public()
+        if query:
+            records = [
+                record
+                for record in records
+                if query
+                in " ".join(
+                    (
+                        str(record.get("email") or ""),
+                        str(record.get("source") or ""),
+                        str(record.get("reason") or ""),
+                    )
+                ).casefold()
+            ]
+        total = len(records)
+        total_pages = (total + page_size - 1) // page_size if total else 0
+        start = (page - 1) * page_size
+        return jsonify(
+            {
+                "ok": True,
+                "items": records[start : start + page_size],
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": total_pages,
+                },
+            }
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except DisabledAccountPoolError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.post("/api/disabled-accounts/<record_id>/restore")
+def api_restore_disabled_account(record_id: str):
+    need = require_login()
+    if need:
+        return need
+    if not request.is_json:
+        return jsonify(
+            {"ok": False, "error": "恢复禁用账号必须使用 JSON POST"}
+        ), 400
+    if not _CPA_CORE_OK:
+        return jsonify(
+            {"ok": False, "error": f"core unavailable: {_CPA_CORE_ERR}"}
+        ), 500
+    if not _credential_import_lock.acquire(blocking=False):
+        return jsonify(
+            {"ok": False, "error": "凭据导入正在进行，请稍后重试"}
+        ), 409
+
+    activity_acquired = False
+    migration_acquired = False
+    restored: Optional[dict] = None
+    committed = False
+    pool = current_disabled_account_pool()
+    try:
+        if not _activity_lock.acquire(blocking=False):
+            return jsonify(
+                {"ok": False, "error": "注册活动正在切换，请稍后重试"}
+            ), 409
+        activity_acquired = True
+        if registration_is_running():
+            return jsonify(
+                {"ok": False, "error": "注册任务运行中，不能恢复账号"}
+            ), 409
+        if not _credential_migration_lock.acquire(blocking=False):
+            return jsonify(
+                {"ok": False, "error": "凭据迁移正在进行，请稍后重试"}
+            ), 409
+        migration_acquired = True
+
+        try:
+            restored = pool.restore(record_id)
+        except KeyError:
+            return jsonify(
+                {"ok": False, "error": "禁用账号不存在或已恢复"}
+            ), 404
+
+        account = parse_line(str(restored.get("raw") or ""))
+        sso = normalize_sso(account.get("sso") or "")
+        email = str(
+            account.get("email") or restored.get("email") or ""
+        ).strip()
+        if not email or not sso:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "禁用账号缺少可用于重新授权的原始 SSO",
+                }
+            ), 422
+        fingerprint = sso_fingerprint(sso)
+        with _cpa_lock:
+            _cpa_done.discard(fingerprint)
+        queued, reason = enqueue_cpa_convert(
+            email=email,
+            password=account.get("password") or "",
+            sso=sso,
+            source=restored.get("source") or "disabled-account-restore",
+            force=True,
+        )
+        if not queued:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": (
+                        "账号恢复后无法加入重新授权队列: "
+                        f"{sanitize_log_message(reason)}"
+                    ),
+                }
+            ), 409
+
+        committed = True
+        invalidate_account_catalog()
+        log_line(f"[CPA] RESTORE queued {email}")
+        return jsonify(
+            {
+                "ok": True,
+                "email": email,
+                "queued": True,
+                "message": "账号已恢复并加入重新授权队列",
+            }
+        )
+    except DisabledAccountPoolError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        if restored is not None and not committed:
+            try:
+                pool.put(restored)
+            except Exception as exc:
+                log_line(
+                    "[CPA] 恢复失败后的禁用状态回滚失败: "
+                    f"{sanitize_log_message(exc)}"
+                )
+        if migration_acquired:
+            _credential_migration_lock.release()
+        if activity_acquired:
+            _activity_lock.release()
+        _credential_import_lock.release()
 
 
 @app.get("/api/nodes")
@@ -7265,6 +8054,14 @@ def api_cpa_refresh_all():
             workspace_lease = _acquire_current_cpa_workspace_lease()
         except OAuthOwnershipConflict as exc:
             return jsonify({"ok": False, "error": str(exc)}), 409
+        with _cpa_lock:
+            if _cpa_pipeline_busy_locked():
+                return jsonify(
+                    {
+                        "ok": False,
+                        "error": "CPA OAuth 队列仍在运行，请等待完成后重试",
+                    }
+                ), 409
         candidates, duplicates_skipped = _reauthorization_candidates(limit)
         if not candidates:
             return jsonify(
@@ -7275,11 +8072,165 @@ def api_cpa_refresh_all():
             ), 400
 
         total = len(candidates)
-        queued = enqueue_all_sso_refresh(limit=limit)
-        skipped = max(0, total - queued)
+        batch_id = _begin_cpa_run("reauthorize", total)
+        remaining_candidates = list(candidates)
+        disabled_count = 0
+        preflight_ok = False
+        preflight_error = ""
+        while remaining_candidates:
+            preflight_index, preflight_candidate = (
+                _select_reauthorization_preflight_candidate(
+                    remaining_candidates
+                )
+            )
+            with _cpa_lock:
+                fail_before = int(_cpa_state.get("run_fail") or 0)
+                ok_before = int(_cpa_state.get("run_ok") or 0)
+            preflight_ok, preflight_error = (
+                _run_cpa_reauthorization_preflight(
+                    preflight_candidate,
+                    batch_id,
+                )
+            )
+            if preflight_ok:
+                with _cpa_lock:
+                    if (
+                        _cpa_state.get("run_id") == batch_id
+                        and int(_cpa_state.get("run_ok") or 0)
+                        <= ok_before
+                    ):
+                        # Test doubles and alternate converters still obey
+                        # the preflight contract even when they do not commit.
+                        _cpa_state["run_ok"] = ok_before + 1
+                remaining_candidates.pop(preflight_index)
+                break
+
+            if is_access_denied_error(preflight_error):
+                try:
+                    if not account_is_disabled(
+                        email=preflight_candidate.get("email") or "",
+                        sso=preflight_candidate.get("sso") or "",
+                    ):
+                        _quarantine_access_denied_account(
+                            preflight_candidate,
+                            RuntimeError(preflight_error),
+                        )
+                except Exception as exc:
+                    preflight_error = (
+                        "Access denied 账号写入禁用池失败: "
+                        f"{sanitize_log_message(exc)}"
+                    )
+                    break
+                disabled_count += 1
+                with _cpa_lock:
+                    if (
+                        _cpa_state.get("run_id") == batch_id
+                        and int(_cpa_state.get("run_fail") or 0)
+                        <= fail_before
+                    ):
+                        _cpa_state["run_fail"] = fail_before + 1
+                remaining_candidates.pop(preflight_index)
+                log_line(
+                    "[CPA] 预检账号 Access denied，已禁用并继续: "
+                    f"{preflight_candidate.get('email') or 'unknown'}"
+                )
+                continue
+            break
+
+        if not preflight_ok and remaining_candidates:
+            safe_error = sanitize_log_message(
+                preflight_error or "未知 OAuth 预检错误"
+            )
+            with _cpa_lock:
+                if _cpa_state.get("run_id") == batch_id:
+                    if int(_cpa_state.get("run_fail") or 0) == 0:
+                        _cpa_state["run_fail"] = 1
+                    completed = (
+                        int(_cpa_state.get("run_ok") or 0)
+                        + int(_cpa_state.get("run_fail") or 0)
+                        + int(_cpa_state.get("run_skipped") or 0)
+                    )
+                    _cpa_state["run_skipped"] = (
+                        int(_cpa_state.get("run_skipped") or 0)
+                        + max(0, total - completed)
+                    )
+                    _cpa_state["run_status"] = "preflight_failed"
+                    _cpa_state["run_last_error"] = safe_error
+                    _cpa_state["run_finished_at"] = datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+                    _finish_cpa_run_if_complete_locked()
+            log_line(
+                "[CPA] 重新生成账号授权预检失败，批量任务未启动: "
+                f"{safe_error}"
+            )
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": f"单账号预检失败，未启动批量任务: {safe_error}",
+                        "total": total,
+                        "queued": 0,
+                        "skipped": max(0, total - 1),
+                        "disabled": disabled_count,
+                        "duplicates_skipped": duplicates_skipped,
+                        "preflight": {"ok": False, "error": safe_error},
+                        "cpa": cpa_stats(),
+                    }
+                ),
+                422,
+            )
+
+        if not preflight_ok:
+            with _cpa_lock:
+                if _cpa_state.get("run_id") == batch_id:
+                    _cpa_state["run_queued"] = 0
+                    _finish_cpa_run_if_complete_locked()
+            log_line(
+                "[CPA] 所有重新授权候选均为 Access denied，"
+                f"已禁用: {disabled_count}"
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "total": total,
+                    "queued": 0,
+                    "skipped": disabled_count,
+                    "disabled": disabled_count,
+                    "duplicates_skipped": duplicates_skipped,
+                    "preflight": {
+                        "ok": False,
+                        "error": "所有候选账号均已被禁用",
+                    },
+                    "message": (
+                        f"已禁用 {disabled_count} 个 Access denied 账号；"
+                        "没有可继续授权的账号"
+                    ),
+                    "cpa": cpa_stats(),
+                }
+            )
+
+        bulk_queued = enqueue_reauthorization_candidates(
+            remaining_candidates, batch_id
+        )
+        queued = 1 + bulk_queued
+        queue_skipped = max(
+            0, len(remaining_candidates) - bulk_queued
+        )
+        skipped = disabled_count + queue_skipped
+        with _cpa_lock:
+            if _cpa_state.get("run_id") == batch_id:
+                _cpa_state["run_queued"] = queued
+                _cpa_state["run_skipped"] = (
+                    int(_cpa_state.get("run_skipped") or 0)
+                    + queue_skipped
+                )
+                _cpa_state["run_status"] = "running"
+                _finish_cpa_run_if_complete_locked()
         log_line(
-            "[CPA] 重新生成账号授权入队: "
-            f"{queued} · 队列跳过: {skipped} · 身份去重: {duplicates_skipped}"
+            "[CPA] 重新生成账号授权预检通过并入队: "
+            f"{queued} · 禁用: {disabled_count} · "
+            f"队列跳过: {queue_skipped} · 身份去重: {duplicates_skipped}"
         )
         return jsonify(
             {
@@ -7287,8 +8238,13 @@ def api_cpa_refresh_all():
                 "total": total,
                 "queued": queued,
                 "skipped": skipped,
+                "disabled": disabled_count,
                 "duplicates_skipped": duplicates_skipped,
-                "message": f"已将 {queued} 个账号加入重新生成账号授权队列",
+                "preflight": {"ok": True},
+                "message": (
+                    "重新生成账号授权预检通过；"
+                    f"已处理/入队 {queued} 个账号"
+                ),
                 "cpa": cpa_stats(),
             }
         )

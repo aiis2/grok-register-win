@@ -272,6 +272,29 @@
             <button class="button button--secondary" type="submit" data-busy-group="accounts">确认并导入</button>
           </form>
         </article>
+
+        <article class="surface-card disabled-account-card">
+          <div class="card-heading">
+            <div><span class="eyebrow">Quarantine</span><h2>禁用账号池</h2></div>
+            <span class="card-count"><strong id="disabled-accounts-count">0</strong> 个账号</span>
+          </div>
+          <p class="form-note">OAuth 明确返回 Access denied 的账号不会再进入刷新或任何导出。确认后可手动恢复并重新授权，旧 CPA 在新授权成功前仍保持禁用。</p>
+          <div class="inline-alert inline-alert--error account-alert" id="disabled-accounts-error" role="alert" hidden></div>
+          <div class="table-scroll">
+            <table class="data-table disabled-account-table" id="disabled-accounts-table">
+              <thead><tr><th scope="col">邮箱</th><th scope="col">来源</th><th scope="col">原因</th><th scope="col">禁用时间</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
+              <tbody id="disabled-accounts-body"></tbody>
+            </table>
+          </div>
+          <div class="empty-state table-empty" id="disabled-accounts-empty"><span aria-hidden="true">✓</span><strong>禁用池为空</strong><p>当前没有因 Access denied 被隔离的账号。</p></div>
+          <div class="table-footer">
+            <span id="disabled-accounts-page-label">第 0 / 0 页</span>
+            <div class="pagination" aria-label="禁用账号分页">
+              <button class="button button--ghost" id="disabled-accounts-prev" type="button" disabled data-busy-group="disabled-accounts">上一页</button>
+              <button class="button button--ghost" id="disabled-accounts-next" type="button" disabled data-busy-group="disabled-accounts">下一页</button>
+            </div>
+          </div>
+        </article>
       </div>
     </section>
 

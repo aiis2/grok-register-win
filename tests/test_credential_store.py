@@ -30,6 +30,7 @@ def test_default_directory_resolves_under_app_root(tmp_path):
     assert layout.sso_dir == layout.root / "sso"
     assert layout.mail_dir == layout.root / "mail"
     assert layout.cpa_dir == layout.root / "cpa"
+    assert layout.disabled_dir == layout.root / "disabled"
     assert layout.archive_dir == layout.root / "archive"
 
 
@@ -95,6 +96,7 @@ def test_ensure_layout_creates_all_subdirectories(tmp_path):
     assert layout.sso_dir.is_dir()
     assert layout.mail_dir.is_dir()
     assert layout.cpa_dir.is_dir()
+    assert layout.disabled_dir.is_dir()
     assert layout.archive_dir.is_dir()
 
 
@@ -189,6 +191,21 @@ def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tm
         _write(current.mail_dir / "mail_credentials_current.txt", "current-mail"),
         _write(current.cpa_dir / "xai-current.json", "current-cpa"),
         _write(
+            current.disabled_dir / "accounts.json",
+            json.dumps(
+                {
+                    "version": 1,
+                    "updated_at": "2026-07-24T01:00:00Z",
+                    "accounts": {
+                        "disabled-one": {
+                            "id": "disabled-one",
+                            "email": "disabled@example.com",
+                        }
+                    },
+                }
+            ),
+        ),
+        _write(
             current.cpa_dir / "oauth_ownership.json",
             _ownership_payload(
                 "current-identity",
@@ -208,10 +225,14 @@ def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tm
                 "setting": setting,
                 "sources_exist": all(path.exists() for path in sources),
                 "target_files": sorted(
-                    path.name
-                    for path in target.root.rglob("*")
-                    if path.is_file()
-                    and path.name != ".oauth_ownership.json.lock"
+                        path.name
+                        for path in target.root.rglob("*")
+                        if path.is_file()
+                        and path.name
+                        not in {
+                            ".oauth_ownership.json.lock",
+                            ".accounts.json.lock",
+                        }
                 ),
             }
         )
@@ -224,17 +245,18 @@ def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tm
         conflict_timestamp="20260719_170000",
     )
 
-    assert result.copied == 7
+    assert result.copied == 8
     assert result.skipped == 0
     assert result.renamed == 0
     assert result.warnings == []
     assert switch_observations == [
         {
-            "setting": str(Path("new-vault")),
-            "sources_exist": True,
-            "target_files": [
-                "accounts_current.txt",
-                "accounts_legacy.txt",
+                "setting": str(Path("new-vault")),
+                "sources_exist": True,
+                "target_files": [
+                    "accounts.json",
+                    "accounts_current.txt",
+                    "accounts_legacy.txt",
                 "mail_credentials.txt",
                 "mail_credentials_current.txt",
                 "oauth_ownership.json",
@@ -244,6 +266,68 @@ def test_migration_moves_current_and_legacy_credentials_after_verified_switch(tm
         }
     ]
     assert all(not path.exists() for path in sources)
+    assert json.loads(
+        (target.disabled_dir / "accounts.json").read_text(encoding="utf-8")
+    )["accounts"]["disabled-one"]["email"] == "disabled@example.com"
+
+
+def test_migration_merges_disabled_account_registries_without_reviving_accounts(
+    tmp_path,
+):
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    current = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "old"})
+    )
+    target = ensure_layout(
+        CredentialLayout.from_config(app_root, {"credentials_dir": "new"})
+    )
+    source = _write(
+        current.disabled_dir / "accounts.json",
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-07-24T01:00:00Z",
+                "accounts": {
+                    "source-id": {
+                        "id": "source-id",
+                        "email": "source@example.com",
+                        "disabled_at": "2026-07-24T01:00:00Z",
+                    }
+                },
+            }
+        ),
+    )
+    _write(
+        target.disabled_dir / "accounts.json",
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-07-24T02:00:00Z",
+                "accounts": {
+                    "target-id": {
+                        "id": "target-id",
+                        "email": "target@example.com",
+                        "disabled_at": "2026-07-24T02:00:00Z",
+                    }
+                },
+            }
+        ),
+    )
+
+    result = migrate_credentials(
+        app_root,
+        current,
+        target,
+        switch_config=lambda _setting: None,
+    )
+
+    merged = json.loads(
+        (target.disabled_dir / "accounts.json").read_text(encoding="utf-8")
+    )
+    assert set(merged["accounts"]) == {"source-id", "target-id"}
+    assert result.copied == 1
+    assert not source.exists()
 
 
 def test_migration_merges_all_live_ownership_registries_into_canonical_file(
@@ -577,7 +661,11 @@ def test_verification_failure_rolls_back_new_targets_and_keeps_sources(tmp_path)
     assert second.exists()
     assert not any(
         path.is_file()
-        and path.name != ".oauth_ownership.json.lock"
+        and path.name
+        not in {
+            ".oauth_ownership.json.lock",
+            ".accounts.json.lock",
+        }
         for path in target.root.rglob("*")
     )
 
