@@ -108,8 +108,13 @@ GROK_REFERRER = "grok-build"
 GROK_VERSION = "0.2.93"
 GROK_TOKEN_UA = f"grok-pager/{GROK_VERSION} grok-shell/{GROK_VERSION} (linux; x86_64)"
 BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+_MIN_REQUEST_TIMEOUT_SECONDS = 0.05
+_DEBUG_CONSENT_HTML = str(
+    os.environ.get("SSO2CPA_DEBUG_CONSENT_HTML") or ""
+).strip().casefold() in {"1", "true", "yes", "on"}
 
 _CONSENT_ACTION_ID_CACHE = ""
+_CONSENT_ACTION_ID_CACHE_KEY = ""
 _CONSENT_ACTION_ID_LOCK = threading.Lock()
 _CONSENT_ROUTER_STATE = [
     "",
@@ -190,24 +195,70 @@ def _extract_next_action_id(source: str) -> str:
     return ""
 
 
+def _consent_action_cache_key(
+    consent_html: str,
+    consent_url: str,
+) -> str:
+    script_urls = []
+    for script_source in re.findall(
+        r'<script[^>]+src=["\']([^"\']+)["\']',
+        consent_html or "",
+        flags=re.IGNORECASE,
+    ):
+        script_url = urljoin(consent_url, script_source)
+        if urlparse(script_url).hostname == "accounts.x.ai":
+            script_urls.append(script_url)
+    if not script_urls:
+        return ""
+    material = "\n".join(sorted(set(script_urls)))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 def _discover_consent_action_id(
     session,
     consent_html: str,
     consent_url: str,
     *,
     force: bool = False,
+    deadline: Optional[float] = None,
 ) -> str:
     """Resolve the current deployment's consent Server Action ID."""
-    global _CONSENT_ACTION_ID_CACHE
+    global _CONSENT_ACTION_ID_CACHE, _CONSENT_ACTION_ID_CACHE_KEY
 
-    if not force and _CONSENT_ACTION_ID_CACHE:
-        return _CONSENT_ACTION_ID_CACHE
+    _check_conversion_deadline(deadline, "consent_action")
+    deployment_key = _consent_action_cache_key(
+        consent_html,
+        consent_url,
+    )
+    inline_action_id = _extract_next_action_id(consent_html)
 
-    with _CONSENT_ACTION_ID_LOCK:
-        if not force and _CONSENT_ACTION_ID_CACHE:
+    if deadline is None:
+        acquired = _CONSENT_ACTION_ID_LOCK.acquire()
+    else:
+        acquired = _CONSENT_ACTION_ID_LOCK.acquire(
+            timeout=_conversion_deadline_remaining(
+                deadline,
+                "consent_action_lock",
+            )
+        )
+    if not acquired:
+        raise ConversionDeadlineExceeded("consent_action_lock")
+
+    try:
+        _check_conversion_deadline(deadline, "consent_action_lock")
+        if inline_action_id:
+            _CONSENT_ACTION_ID_CACHE = inline_action_id
+            _CONSENT_ACTION_ID_CACHE_KEY = deployment_key
+            return inline_action_id
+        if (
+            not force
+            and deployment_key
+            and _CONSENT_ACTION_ID_CACHE
+            and _CONSENT_ACTION_ID_CACHE_KEY == deployment_key
+        ):
             return _CONSENT_ACTION_ID_CACHE
 
-        action_id = _extract_next_action_id(consent_html)
+        action_id = ""
         if not action_id:
             script_sources = re.findall(
                 r'<script[^>]+src=["\']([^"\']+)["\']',
@@ -231,10 +282,21 @@ def _discover_consent_action_id(
                             "Referer": consent_url,
                         },
                         allow_redirects=True,
-                        timeout=20,
+                        timeout=_conversion_request_timeout(
+                            deadline,
+                            20,
+                            "consent_script",
+                        ),
                     )
+                except ConversionDeadlineExceeded:
+                    raise
                 except Exception:
+                    _check_conversion_deadline(
+                        deadline,
+                        "consent_script",
+                    )
                     continue
+                _check_conversion_deadline(deadline, "consent_script")
                 if not (200 <= script_response.status_code < 300):
                     continue
                 action_id = _extract_next_action_id(script_response.text or "")
@@ -246,11 +308,16 @@ def _discover_consent_action_id(
                 "consent 页面协议已变化：未找到 submitOAuth2Consent Server Action"
             )
         _CONSENT_ACTION_ID_CACHE = action_id
+        _CONSENT_ACTION_ID_CACHE_KEY = deployment_key
         return action_id
+    finally:
+        _CONSENT_ACTION_ID_LOCK.release()
 
 
 def _debug_dump_consent_html(html: str, final_url: str) -> None:
     """Save consent page HTML for debugging action ID extraction."""
+    if not _DEBUG_CONSENT_HTML:
+        return
     import tempfile
     import os
     try:
@@ -265,6 +332,52 @@ def _debug_dump_consent_html(html: str, final_url: str) -> None:
 
 class ConvertError(Exception):
     pass
+
+
+class ConversionDeadlineExceeded(ConvertError):
+    """The caller-provided monotonic conversion deadline was exhausted."""
+
+    def __init__(self, stage: str) -> None:
+        self.stage = str(stage or "conversion")
+        super().__init__(
+            f"conversion deadline exceeded (stage={self.stage})"
+        )
+
+
+def _conversion_deadline_remaining(
+    deadline: Optional[float],
+    stage: str,
+) -> float:
+    if deadline is None:
+        raise ValueError("deadline is required")
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise ConversionDeadlineExceeded(stage)
+    return remaining
+
+
+def _check_conversion_deadline(
+    deadline: Optional[float],
+    stage: str,
+) -> None:
+    if deadline is not None:
+        _conversion_deadline_remaining(deadline, stage)
+
+
+def _conversion_request_timeout(
+    deadline: Optional[float],
+    stage_cap: float,
+    stage: str,
+) -> float:
+    if deadline is None:
+        return stage_cap
+    remaining = _conversion_deadline_remaining(deadline, stage)
+    if remaining < _MIN_REQUEST_TIMEOUT_SECONDS:
+        raise ConversionDeadlineExceeded(stage)
+    return min(
+        stage_cap,
+        remaining,
+    )
 
 
 def _safe_oauth_text(value: Any, fallback: str = "") -> str:
@@ -595,7 +708,12 @@ def parse_consent_code(body: str, *, status_code: int = 0) -> str:
     return m.group(1) if m else ""
 
 
-def sso_to_token(sso: str, proxy: str = "") -> dict:
+def sso_to_token(
+    sso: str,
+    proxy: str = "",
+    *,
+    deadline: Optional[float] = None,
+) -> dict:
     sso = normalize_sso(sso)
     if not sso:
         raise ConvertError("空 SSO")
@@ -626,10 +744,17 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
             auth_url,
             headers=browser_headers("GET"),
             allow_redirects=True,
-            timeout=30,
+            timeout=_conversion_request_timeout(
+                deadline,
+                30,
+                "authorize",
+            ),
         )
+    except ConversionDeadlineExceeded:
+        raise
     except Exception as e:
         raise ConvertError(f"authorize 请求失败: {e}") from e
+    _check_conversion_deadline(deadline, "authorize")
 
     final_url = str(resp.url)
     body = resp.text or ""
@@ -653,7 +778,12 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
             f"impersonate={_IMPERSONATE or 'n/a'}): {final_url}"
         )
 
-    action_id = _discover_consent_action_id(session, body, final_url)
+    action_id = _discover_consent_action_id(
+        session,
+        body,
+        final_url,
+        deadline=deadline,
+    )
     try:
         prime_response = session.get(
             f"{ACCOUNTS_ORIGIN}/",
@@ -663,10 +793,17 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
                 "Referer": final_url,
             },
             allow_redirects=True,
-            timeout=30,
+            timeout=_conversion_request_timeout(
+                deadline,
+                30,
+                "consent_prime",
+            ),
         )
+    except ConversionDeadlineExceeded:
+        raise
     except Exception as e:
         raise ConvertError(f"consent 会话初始化失败: {e}") from e
+    _check_conversion_deadline(deadline, "consent_prime")
     if not (200 <= prime_response.status_code < 400):
         raise ConvertError(
             f"consent 会话初始化 HTTP {prime_response.status_code}"
@@ -697,10 +834,17 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
                 "Next-Router-State-Tree": CONSENT_ROUTER_STATE_TREE,
             },
             allow_redirects=False,
-            timeout=30,
+            timeout=_conversion_request_timeout(
+                deadline,
+                30,
+                "consent_action",
+            ),
         )
+    except ConversionDeadlineExceeded:
+        raise
     except Exception as e:
         raise ConvertError(f"consent 请求失败: {e}") from e
+    _check_conversion_deadline(deadline, "consent_action")
 
     # Current Next.js actions return an RSC payload. Retain redirect parsing
     # for deployments that answer with a loopback callback instead.
@@ -726,8 +870,8 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
         _debug_dump_consent_html(cres.text[:5000], f"status={cres.status_code} url={redirect_url}")
         raise ConvertError(
             f"consent 响应缺少 code: status={cres.status_code}"
-            f" redirect={redirect_url[:200]}"
-            f" body={cres.text[:200]}"
+            f" redirected={bool(redirect_url)}"
+            f" body_length={len(cres.text or '')}"
         )
 
     try:
@@ -746,19 +890,27 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
                 "X-Grok-Client-Version": GROK_VERSION,
                 "Content-Type": "application/x-www-form-urlencoded",
             },
-            timeout=30,
+            timeout=_conversion_request_timeout(
+                deadline,
+                30,
+                "token_exchange",
+            ),
         )
+    except ConversionDeadlineExceeded:
+        raise
     except Exception as e:
         raise ConvertError(f"token 请求失败: {e}") from e
+    _check_conversion_deadline(deadline, "token_exchange")
 
     try:
         token = tres.json()
     except Exception as e:
-        if tres.status_code < 200 or tres.status_code >= 300:
-            raise ConvertError(
-                f"token HTTP {tres.status_code}: non-JSON response"
-            ) from e
-        raise ConvertError(f"token 非 JSON: {tres.text[:200]}") from e
+        raise ConvertError(
+            "token 响应非 JSON: "
+            f"status={tres.status_code} "
+            f"body_length={len(tres.text or '')} "
+            "transport=non-json"
+        ) from e
 
     token_error = _safe_oauth_text(token.get("error"))
     token_description = _safe_oauth_text(
@@ -777,7 +929,12 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
         raise ConvertError(f"token HTTP {tres.status_code}: {detail}")
 
     if not token.get("access_token"):
-        raise ConvertError(f"token 响应无 access_token: {token}")
+        detail = token_description or token_error or "missing access_token"
+        error_code = token_error or "invalid_token_response"
+        raise ConvertError(
+            "token 响应无 access_token: "
+            f"error={error_code} description={detail}"
+        )
 
     token.setdefault("expires_in", 21600)
     token.setdefault("token_type", "Bearer")
@@ -824,8 +981,14 @@ def token_to_cpa_entry(token: dict, sso: str, email_hint: str = "") -> dict:
     }
 
 
-def convert_one(sso: str, email: str = "", proxy: str = "") -> dict:
-    token = sso_to_token(sso, proxy=proxy)
+def convert_one(
+    sso: str,
+    email: str = "",
+    proxy: str = "",
+    *,
+    deadline: Optional[float] = None,
+) -> dict:
+    token = sso_to_token(sso, proxy=proxy, deadline=deadline)
     return token_to_cpa_entry(token, sso, email_hint=email)
 
 

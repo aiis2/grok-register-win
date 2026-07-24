@@ -8,6 +8,7 @@ import time
 import pytest
 
 from panel import app as panel_app
+from sso2cpa_core import ConversionDeadlineExceeded
 
 
 @pytest.fixture
@@ -313,7 +314,10 @@ def test_transient_oauth_failure_retries_twice_then_succeeds(
     monkeypatch.setattr(panel_app, "convert_one", convert)
     monkeypatch.setattr(panel_app, "_cpa_sleep", sleeps.append, raising=False)
     monkeypatch.setattr(
-        panel_app, "_wait_for_cpa_cooldown", lambda: None, raising=False
+        panel_app,
+        "_wait_for_cpa_cooldown",
+        lambda **_kwargs: None,
+        raising=False,
     )
     monkeypatch.setattr(
         panel_app, "_extend_cpa_cooldown", lambda _seconds: None, raising=False
@@ -351,6 +355,70 @@ def test_permanent_oauth_failure_is_not_retried(
     assert "SSO 无效" in str(error)
     assert attempts == 1
     assert calls == 1
+
+
+def test_conversion_deadline_stops_retry_and_is_forwarded(
+    isolated_pipeline, monkeypatch
+):
+    calls = []
+    sleeps = []
+
+    def convert(sso, email="", proxy="", *, deadline=None):
+        calls.append((sso, email, proxy, deadline))
+        raise ConversionDeadlineExceeded("authorize")
+
+    monkeypatch.setattr(panel_app, "convert_one", convert)
+    monkeypatch.setattr(panel_app, "_cpa_sleep", sleeps.append, raising=False)
+    monkeypatch.setattr(
+        panel_app, "_wait_for_cpa_cooldown", lambda **_kwargs: None
+    )
+
+    entry, error, attempts = panel_app._convert_cpa_with_retry(
+        "synthetic-sso",
+        "deadline@example.invalid",
+        deadline=123.0,
+    )
+
+    assert entry is None
+    assert isinstance(error, ConversionDeadlineExceeded)
+    assert attempts == 1
+    assert calls == [
+        (
+            "synthetic-sso",
+            "deadline@example.invalid",
+            panel_app.PROXY_URL,
+            123.0,
+        )
+    ]
+    assert sleeps == []
+    assert panel_app._systemic_cpa_error_signature(error) == (
+        "oauth_preflight_timeout"
+    )
+
+
+def test_cpa_cooldown_does_not_sleep_past_deadline(
+    isolated_pipeline, monkeypatch
+):
+    class Clock:
+        now = 100.0
+
+        @classmethod
+        def monotonic(cls):
+            return cls.now
+
+        @classmethod
+        def sleep(cls, seconds):
+            cls.now += seconds
+
+    monkeypatch.setattr(panel_app.time, "monotonic", Clock.monotonic)
+    monkeypatch.setattr(panel_app, "_cpa_sleep", Clock.sleep)
+    monkeypatch.setattr(panel_app, "_cpa_cooldown_until", 110.0)
+
+    with pytest.raises(ConversionDeadlineExceeded) as raised:
+        panel_app._wait_for_cpa_cooldown(deadline=103.0)
+
+    assert raised.value.stage == "cpa_cooldown"
+    assert Clock.now == 103.0
 
 
 def test_identical_systemic_batch_failures_open_circuit_and_drain_remainder(
@@ -409,6 +477,105 @@ def test_identical_systemic_batch_failures_open_circuit_and_drain_remainder(
     assert panel_app._cpa_state["pending"] == 0
     assert panel_app._cpa_q.empty()
     assert not panel_app._cpa_inflight
+
+
+def test_batch_circuit_trip_rechecks_streak_after_interleaved_success(
+    isolated_pipeline,
+    monkeypatch,
+):
+    batch_id = panel_app._begin_cpa_run("reauthorize", 10)
+    signature = "consent_protocol_changed"
+    panel_app._cpa_state["run_error_signature"] = signature
+    panel_app._cpa_state["run_error_streak"] = (
+        panel_app.CPA_CIRCUIT_THRESHOLD - 1
+    )
+    queued_item = {
+        "email": "queued@example.invalid",
+        "sso": "queued-after-race-sso",
+        "fp": panel_app.sso_fingerprint("queued-after-race-sso"),
+        "batch_id": batch_id,
+    }
+    panel_app._cpa_inflight.add(queued_item["fp"])
+    panel_app._cpa_q.put(queued_item)
+    panel_app._cpa_state["pending"] = 1
+
+    def interleave_success(message):
+        if str(message).startswith("[CPA] FAIL"):
+            with panel_app._cpa_lock:
+                panel_app._cpa_state["run_error_signature"] = ""
+                panel_app._cpa_state["run_error_streak"] = 0
+
+    monkeypatch.setattr(panel_app, "log_line", interleave_success)
+    failed_sso = "failed-before-success-sso"
+    panel_app._record_cpa_failure(
+        {
+            "email": "failed@example.invalid",
+            "sso": failed_sso,
+            "fp": panel_app.sso_fingerprint(failed_sso),
+            "batch_id": batch_id,
+        },
+        panel_app.sso_fingerprint(failed_sso),
+        RuntimeError(
+            "consent 页面协议已变化：未找到 "
+            "submitOAuth2Consent Server Action"
+        ),
+        persist=False,
+    )
+
+    assert bool(panel_app._cpa_state.get("circuit_open")) is False
+    assert panel_app._cpa_state["pending"] == 1
+    assert panel_app._cpa_q.qsize() == 1
+
+
+def test_inflight_success_after_batch_circuit_preserves_diagnostic_signature(
+    isolated_pipeline,
+):
+    batch_id = panel_app._begin_cpa_run("reauthorize", 4)
+    signature = "consent_protocol_changed"
+    panel_app._cpa_state.update(
+        {
+            "run_status": "paused",
+            "run_fail": 3,
+            "run_error_signature": signature,
+            "run_error_streak": 3,
+            "circuit_open": True,
+            "circuit_scope": "batch",
+            "circuit_reason": "synthetic circuit",
+        }
+    )
+    sso = "inflight-success-after-circuit-sso"
+    fingerprint = panel_app.sso_fingerprint(sso)
+    panel_app._cpa_inflight.add(fingerprint)
+
+    ok, error = panel_app._commit_cpa_result(
+        {
+            "item": {
+                "email": "redacted@example.invalid",
+                "sso": sso,
+                "fp": fingerprint,
+                "batch_id": batch_id,
+                "redact_sensitive_logs": True,
+            },
+            "entry": {
+                "email": "redacted@example.invalid",
+                "sso": sso,
+                "access_token": "synthetic-access",
+                "refresh_token": "synthetic-refresh",
+                "auth_kind": "oauth",
+            },
+            "error": None,
+            "workspace_generation": panel_app._cpa_workspace_generation,
+            "worker_id": 1,
+            "attempts": 1,
+        }
+    )
+
+    assert ok is True
+    assert error == ""
+    assert panel_app._cpa_state["circuit_open"] is True
+    assert panel_app._cpa_state["run_status"] == "paused"
+    assert panel_app._cpa_state["run_error_signature"] == signature
+    assert panel_app._cpa_state["run_error_streak"] == 3
 
 
 def test_three_distinct_access_denials_open_batch_policy_circuit(
@@ -500,6 +667,54 @@ def test_three_unbatched_access_denials_pause_and_drain_automatic_cpa(
 
     assert queued is False
     assert reason == "oauth access denied circuit open"
+
+
+def test_automatic_circuit_trip_rechecks_policy_after_interleaved_success(
+    isolated_pipeline,
+    monkeypatch,
+):
+    panel_app._cpa_state["policy_denial_streak"] = (
+        panel_app.CPA_CIRCUIT_THRESHOLD - 1
+    )
+    queued_item = {
+        "email": "queued@example.invalid",
+        "sso": "queued-automatic-after-race-sso",
+        "fp": panel_app.sso_fingerprint(
+            "queued-automatic-after-race-sso"
+        ),
+        "batch_id": "",
+    }
+    panel_app._cpa_inflight.add(queued_item["fp"])
+    panel_app._cpa_q.put(queued_item)
+    panel_app._cpa_state["pending"] = 1
+
+    def interleave_success(message):
+        if str(message).startswith("[CPA] FAIL"):
+            with panel_app._cpa_lock:
+                panel_app._cpa_state["policy_denial_streak"] = 0
+
+    monkeypatch.setattr(panel_app, "log_line", interleave_success)
+    monkeypatch.setattr(
+        panel_app,
+        "_quarantine_access_denied_account",
+        lambda *_args, **_kwargs: {},
+    )
+    failed_sso = "automatic-denied-before-success-sso"
+    panel_app._record_cpa_failure(
+        {
+            "email": "denied@example.invalid",
+            "sso": failed_sso,
+            "fp": panel_app.sso_fingerprint(failed_sso),
+            "batch_id": "",
+        },
+        panel_app.sso_fingerprint(failed_sso),
+        RuntimeError("consent 失败: Access denied"),
+        persist=False,
+    )
+
+    assert bool(panel_app._cpa_state.get("circuit_open")) is False
+    assert panel_app._cpa_state["pending"] == 1
+    assert panel_app._cpa_q.qsize() == 1
 
 
 def test_worker_skips_automatic_item_observed_after_policy_circuit(
@@ -693,6 +908,67 @@ def test_worker_rechecks_quarantine_after_item_was_queued(
     assert not panel_app._cpa_inflight
 
 
+@pytest.mark.parametrize("stale_kind", ["generation", "durable_epoch"])
+def test_reauthorization_batch_stale_worker_item_closes_run_accounting(
+    isolated_pipeline,
+    monkeypatch,
+    stale_kind,
+):
+    conversions = []
+    monkeypatch.setattr(
+        panel_app,
+        "_convert_cpa_with_retry",
+        lambda *_args, **_kwargs: conversions.append("converted"),
+    )
+    batch_id = panel_app._begin_cpa_run("reauthorize", 1)
+    sso = f"stale-{stale_kind}-sso"
+    fingerprint = panel_app.sso_fingerprint(sso)
+    workspace_lease = panel_app._acquire_current_cpa_workspace_lease()
+    workspace_directory = str(workspace_lease.directory)
+    workspace_epoch = workspace_lease.epoch()
+    workspace_lease.release()
+    workspace_generation = panel_app._cpa_workspace_generation
+    if stale_kind == "generation":
+        workspace_generation -= 1
+    else:
+        workspace_epoch += 1
+
+    panel_app._cpa_inflight.add(fingerprint)
+    panel_app._cpa_state["pending"] = 1
+    panel_app._cpa_q.put(
+        {
+            "email": "redacted@example.invalid",
+            "sso": sso,
+            "fp": fingerprint,
+            "batch_id": batch_id,
+            "force": True,
+            "redact_sensitive_logs": True,
+            "workspace_generation": workspace_generation,
+            "workspace_directory": workspace_directory,
+            "workspace_epoch": workspace_epoch,
+        }
+    )
+    panel_app._cpa_q.put(None)
+
+    worker = threading.Thread(
+        target=panel_app._cpa_oauth_worker_loop,
+        args=(1,),
+    )
+    worker.start()
+    panel_app._cpa_q.join()
+    worker.join(timeout=2)
+
+    assert conversions == []
+    assert panel_app._cpa_state["run_total"] == 1
+    assert panel_app._cpa_state["run_ok"] == 0
+    assert panel_app._cpa_state["run_fail"] == 0
+    assert panel_app._cpa_state["run_skipped"] == 1
+    assert panel_app._cpa_state["run_status"] == "completed"
+    assert panel_app._cpa_state["pending"] == 0
+    assert panel_app._cpa_state["active_workers"] == 0
+    assert fingerprint not in panel_app._cpa_inflight
+
+
 def test_final_failure_preserves_old_cpa_and_clears_pipeline_state(
     isolated_pipeline, monkeypatch
 ):
@@ -785,6 +1061,70 @@ def test_stale_commit_result_never_writes_into_new_workspace(
     assert not panel_app.current_cpa_paths().index_path.exists()
     assert fingerprint not in panel_app._cpa_inflight
     assert fingerprint not in panel_app._cpa_done
+
+
+@pytest.mark.parametrize("stale_phase", ["before_lease", "after_lease"])
+def test_reauthorization_batch_stale_commit_closes_run_accounting(
+    isolated_pipeline,
+    monkeypatch,
+    stale_phase,
+):
+    batch_id = panel_app._begin_cpa_run("reauthorize", 1)
+    sso = f"stale-commit-{stale_phase}-sso"
+    fingerprint = panel_app.sso_fingerprint(sso)
+    panel_app._cpa_inflight.add(fingerprint)
+    result = {
+        "item": {
+            "email": "redacted@example.invalid",
+            "sso": sso,
+            "password": "",
+            "source": "old-workspace",
+            "fp": fingerprint,
+            "batch_id": batch_id,
+            "redact_sensitive_logs": True,
+        },
+        "entry": {
+            "email": "redacted@example.invalid",
+            "sso": sso,
+            "access_token": "synthetic-access",
+            "refresh_token": "synthetic-refresh",
+            "auth_kind": "oauth",
+        },
+        "error": None,
+        "workspace_generation": panel_app._cpa_workspace_generation,
+        "worker_id": 1,
+        "attempts": 1,
+    }
+
+    if stale_phase == "before_lease":
+        panel_app._cpa_workspace_generation += 1
+    else:
+        acquire_workspace_lease = (
+            panel_app._acquire_current_cpa_workspace_lease
+        )
+
+        def acquire_then_switch():
+            lease = acquire_workspace_lease()
+            panel_app._cpa_workspace_generation += 1
+            return lease
+
+        monkeypatch.setattr(
+            panel_app,
+            "_acquire_current_cpa_workspace_lease",
+            acquire_then_switch,
+        )
+
+    ok, error = panel_app._commit_cpa_result(result)
+
+    assert ok is False
+    assert error == "OAuth 凭据目录已切换"
+    assert panel_app._cpa_state["run_total"] == 1
+    assert panel_app._cpa_state["run_ok"] == 0
+    assert panel_app._cpa_state["run_fail"] == 0
+    assert panel_app._cpa_state["run_skipped"] == 1
+    assert panel_app._cpa_state["run_status"] == "completed"
+    assert not list(isolated_pipeline.glob("xai-*.json"))
+    assert fingerprint not in panel_app._cpa_inflight
 
 
 def test_credentials_config_exposes_saved_and_runtime_cpa_concurrency(

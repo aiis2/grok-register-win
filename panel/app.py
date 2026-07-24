@@ -96,6 +96,8 @@ SSO2CPA_PATH = Path(
 AUTO_CPA = os.environ.get("AUTO_CPA", "1").strip() not in ("0", "false", "False", "no")
 CPA_DELAY = float(os.environ.get("CPA_DELAY", "1.0"))
 CPA_CIRCUIT_THRESHOLD = 3
+CPA_PREFLIGHT_SAMPLE_TIMEOUT = 60.0
+CPA_PREFLIGHT_BATCH_TIMEOUT = 120.0
 
 
 def normalize_cpa_concurrency(value) -> int:
@@ -188,6 +190,7 @@ from lib.browser_window import (
 
 try:
     from sso2cpa_core import (  # type: ignore
+        ConversionDeadlineExceeded,
         build_sub2_payload,
         cpa_to_sub2_account,
         convert_one,
@@ -200,6 +203,9 @@ try:
     _CPA_CORE_OK = True
     _CPA_CORE_ERR = ""
 except Exception as _e:  # pragma: no cover
+    class ConversionDeadlineExceeded(RuntimeError):  # type: ignore
+        pass
+
     convert_one = None  # type: ignore
     build_sub2_payload = None  # type: ignore
     cpa_to_sub2_account = None  # type: ignore
@@ -954,27 +960,84 @@ def _extend_cpa_cooldown(seconds: float) -> None:
         )
 
 
-def _wait_for_cpa_cooldown() -> None:
+def _cpa_deadline_remaining(
+    deadline: Optional[float],
+    stage: str,
+) -> Optional[float]:
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise ConversionDeadlineExceeded(stage)
+    return remaining
+
+
+def _sleep_with_cpa_deadline(
+    seconds: float,
+    *,
+    deadline: Optional[float],
+    stage: str,
+) -> None:
+    delay = max(0.0, float(seconds))
+    if delay <= 0:
+        _cpa_deadline_remaining(deadline, stage)
+        return
+    remaining = _cpa_deadline_remaining(deadline, stage)
+    if remaining is None:
+        _cpa_sleep(delay)
+        return
+    sleep_for = min(delay, remaining)
+    _cpa_sleep(sleep_for)
+    if sleep_for < delay or time.monotonic() >= float(deadline):
+        raise ConversionDeadlineExceeded(stage)
+
+
+def _wait_for_cpa_cooldown(
+    *,
+    deadline: Optional[float] = None,
+) -> None:
     with _cpa_lock:
         remaining = max(0.0, _cpa_cooldown_until - time.monotonic())
     if remaining > 0:
-        _cpa_sleep(remaining)
+        _sleep_with_cpa_deadline(
+            remaining,
+            deadline=deadline,
+            stage="cpa_cooldown",
+        )
+    else:
+        _cpa_deadline_remaining(deadline, "cpa_cooldown")
 
 
 def _convert_cpa_with_retry(
-    sso: str, email: str
+    sso: str,
+    email: str,
+    *,
+    deadline: Optional[float] = None,
 ) -> Tuple[Optional[dict], Optional[Exception], int]:
     if convert_one is None:
         return None, RuntimeError(f"core missing: {_CPA_CORE_ERR}"), 1
     last_error: Optional[Exception] = None
     for attempt in range(1, 4):
-        _wait_for_cpa_cooldown()
         try:
+            _wait_for_cpa_cooldown(deadline=deadline)
+        except ConversionDeadlineExceeded as exc:
+            return None, exc, attempt
+        try:
+            convert_kwargs = {
+                "email": email,
+                "proxy": PROXY_URL,
+            }
+            if deadline is not None:
+                convert_kwargs["deadline"] = deadline
+            entry = convert_one(sso, **convert_kwargs)
+            _cpa_deadline_remaining(deadline, "cpa_conversion")
             return (
-                convert_one(sso, email=email, proxy=PROXY_URL),
+                entry,
                 None,
                 attempt,
             )
+        except ConversionDeadlineExceeded as exc:
+            return None, exc, attempt
         except Exception as exc:
             last_error = exc
             if attempt >= 3 or not is_transient_cpa_error(exc):
@@ -986,7 +1049,14 @@ def _convert_cpa_with_retry(
                 for status in (500, 502, 503, 504)
             ):
                 _extend_cpa_cooldown(delay)
-            _cpa_sleep(delay)
+            try:
+                _sleep_with_cpa_deadline(
+                    delay,
+                    deadline=deadline,
+                    stage="cpa_retry_backoff",
+                )
+            except ConversionDeadlineExceeded as deadline_error:
+                return None, deadline_error, attempt
     return None, last_error, 3
 
 
@@ -1768,6 +1838,47 @@ def cpa_stats() -> dict:
     return st
 
 
+def _reauthorization_public_cpa_stats() -> dict:
+    """Expose aggregate run state without account/error/path material."""
+    stats = cpa_stats()
+    public_keys = (
+        "enabled",
+        "core_ok",
+        "concurrency",
+        "pending",
+        "active_workers",
+        "commit_pending",
+        "commit_active",
+        "ok",
+        "fail",
+        "running",
+        "active",
+        "files",
+        "done",
+        "historical_ok",
+        "run_id",
+        "run_kind",
+        "run_status",
+        "run_total",
+        "run_queued",
+        "run_ok",
+        "run_fail",
+        "run_skipped",
+        "run_error_signature",
+        "run_error_streak",
+        "run_started_at",
+        "run_finished_at",
+        "circuit_open",
+        "circuit_scope",
+        "policy_denial_streak",
+    )
+    return {
+        key: stats[key]
+        for key in public_keys
+        if key in stats
+    }
+
+
 def _begin_cpa_run(kind: str, total: int) -> str:
     run_id = uuid.uuid4().hex
     now = datetime.now().isoformat(timespec="seconds")
@@ -1796,12 +1907,16 @@ def _begin_cpa_run(kind: str, total: int) -> str:
     return run_id
 
 
-def _finish_cpa_run_if_complete_locked() -> None:
-    total = max(0, int(_cpa_state.get("run_total") or 0))
-    completed = sum(
+def _cpa_run_terminal_count_locked() -> int:
+    return sum(
         max(0, int(_cpa_state.get(key) or 0))
         for key in ("run_ok", "run_fail", "run_skipped")
     )
+
+
+def _finish_cpa_run_if_complete_locked() -> None:
+    total = max(0, int(_cpa_state.get("run_total") or 0))
+    completed = _cpa_run_terminal_count_locked()
     if not total or completed < total:
         return
     status = str(_cpa_state.get("run_status") or "")
@@ -1817,10 +1932,24 @@ def _finish_cpa_run_if_complete_locked() -> None:
         )
 
 
+def _record_cpa_batch_skip_locked(batch_id: str) -> bool:
+    if not batch_id or _cpa_state.get("run_id") != batch_id:
+        return False
+    _cpa_state["run_skipped"] = (
+        int(_cpa_state.get("run_skipped") or 0) + 1
+    )
+    _finish_cpa_run_if_complete_locked()
+    return True
+
+
 def _systemic_cpa_error_signature(error: Exception) -> str:
+    if isinstance(error, ConversionDeadlineExceeded):
+        return "oauth_preflight_timeout"
     if is_access_denied_error(error):
         return "oauth_access_denied"
     text = str(error or "").casefold()
+    if "conversion deadline exceeded" in text:
+        return "oauth_preflight_timeout"
     if "submitoauth2consent" in text:
         return "consent_protocol_changed"
     if "consent 响应缺少 code" in text:
@@ -1885,6 +2014,10 @@ def _trip_cpa_batch_circuit(
             not batch_id
             or _cpa_state.get("run_id") != batch_id
             or bool(_cpa_state.get("circuit_open"))
+            or str(_cpa_state.get("run_error_signature") or "")
+            != signature
+            or int(_cpa_state.get("run_error_streak") or 0)
+            < CPA_CIRCUIT_THRESHOLD
         ):
             return 0
         _cpa_state["circuit_open"] = True
@@ -1944,7 +2077,11 @@ def _trip_cpa_automatic_policy_circuit(
     error: str,
 ) -> int:
     with _cpa_lock:
-        if bool(_cpa_state.get("circuit_open")):
+        if (
+            bool(_cpa_state.get("circuit_open"))
+            or int(_cpa_state.get("policy_denial_streak") or 0)
+            < CPA_CIRCUIT_THRESHOLD
+        ):
             return 0
         _cpa_state["circuit_open"] = True
         _cpa_state["circuit_scope"] = "automatic"
@@ -2039,6 +2176,7 @@ def enqueue_cpa_convert(
                         "fp": fp,
                         "force": force,
                         "batch_id": str(batch_id or ""),
+                        "redact_sensitive_logs": bool(batch_id),
                         "workspace_generation": generation,
                         "workspace_directory": workspace_directory,
                         "workspace_epoch": workspace_epoch,
@@ -2104,6 +2242,73 @@ def _reauthorization_identity(account: dict, sso: str) -> str:
     return f"sso:{sso_fingerprint(sso)}"
 
 
+def _reauthorization_candidate_identity(candidate: dict) -> str:
+    identity = str(candidate.get("_stable_identity") or "")
+    if identity:
+        return identity
+    return _reauthorization_identity(
+        candidate,
+        normalize_sso(candidate.get("sso") or ""),
+    )
+
+
+def _reauthorization_source_metadata() -> Dict[str, dict]:
+    """Return stable local time/line metadata for the active account files."""
+    metadata: Dict[str, dict] = {}
+    for path in list_account_files():
+        try:
+            mtime_ns = int(path.stat().st_mtime_ns)
+        except OSError:
+            mtime_ns = 0
+        line_indices: Dict[str, int] = {}
+        for line_index, line in enumerate(read_account_lines(path)):
+            line_indices.setdefault(line, line_index)
+        metadata[path.name] = {
+            "mtime_ns": mtime_ns,
+            "line_indices": line_indices,
+        }
+    return metadata
+
+
+def _reauthorization_account_snapshot() -> List[dict]:
+    """Read account files in global local-time order for reauthorization."""
+    files = list_account_files()
+    if not files:
+        return [dict(account) for account in unique_accounts()]
+
+    file_snapshots: List[Tuple[int, Path]] = []
+    for path in files:
+        try:
+            mtime_ns = int(path.stat().st_mtime_ns)
+        except OSError:
+            mtime_ns = 0
+        file_snapshots.append((mtime_ns, path))
+    file_snapshots.sort(
+        key=lambda item: (-item[0], item[1].name.casefold())
+    )
+
+    disabled_identities = current_disabled_account_pool().identity_sets()
+    seen_lines: Set[str] = set()
+    accounts: List[dict] = []
+    for mtime_ns, path in file_snapshots:
+        for line_index, line in enumerate(read_account_lines(path)):
+            if line in seen_lines:
+                continue
+            seen_lines.add(line)
+            info = parse_line(line)
+            if _account_info_is_disabled(info, disabled_identities):
+                continue
+            info["source"] = path.name
+            info["_source_mtime_ns"] = mtime_ns
+            info["_source_line_index"] = line_index
+            meta = decode_sso_meta(info.get("sso") or "")
+            info["session_id"] = (
+                meta.get("session_id") or meta.get("sid") or ""
+            )
+            accounts.append(info)
+    return accounts
+
+
 def _reauthorization_candidates(
     limit: int = 10000,
 ) -> Tuple[List[dict], int]:
@@ -2111,23 +2316,150 @@ def _reauthorization_candidates(
         safe_limit = max(1, min(int(limit), 10000))
     except (TypeError, ValueError):
         safe_limit = 10000
-    selected: List[dict] = []
-    seen_identities: Set[str] = set()
-    duplicates_skipped = 0
-    for account in unique_accounts():
+    source_metadata = _reauthorization_source_metadata()
+    source_fallback_indices: Dict[str, int] = {}
+    ordered: List[dict] = []
+    for account in _reauthorization_account_snapshot():
         sso = normalize_sso(account.get("sso") or "")
         if not sso:
             continue
         identity = _reauthorization_identity(account, sso)
+        source = str(account.get("source") or "")
+        source_info = source_metadata.get(source) or {}
+        fallback_index = source_fallback_indices.get(source, 0)
+        source_fallback_indices[source] = fallback_index + 1
+        raw = str(account.get("raw") or "").strip()
+        line_indices = source_info.get("line_indices") or {}
+        line_index = int(line_indices.get(raw, fallback_index))
+        candidate = dict(account)
+        candidate.update(
+            {
+                "sso": sso,
+                "_source_mtime_ns": int(
+                    account.get("_source_mtime_ns")
+                    or source_info.get("mtime_ns")
+                    or 0
+                ),
+                "_source_line_index": int(
+                    account.get("_source_line_index")
+                    if account.get("_source_line_index") is not None
+                    else line_index
+                ),
+                "_stable_identity": identity,
+            }
+        )
+        ordered.append(candidate)
+
+    ordered.sort(
+        key=lambda candidate: (
+            -int(candidate.get("_source_mtime_ns") or 0),
+            str(candidate.get("source") or "").casefold(),
+            int(candidate.get("_source_line_index") or 0),
+            str(candidate.get("_stable_identity") or ""),
+        )
+    )
+
+    selected: List[dict] = []
+    seen_identities: Set[str] = set()
+    duplicates_skipped = 0
+    for candidate in ordered:
+        identity = str(candidate.get("_stable_identity") or "")
         if identity in seen_identities:
             duplicates_skipped += 1
             continue
         seen_identities.add(identity)
         if len(selected) < safe_limit:
-            candidate = dict(account)
-            candidate["sso"] = sso
-            selected.append(candidate)
+            selected.append(dict(candidate))
+    for candidate_index, candidate in enumerate(selected):
+        candidate["_candidate_index"] = candidate_index
     return selected, duplicates_skipped
+
+
+def _plan_reauthorization_preflight_samples(
+    candidates: List[dict],
+    *,
+    max_samples: int = 5,
+) -> List[dict]:
+    """Plan deterministic oldest/newest/middle probes plus two reserves."""
+    if not candidates:
+        return []
+    sample_limit = max(1, min(int(max_samples), len(candidates)))
+    last_index = len(candidates) - 1
+    middle_index = last_index // 2
+    selected_indices: List[int] = []
+    selected_identities: Set[str] = set()
+
+    def identity_at(index: int) -> str:
+        return _reauthorization_candidate_identity(candidates[index])
+
+    def append_index(index: int) -> None:
+        if len(selected_indices) >= sample_limit:
+            return
+        identity = identity_at(index)
+        if identity in selected_identities:
+            return
+        selected_indices.append(index)
+        selected_identities.add(identity)
+
+    append_index(last_index)
+    append_index(0)
+
+    used_sources = {
+        str(candidates[index].get("source") or "")
+        for index in selected_indices
+        if str(candidates[index].get("source") or "")
+    }
+    middle_source = str(candidates[middle_index].get("source") or "")
+    if middle_source and middle_source in used_sources:
+        distinct_source_indices = [
+            index
+            for index, candidate in enumerate(candidates)
+            if identity_at(index) not in selected_identities
+            and str(candidate.get("source") or "")
+            and str(candidate.get("source") or "") not in used_sources
+        ]
+        if distinct_source_indices:
+            middle_index = min(
+                distinct_source_indices,
+                key=lambda index: (abs(index - middle_index), index),
+            )
+    append_index(middle_index)
+
+    reserve_targets = (last_index // 4, (last_index * 3) // 4)
+    for index in reserve_targets:
+        append_index(index)
+    if len(selected_indices) < sample_limit:
+        for index in range(len(candidates)):
+            append_index(index)
+
+    primary_count = min(3, len(candidates))
+    planned: List[dict] = []
+    for sample_index, candidate_index in enumerate(selected_indices):
+        candidate = dict(candidates[candidate_index])
+        candidate["_candidate_index"] = candidate_index
+        candidate["_sample_phase"] = (
+            "primary" if sample_index < primary_count else "reserve"
+        )
+        planned.append(candidate)
+    return planned
+
+
+def _reauthorization_sample_deadline(
+    batch_deadline: float,
+    *,
+    samples_remaining: int = 1,
+) -> float:
+    """Give each probe a bounded share while reserving time for later probes."""
+    now = time.monotonic()
+    remaining = max(0.0, float(batch_deadline) - now)
+    if remaining <= 0:
+        return now
+    fair_share = remaining / max(1, int(samples_remaining))
+    budget = min(
+        CPA_PREFLIGHT_SAMPLE_TIMEOUT,
+        fair_share if samples_remaining > 1 else remaining,
+    )
+    return now + max(0.0, budget)
 
 
 def _select_reauthorization_preflight_candidate(
@@ -2135,10 +2467,10 @@ def _select_reauthorization_preflight_candidate(
 ) -> Tuple[int, dict]:
     if not candidates:
         raise ValueError("没有可用于 OAuth 预检的账号")
-    # Account files are catalogued newest first. An established older account
-    # is a better protocol canary than a just-created account that xAI may
-    # reject individually even when the OAuth implementation is correct.
-    index = len(candidates) - 1
+    candidate = _plan_reauthorization_preflight_samples(
+        candidates, max_samples=1
+    )[0]
+    index = int(candidate.get("_candidate_index") or 0)
     return index, candidates[index]
 
 
@@ -2180,6 +2512,8 @@ def enqueue_all_sso_refresh(
 def _run_cpa_reauthorization_preflight(
     candidate: dict,
     batch_id: str,
+    *,
+    deadline: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """Convert and atomically commit one account before releasing a batch."""
     sso = normalize_sso(candidate.get("sso") or "")
@@ -2195,6 +2529,7 @@ def _run_cpa_reauthorization_preflight(
         "fp": fp,
         "force": True,
         "batch_id": batch_id,
+        "redact_sensitive_logs": True,
         "workspace_generation": _cpa_workspace_generation,
     }
     workspace_lease: Optional[_CPAWorkspaceLease] = None
@@ -2212,7 +2547,11 @@ def _run_cpa_reauthorization_preflight(
             _refresh_cpa_running_locked()
 
         try:
-            entry, error, attempts = _convert_cpa_with_retry(sso, email)
+            entry, error, attempts = _convert_cpa_with_retry(
+                sso,
+                email,
+                deadline=deadline,
+            )
         except Exception as exc:
             entry, error, attempts = None, exc, 1
         with _cpa_lock:
@@ -2313,12 +2652,8 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
                 if (
                     batch_id
                     and _cpa_state.get("run_id") == batch_id
-                    and (circuit_cancelled or disabled_account)
                 ):
-                    _cpa_state["run_skipped"] = (
-                        int(_cpa_state.get("run_skipped") or 0) + 1
-                    )
-                    _finish_cpa_run_if_complete_locked()
+                    _record_cpa_batch_skip_locked(batch_id)
             else:
                 _cpa_state["active_workers"] = (
                     int(_cpa_state.get("active_workers") or 0) + 1
@@ -2326,13 +2661,14 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
             _refresh_cpa_running_locked()
 
         if stale_workspace or circuit_cancelled or disabled_account:
+            item_label = _cpa_item_log_label(item, fp)
             if circuit_cancelled:
                 scope = (
                     "automatic"
                     if automatic_circuit_cancelled
                     else "batch"
                 )
-                log_line(f"[CPA] SKIP paused {scope} {email or fp[:12]}")
+                log_line(f"[CPA] SKIP paused {scope} {item_label}")
             elif disabled_account:
                 suffix = (
                     f" · {disabled_check_error}"
@@ -2340,8 +2676,10 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
                     else ""
                 )
                 log_line(
-                    f"[CPA] SKIP disabled {email or fp[:12]}{suffix}"
+                    f"[CPA] SKIP disabled {item_label}{suffix}"
                 )
+            else:
+                log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
             _cpa_q.task_done()
             continue
 
@@ -2377,6 +2715,11 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
                     0, int(_cpa_state.get("active_workers") or 0) - 1
                 )
                 _cpa_inflight.discard(fp)
+                if (
+                    batch_id
+                    and _cpa_state.get("run_id") == batch_id
+                ):
+                    _record_cpa_batch_skip_locked(batch_id)
                 _refresh_cpa_running_locked()
             if workspace_lease is not None:
                 workspace_lease.release()
@@ -2454,7 +2797,11 @@ def _cpa_matches_disabled_record(payload: dict, record: dict) -> bool:
     return bool(sso and sso_fingerprint(sso) in record_fingerprints)
 
 
-def _mark_disabled_cpa_files(record: dict) -> int:
+def _mark_disabled_cpa_files(
+    record: dict,
+    *,
+    redact_sensitive_logs: bool = False,
+) -> int:
     marked = 0
     disabled_at = str(
         record.get("disabled_at")
@@ -2472,11 +2819,40 @@ def _mark_disabled_cpa_files(record: dict) -> int:
             _write_json_atomic(path, updated)
             marked += 1
         except Exception as exc:
-            log_line(
-                "[CPA] 禁用旧凭据失败 "
-                f"{path.name}: {sanitize_log_message(exc)}"
-            )
+            if redact_sensitive_logs:
+                log_line("[CPA] 禁用旧凭据失败: storage_error")
+            else:
+                log_line(
+                    "[CPA] 禁用旧凭据失败 "
+                    f"{path.name}: {sanitize_log_message(exc)}"
+                )
     return marked
+
+
+def _cpa_redacts_sensitive_logs(item: dict) -> bool:
+    return bool(item.get("redact_sensitive_logs"))
+
+
+def _cpa_item_log_label(item: dict, fp: str) -> str:
+    if _cpa_redacts_sensitive_logs(item):
+        return f"fp={fp[:12]}"
+    return str(item.get("email") or fp[:12])
+
+
+def _cpa_error_for_storage(item: dict, error: Exception | str) -> str:
+    if not _cpa_redacts_sensitive_logs(item):
+        return str(error)
+    signature = _systemic_cpa_error_signature(
+        error if isinstance(error, Exception) else RuntimeError(str(error))
+    )
+    if not signature and is_transient_cpa_error(
+        error if isinstance(error, Exception) else RuntimeError(str(error))
+    ):
+        signature = "oauth_transient_error"
+    return (
+        "OAuth reauthorization failed "
+        f"({signature or 'account_or_protocol_error'})"
+    )
 
 
 def _quarantine_access_denied_account(item: dict, error: Exception | str) -> dict:
@@ -2488,11 +2864,15 @@ def _quarantine_access_denied_account(item: dict, error: Exception | str) -> dic
         raw=item.get("raw") or "",
     )
     record = current_disabled_account_pool().disable(candidate, error)
-    marked = _mark_disabled_cpa_files(record)
+    marked = _mark_disabled_cpa_files(
+        record,
+        redact_sensitive_logs=_cpa_redacts_sensitive_logs(item),
+    )
     invalidate_account_catalog()
+    fp = sso_fingerprint(item.get("sso") or "")
     log_line(
         "[CPA] DISABLED access_denied "
-        f"{record.get('email') or str(record.get('id') or '')[:12]}"
+        f"{_cpa_item_log_label(item, fp)}"
         f" · CPA={marked}"
     )
     return record
@@ -2507,7 +2887,8 @@ def _record_cpa_failure(
     persist: bool = True,
 ) -> None:
     email = item.get("email") or ""
-    err = str(error)
+    err = _cpa_error_for_storage(item, error)
+    redact_sensitive = _cpa_redacts_sensitive_logs(item)
     account_denied = is_access_denied_error(error)
     batch_id = str(item.get("batch_id") or "")
     trip_signature = ""
@@ -2560,24 +2941,26 @@ def _record_cpa_failure(
         try:
             paths = cpa_paths or current_cpa_paths()
             with open(paths.failed_path, "a", encoding="utf-8") as f:
+                failure_record = {
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                    "fp": fp,
+                    "error": err,
+                }
+                if not redact_sensitive:
+                    failure_record["email"] = email
                 f.write(
-                    json.dumps(
-                        {
-                            "at": datetime.now().isoformat(timespec="seconds"),
-                            "email": email,
-                            "fp": fp,
-                            "error": err,
-                        },
-                        ensure_ascii=False,
-                    )
+                    json.dumps(failure_record, ensure_ascii=False)
                     + "\n"
                 )
         except Exception:
             pass
-    log_line(f"[CPA] FAIL {email or fp[:12]}: {err}")
+    log_line(f"[CPA] FAIL {_cpa_item_log_label(item, fp)}: {err}")
     if account_denied:
         try:
-            _quarantine_access_denied_account(item, error)
+            _quarantine_access_denied_account(
+                item,
+                err if redact_sensitive else error,
+            )
         except Exception as exc:
             log_line(
                 "[CPA] 禁用账号池写入失败: "
@@ -2691,6 +3074,9 @@ def _commit_cpa_result(result: dict) -> Tuple[bool, str]:
             stale_workspace = item_generation != _cpa_workspace_generation
             if stale_workspace:
                 _cpa_inflight.discard(fp)
+                _record_cpa_batch_skip_locked(
+                    str(item.get("batch_id") or "")
+                )
         if stale_workspace:
             log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
             return False, "OAuth 凭据目录已切换"
@@ -2727,6 +3113,9 @@ def _commit_cpa_result(result: dict) -> Tuple[bool, str]:
             stale_workspace = item_generation != _cpa_workspace_generation
             if stale_workspace:
                 _cpa_inflight.discard(fp)
+                _record_cpa_batch_skip_locked(
+                    str(item.get("batch_id") or "")
+                )
         if stale_workspace:
             log_line(f"[CPA] SKIP stale workspace {fp[:12]}")
             return False, "OAuth 凭据目录已切换"
@@ -2793,18 +3182,26 @@ def _commit_cpa_result(result: dict) -> Tuple[bool, str]:
             _cpa_done.add(fp)
             _cpa_inflight.discard(fp)
             _cpa_state["ok"] = int(_cpa_state.get("ok") or 0) + 1
-            _cpa_state["last_ok_email"] = email_out
+            _cpa_state["last_ok_email"] = (
+                "" if _cpa_redacts_sensitive_logs(item) else email_out
+            )
             _cpa_state["last_error"] = ""
-            _cpa_state["policy_denial_streak"] = 0
+            circuit_open = bool(_cpa_state.get("circuit_open"))
+            if not circuit_open:
+                _cpa_state["policy_denial_streak"] = 0
             batch_id = str(item.get("batch_id") or "")
             if batch_id and _cpa_state.get("run_id") == batch_id:
                 _cpa_state["run_ok"] = (
                     int(_cpa_state.get("run_ok") or 0) + 1
                 )
-                _cpa_state["run_error_signature"] = ""
-                _cpa_state["run_error_streak"] = 0
+                if not circuit_open:
+                    _cpa_state["run_error_signature"] = ""
+                    _cpa_state["run_error_streak"] = 0
                 _finish_cpa_run_if_complete_locked()
-        log_line(f"[CPA] OK {email_out} -> {fname}")
+        if _cpa_redacts_sensitive_logs(item):
+            log_line(f"[CPA] OK {_cpa_item_log_label(item, fp)}")
+        else:
+            log_line(f"[CPA] OK {email_out} -> {fname}")
         return True, ""
     except Exception as exc:
         _record_cpa_failure(
@@ -8212,105 +8609,257 @@ def api_cpa_refresh_all():
 
         total = len(candidates)
         batch_id = _begin_cpa_run("reauthorize", total)
-        remaining_candidates = list(candidates)
+        sample_plan = _plan_reauthorization_preflight_samples(candidates)
+        primary_count = min(3, len(candidates))
+        batch_deadline = (
+            time.monotonic() + CPA_PREFLIGHT_BATCH_TIMEOUT
+        )
+        attempted_identities: Set[str] = set()
+        sampled_sources: Set[str] = set()
+        signature_counts: Dict[str, int] = {}
         disabled_count = 0
-        preflight_ok = False
-        preflight_error = ""
-        access_denied_circuit = False
-        while remaining_candidates:
-            preflight_index, preflight_candidate = (
-                _select_reauthorization_preflight_candidate(
-                    remaining_candidates
-                )
+        last_preflight_error = ""
+        fatal_preflight_error = ""
+        preflight = {
+            "ok": False,
+            "planned": primary_count,
+            "reserve_planned": max(
+                0, len(sample_plan) - primary_count
+            ),
+            "attempted": 0,
+            "reserve_attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "timed_out": 0,
+            "account_denied": 0,
+            "distinct_sources": 0,
+            "systemic_signature": "",
+        }
+
+        def run_preflight_sample(
+            candidate: dict,
+            *,
+            samples_remaining: int,
+        ) -> None:
+            nonlocal disabled_count
+            nonlocal fatal_preflight_error
+            nonlocal last_preflight_error
+
+            identity = _reauthorization_candidate_identity(candidate)
+            attempted_identities.add(identity)
+            source = str(candidate.get("source") or "")
+            if source:
+                sampled_sources.add(source)
+            preflight["attempted"] = (
+                int(preflight["attempted"]) + 1
             )
+            if candidate.get("_sample_phase") == "reserve":
+                preflight["reserve_attempted"] = (
+                    int(preflight["reserve_attempted"]) + 1
+                )
+
             with _cpa_lock:
-                fail_before = int(_cpa_state.get("run_fail") or 0)
-                ok_before = int(_cpa_state.get("run_ok") or 0)
-            preflight_ok, preflight_error = (
+                terminal_before = _cpa_run_terminal_count_locked()
+            sample_ok, sample_error = (
                 _run_cpa_reauthorization_preflight(
-                    preflight_candidate,
+                    candidate,
                     batch_id,
+                    deadline=_reauthorization_sample_deadline(
+                        batch_deadline,
+                        samples_remaining=samples_remaining,
+                    ),
                 )
             )
-            if preflight_ok:
+            if sample_ok:
+                preflight["succeeded"] = (
+                    int(preflight["succeeded"]) + 1
+                )
                 with _cpa_lock:
                     if (
                         _cpa_state.get("run_id") == batch_id
-                        and int(_cpa_state.get("run_ok") or 0)
-                        <= ok_before
+                        and _cpa_run_terminal_count_locked()
+                        <= terminal_before
                     ):
                         # Test doubles and alternate converters still obey
                         # the preflight contract even when they do not commit.
-                        _cpa_state["run_ok"] = ok_before + 1
-                remaining_candidates.pop(preflight_index)
-                break
+                        _cpa_state["run_ok"] = (
+                            int(_cpa_state.get("run_ok") or 0) + 1
+                        )
+                return
 
-            if is_access_denied_error(preflight_error):
+            preflight["failed"] = int(preflight["failed"]) + 1
+            last_preflight_error = str(
+                sample_error or "未知 OAuth 预检错误"
+            )
+            signature = _systemic_cpa_error_signature(
+                RuntimeError(last_preflight_error)
+            )
+            if signature == "oauth_preflight_timeout":
+                preflight["timed_out"] = (
+                    int(preflight["timed_out"]) + 1
+                )
+            if signature:
+                signature_counts[signature] = (
+                    int(signature_counts.get(signature) or 0) + 1
+                )
+            with _cpa_lock:
+                if (
+                    _cpa_state.get("run_id") == batch_id
+                    and _cpa_run_terminal_count_locked()
+                    <= terminal_before
+                ):
+                    _cpa_state["run_fail"] = (
+                        int(_cpa_state.get("run_fail") or 0) + 1
+                    )
+
+            if is_access_denied_error(last_preflight_error):
+                preflight["account_denied"] = (
+                    int(preflight["account_denied"]) + 1
+                )
                 try:
                     if not account_is_disabled(
-                        email=preflight_candidate.get("email") or "",
-                        sso=preflight_candidate.get("sso") or "",
+                        email=candidate.get("email") or "",
+                        sso=candidate.get("sso") or "",
                     ):
+                        quarantine_candidate = dict(candidate)
+                        quarantine_candidate[
+                            "redact_sensitive_logs"
+                        ] = True
                         _quarantine_access_denied_account(
-                            preflight_candidate,
-                            RuntimeError(preflight_error),
+                            quarantine_candidate,
+                            RuntimeError(last_preflight_error),
                         )
                 except Exception as exc:
-                    preflight_error = (
-                        "Access denied 账号写入禁用池失败: "
-                        f"{sanitize_log_message(exc)}"
+                    log_line(
+                        "[CPA] Access denied 账号写入禁用池失败: "
+                        f"{_systemic_cpa_error_signature(exc) or 'storage_error'}"
                     )
-                    break
-                disabled_count += 1
-                with _cpa_lock:
-                    if (
-                        _cpa_state.get("run_id") == batch_id
-                        and int(_cpa_state.get("run_fail") or 0)
-                        <= fail_before
-                    ):
-                        _cpa_state["run_fail"] = fail_before + 1
-                remaining_candidates.pop(preflight_index)
-                log_line(
-                    "[CPA] 预检账号 Access denied，已禁用并继续: "
-                    f"{preflight_candidate.get('email') or 'unknown'}"
-                )
-                if (
-                    disabled_count >= CPA_CIRCUIT_THRESHOLD
-                    and remaining_candidates
-                ):
-                    access_denied_circuit = True
-                    break
-                continue
-            break
+                    fatal_preflight_error = (
+                        "Access denied 账号写入禁用池失败"
+                    )
+                else:
+                    disabled_count += 1
 
-        if access_denied_circuit:
-            safe_error = (
-                "OAuth 服务端连续拒绝 3 个不同账号；"
-                "已暂停剩余 CPA，继续重试不会改变授权结果"
+        for sample_position, candidate in enumerate(
+            sample_plan[:primary_count]
+        ):
+            if fatal_preflight_error:
+                break
+            if time.monotonic() >= batch_deadline:
+                last_preflight_error = (
+                    "conversion deadline exceeded "
+                    "(stage=preflight_batch)"
+                )
+                break
+            run_preflight_sample(
+                candidate,
+                samples_remaining=primary_count - sample_position,
             )
+
+        def consensus_signature() -> str:
+            if int(preflight["succeeded"]) > 0:
+                return ""
+            for signature, count in signature_counts.items():
+                if count >= CPA_CIRCUIT_THRESHOLD:
+                    return signature
+            return ""
+
+        circuit_signature = consensus_signature()
+        if (
+            not fatal_preflight_error
+            and int(preflight["succeeded"]) == 0
+            and not circuit_signature
+        ):
+            reserve_plan = sample_plan[primary_count:]
+            for reserve_position, candidate in enumerate(reserve_plan):
+                if time.monotonic() >= batch_deadline:
+                    break
+                run_preflight_sample(
+                    candidate,
+                    samples_remaining=(
+                        len(reserve_plan) - reserve_position
+                    ),
+                )
+                circuit_signature = consensus_signature()
+                if (
+                    int(preflight["succeeded"]) > 0
+                    or circuit_signature
+                    or fatal_preflight_error
+                ):
+                    break
+
+        preflight["distinct_sources"] = len(sampled_sources)
+        circuit_signature = consensus_signature()
+        if circuit_signature:
+            preflight["systemic_signature"] = circuit_signature
+        preflight_ok = (
+            int(preflight["succeeded"]) > 0
+            and not fatal_preflight_error
+        )
+        preflight["ok"] = preflight_ok
+        remaining_candidates = [
+            candidate
+            for candidate in candidates
+            if _reauthorization_candidate_identity(candidate)
+            not in attempted_identities
+        ]
+
+        if not preflight_ok:
+            if circuit_signature == "oauth_access_denied":
+                safe_error = (
+                    "OAuth 服务端拒绝了 3 个不同时间/序号的样本；"
+                    "已暂停剩余 CPA"
+                )
+            elif circuit_signature:
+                safe_error = (
+                    "OAuth 多样本预检在 3 个不同账号上出现相同系统错误"
+                    f"（{circuit_signature}）；已暂停剩余 CPA"
+                )
+            elif fatal_preflight_error:
+                safe_error = fatal_preflight_error
+            else:
+                safe_error = (
+                    "OAuth 多样本预检未发现可用样本；"
+                    "已保留旧 CPA，未启动剩余批量任务"
+                )
+            preflight["error"] = safe_error
             untried = len(remaining_candidates)
+            run_status = (
+                "paused" if circuit_signature else "preflight_failed"
+            )
             with _cpa_lock:
                 if _cpa_state.get("run_id") == batch_id:
-                    _cpa_state["circuit_open"] = True
-                    _cpa_state["circuit_scope"] = "batch"
-                    _cpa_state["circuit_reason"] = safe_error
-                    _cpa_state["run_status"] = "paused"
-                    _cpa_state[
-                        "run_error_signature"
-                    ] = "oauth_access_denied"
-                    _cpa_state["run_error_streak"] = disabled_count
-                    _cpa_state["policy_denial_streak"] = disabled_count
+                    _cpa_state["run_status"] = run_status
+                    _cpa_state["run_queued"] = int(
+                        preflight["succeeded"]
+                    )
                     _cpa_state["run_last_error"] = safe_error
                     _cpa_state["run_skipped"] = (
                         int(_cpa_state.get("run_skipped") or 0) + untried
                     )
+                    if circuit_signature:
+                        _cpa_state["circuit_open"] = True
+                        _cpa_state["circuit_scope"] = "batch"
+                        _cpa_state["circuit_reason"] = safe_error
+                        _cpa_state[
+                            "run_error_signature"
+                        ] = circuit_signature
+                        _cpa_state["run_error_streak"] = int(
+                            signature_counts.get(circuit_signature) or 0
+                        )
+                        if circuit_signature == "oauth_access_denied":
+                            _cpa_state["policy_denial_streak"] = int(
+                                preflight["account_denied"]
+                            )
                     _cpa_state["run_finished_at"] = (
                         datetime.now().isoformat(timespec="seconds")
                     )
                     _finish_cpa_run_if_complete_locked()
             log_line(
-                "[CPA] 重新生成账号授权已暂停: "
-                f"连续 Access denied={disabled_count} · 未尝试={untried}"
+                "[CPA] 重新生成账号授权多样本预检失败: "
+                f"尝试={preflight['attempted']} · "
+                f"成功={preflight['succeeded']} · "
+                f"失败={preflight['failed']} · 未尝试={untried}"
             )
             return (
                 jsonify(
@@ -8318,101 +8867,27 @@ def api_cpa_refresh_all():
                         "ok": False,
                         "error": safe_error,
                         "total": total,
-                        "queued": 0,
+                        "queued": int(preflight["succeeded"]),
+                        "failed": int(preflight["failed"]),
                         "skipped": untried,
                         "disabled": disabled_count,
                         "duplicates_skipped": duplicates_skipped,
-                        "preflight": {
-                            "ok": False,
-                            "error": safe_error,
-                        },
-                        "cpa": cpa_stats(),
+                        "preflight": preflight,
+                        "cpa": _reauthorization_public_cpa_stats(),
                     }
                 ),
                 422,
-            )
-
-        if not preflight_ok and remaining_candidates:
-            safe_error = sanitize_log_message(
-                preflight_error or "未知 OAuth 预检错误"
-            )
-            with _cpa_lock:
-                if _cpa_state.get("run_id") == batch_id:
-                    if int(_cpa_state.get("run_fail") or 0) == 0:
-                        _cpa_state["run_fail"] = 1
-                    completed = (
-                        int(_cpa_state.get("run_ok") or 0)
-                        + int(_cpa_state.get("run_fail") or 0)
-                        + int(_cpa_state.get("run_skipped") or 0)
-                    )
-                    _cpa_state["run_skipped"] = (
-                        int(_cpa_state.get("run_skipped") or 0)
-                        + max(0, total - completed)
-                    )
-                    _cpa_state["run_status"] = "preflight_failed"
-                    _cpa_state["run_last_error"] = safe_error
-                    _cpa_state["run_finished_at"] = datetime.now().isoformat(
-                        timespec="seconds"
-                    )
-                    _finish_cpa_run_if_complete_locked()
-            log_line(
-                "[CPA] 重新生成账号授权预检失败，批量任务未启动: "
-                f"{safe_error}"
-            )
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": f"单账号预检失败，未启动批量任务: {safe_error}",
-                        "total": total,
-                        "queued": 0,
-                        "skipped": max(0, total - 1),
-                        "disabled": disabled_count,
-                        "duplicates_skipped": duplicates_skipped,
-                        "preflight": {"ok": False, "error": safe_error},
-                        "cpa": cpa_stats(),
-                    }
-                ),
-                422,
-            )
-
-        if not preflight_ok:
-            with _cpa_lock:
-                if _cpa_state.get("run_id") == batch_id:
-                    _cpa_state["run_queued"] = 0
-                    _finish_cpa_run_if_complete_locked()
-            log_line(
-                "[CPA] 所有重新授权候选均为 Access denied，"
-                f"已禁用: {disabled_count}"
-            )
-            return jsonify(
-                {
-                    "ok": True,
-                    "total": total,
-                    "queued": 0,
-                    "skipped": disabled_count,
-                    "disabled": disabled_count,
-                    "duplicates_skipped": duplicates_skipped,
-                    "preflight": {
-                        "ok": False,
-                        "error": "所有候选账号均已被禁用",
-                    },
-                    "message": (
-                        f"已禁用 {disabled_count} 个 Access denied 账号；"
-                        "没有可继续授权的账号"
-                    ),
-                    "cpa": cpa_stats(),
-                }
             )
 
         bulk_queued = enqueue_reauthorization_candidates(
             remaining_candidates, batch_id
         )
-        queued = 1 + bulk_queued
+        queued = int(preflight["succeeded"]) + bulk_queued
         queue_skipped = max(
             0, len(remaining_candidates) - bulk_queued
         )
-        skipped = disabled_count + queue_skipped
+        failed = int(preflight["failed"])
+        skipped = queue_skipped
         with _cpa_lock:
             if _cpa_state.get("run_id") == batch_id:
                 _cpa_state["run_queued"] = queued
@@ -8420,11 +8895,14 @@ def api_cpa_refresh_all():
                     int(_cpa_state.get("run_skipped") or 0)
                     + queue_skipped
                 )
-                _cpa_state["run_status"] = "running"
+                if not bool(_cpa_state.get("circuit_open")):
+                    _cpa_state["run_status"] = "running"
                 _finish_cpa_run_if_complete_locked()
         log_line(
-            "[CPA] 重新生成账号授权预检通过并入队: "
-            f"{queued} · 禁用: {disabled_count} · "
+            "[CPA] 重新生成账号授权多样本预检通过并入队: "
+            f"样本={preflight['attempted']} · "
+            f"样本成功={preflight['succeeded']} · "
+            f"处理/入队={queued} · 禁用={disabled_count} · "
             f"队列跳过: {queue_skipped} · 身份去重: {duplicates_skipped}"
         )
         return jsonify(
@@ -8432,15 +8910,16 @@ def api_cpa_refresh_all():
                 "ok": True,
                 "total": total,
                 "queued": queued,
+                "failed": failed,
                 "skipped": skipped,
                 "disabled": disabled_count,
                 "duplicates_skipped": duplicates_skipped,
-                "preflight": {"ok": True},
+                "preflight": preflight,
                 "message": (
-                    "重新生成账号授权预检通过；"
+                    "重新生成账号授权多样本预检通过；"
                     f"已处理/入队 {queued} 个账号"
                 ),
-                "cpa": cpa_stats(),
+                "cpa": _reauthorization_public_cpa_stats(),
             }
         )
     finally:

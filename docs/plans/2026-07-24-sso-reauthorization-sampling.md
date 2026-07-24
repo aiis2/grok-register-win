@@ -366,4 +366,3 @@ Confirm:
 - ordinary background CPA conversion behavior is unchanged when no deadline is passed;
 - all timeout and failure branches release locks and workspace leases;
 - route totals satisfy `run_ok + run_fail + run_skipped == run_total`.
-

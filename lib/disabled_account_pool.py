@@ -7,6 +7,7 @@ import re
 import threading
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -161,8 +162,15 @@ class DisabledAccountPool:
             except OSError:
                 pass
 
+    @contextmanager
     def _with_write_lock(self):
-        return InterProcessFileLock(self.lock_path)
+        lock = InterProcessFileLock(self.lock_path)
+        if not lock.acquire(blocking=False):
+            raise OAuthOwnershipConflict("无法获取跨进程凭据锁")
+        try:
+            yield lock
+        finally:
+            lock.release()
 
     def _records(self) -> dict[str, dict]:
         payload = self._read_payload()

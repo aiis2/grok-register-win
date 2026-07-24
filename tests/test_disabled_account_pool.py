@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from lib import disabled_account_pool as disabled_account_pool_module
 from lib.disabled_account_pool import (
     DisabledAccountPool,
     DisabledAccountPoolError,
@@ -123,6 +124,49 @@ def test_two_pool_instances_update_without_losing_existing_records(tmp_path):
     assert {
         item["email"] for item in DisabledAccountPool(directory).list_public()
     } == {"one@example.com", "two@example.com"}
+
+
+def test_write_lock_is_fail_fast_instead_of_blocking_forever(
+    tmp_path,
+    monkeypatch,
+):
+    acquire_calls = []
+
+    class BusyLock:
+        def __init__(self, _path):
+            pass
+
+        def acquire(self, *, blocking=False):
+            acquire_calls.append(blocking)
+            return False
+
+        def release(self):
+            return None
+
+        def __enter__(self):
+            if not self.acquire(blocking=True):
+                raise disabled_account_pool_module.OAuthOwnershipConflict(
+                    "busy"
+                )
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            self.release()
+
+    monkeypatch.setattr(
+        disabled_account_pool_module,
+        "InterProcessFileLock",
+        BusyLock,
+    )
+    pool = DisabledAccountPool(tmp_path / "disabled")
+
+    with pytest.raises(
+        DisabledAccountPoolError,
+        match="正在被其他程序更新",
+    ):
+        pool.disable(_account(), "Access denied")
+
+    assert acquire_calls == [False]
 
 
 def test_corrupt_registry_is_never_replaced_with_empty_pool(tmp_path):
