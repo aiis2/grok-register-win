@@ -19,7 +19,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 
 
 def _fix_curl_ca_bundle():
@@ -267,6 +267,57 @@ class ConvertError(Exception):
     pass
 
 
+def _safe_oauth_text(value: Any, fallback: str = "") -> str:
+    text = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    return (text or fallback)[:160]
+
+
+def _is_oauth_access_denied(error: Any, description: Any = "") -> bool:
+    error_text = _safe_oauth_text(error).casefold().replace(" ", "_")
+    description_text = _safe_oauth_text(description).casefold()
+    return (
+        error_text == "access_denied"
+        or "access denied" in description_text
+    )
+
+
+class OAuthAuthorizationDenied(ConvertError):
+    """Explicit authorization decision returned by the OAuth service."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        http_status: int = 0,
+        oauth_error: str = "access_denied",
+        description: str = "Access denied",
+        transport: str = "",
+    ) -> None:
+        self.stage = _safe_oauth_text(stage, "oauth")
+        self.http_status = max(0, int(http_status or 0))
+        self.oauth_error = _safe_oauth_text(
+            oauth_error,
+            "access_denied",
+        )
+        self.description = _safe_oauth_text(
+            description,
+            "Access denied",
+        )
+        self.transport = _safe_oauth_text(transport)
+        details = [
+            f"stage={self.stage}",
+            f"status={self.http_status}",
+            f"error={self.oauth_error}",
+        ]
+        if self.transport:
+            details.append(f"transport={self.transport}")
+        super().__init__(
+            "OAuth Access denied ("
+            + ", ".join(details)
+            + f"): {self.description}"
+        )
+
+
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
@@ -489,7 +540,19 @@ def _extract_code_from_url(url: str) -> str:
     return ""
 
 
-def parse_consent_code(body: str) -> str:
+def _oauth_error_from_url(url: str) -> Tuple[str, str]:
+    try:
+        params = parse_qs(urlparse(url).query, keep_blank_values=True)
+    except Exception:
+        return "", ""
+    error = _safe_oauth_text((params.get("error") or [""])[0])
+    description = _safe_oauth_text(
+        (params.get("error_description") or [""])[0]
+    )
+    return error, description
+
+
+def parse_consent_code(body: str, *, status_code: int = 0) -> str:
     for line in (body or "").splitlines():
         idx = line.find("{")
         if idx < 0:
@@ -499,8 +562,28 @@ def parse_consent_code(body: str) -> str:
         except Exception:
             continue
         if isinstance(obj, dict) and obj.get("success") is False:
+            oauth_error = _safe_oauth_text(
+                obj.get("error") or obj.get("action"),
+                "unknown",
+            )
+            description = _safe_oauth_text(
+                obj.get("error_description") or obj.get("error"),
+                oauth_error,
+            )
+            if _is_oauth_access_denied(oauth_error, description):
+                raise OAuthAuthorizationDenied(
+                    stage="consent_action",
+                    http_status=status_code,
+                    oauth_error=(
+                        "access_denied"
+                        if oauth_error.casefold() == "access denied"
+                        else oauth_error
+                    ),
+                    description=description,
+                    transport="rsc",
+                )
             raise ConvertError(
-                f"consent 失败: {obj.get('error') or obj.get('action') or 'unknown'}"
+                f"consent 失败: {description}"
             )
         if isinstance(obj, dict) and obj.get("code"):
             return str(obj["code"])
@@ -623,9 +706,21 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
     # for deployments that answer with a loopback callback instead.
     redirect_url = cres.headers.get("Location", "") if cres.status_code in (301, 302, 303, 307, 308) else ""
     if redirect_url:
+        oauth_error, oauth_description = _oauth_error_from_url(redirect_url)
+        if _is_oauth_access_denied(oauth_error, oauth_description):
+            raise OAuthAuthorizationDenied(
+                stage="consent_redirect",
+                http_status=cres.status_code,
+                oauth_error=oauth_error or "access_denied",
+                description=oauth_description or "Access denied",
+                transport="redirect",
+            )
         code = _extract_code_from_url(redirect_url)
     else:
-        code = parse_consent_code(cres.text)
+        code = parse_consent_code(
+            cres.text,
+            status_code=cres.status_code,
+        )
 
     if not code:
         _debug_dump_consent_html(cres.text[:5000], f"status={cres.status_code} url={redirect_url}")
@@ -656,13 +751,30 @@ def sso_to_token(sso: str, proxy: str = "") -> dict:
     except Exception as e:
         raise ConvertError(f"token 请求失败: {e}") from e
 
-    if tres.status_code < 200 or tres.status_code >= 300:
-        raise ConvertError(f"token HTTP {tres.status_code}: {tres.text[:300]}")
-
     try:
         token = tres.json()
     except Exception as e:
+        if tres.status_code < 200 or tres.status_code >= 300:
+            raise ConvertError(
+                f"token HTTP {tres.status_code}: non-JSON response"
+            ) from e
         raise ConvertError(f"token 非 JSON: {tres.text[:200]}") from e
+
+    token_error = _safe_oauth_text(token.get("error"))
+    token_description = _safe_oauth_text(
+        token.get("error_description") or token.get("message")
+    )
+    if _is_oauth_access_denied(token_error, token_description):
+        raise OAuthAuthorizationDenied(
+            stage="token_exchange",
+            http_status=tres.status_code,
+            oauth_error=token_error or "access_denied",
+            description=token_description or "Access denied",
+            transport="json",
+        )
+    if tres.status_code < 200 or tres.status_code >= 300:
+        detail = token_description or token_error or "OAuth error"
+        raise ConvertError(f"token HTTP {tres.status_code}: {detail}")
 
     if not token.get("access_token"):
         raise ConvertError(f"token 响应无 access_token: {token}")

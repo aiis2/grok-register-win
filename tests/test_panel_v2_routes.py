@@ -85,7 +85,7 @@ def test_v1_10_release_documents_combined_bounded_log_console(
         encoding="utf-8"
     )
 
-    assert "version-v1.13.0" in readme
+    assert "version-v1.14.0" in readme
     for phrase in (
         "aiis2",
         "注册与日志",
@@ -115,7 +115,7 @@ def test_v1_10_1_release_documents_turnstile_recovery_and_soak_validation(
         encoding="utf-8"
     )
 
-    assert "version-v1.13.0" in readme
+    assert "version-v1.14.0" in readme
     for phrase in (
         "aiis2",
         "Chromium",
@@ -146,7 +146,7 @@ def test_v1_11_release_documents_parallel_cpa_pipeline_and_registration_stabilit
         encoding="utf-8"
     )
 
-    assert "version-v1.13.0" in readme
+    assert "version-v1.14.0" in readme
     for phrase in (
         "aiis2",
         "默认使用 2 个 worker",
@@ -176,7 +176,7 @@ def test_v1_12_release_documents_oauth_single_instance_ownership(
         encoding="utf-8"
     )
 
-    assert "version-v1.13.0" in readme
+    assert "version-v1.14.0" in readme
     for phrase in (
         "aiis2",
         "重新生成账号授权",
@@ -206,7 +206,7 @@ def test_v1_13_release_documents_access_denied_disabled_account_pool(
         encoding="utf-8"
     )
 
-    assert "version-v1.13.0" in readme
+    assert "version-v1.14.0" in readme
     for phrase in (
         "aiis2",
         "Access denied",
@@ -221,6 +221,40 @@ def test_v1_13_release_documents_access_denied_disabled_account_pool(
         "Playwright",
     ):
         assert phrase in release
+
+
+def test_v1_14_release_documents_oauth_denial_diagnostics_and_circuit(
+    isolated_v2_panel,
+):
+    root = Path(panel_app.__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    release = (root / "docs" / "releases" / "v1.14.0.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "version-v1.14.0" in readme
+    for phrase in (
+        "aiis2",
+        "consent action",
+        "303 callback",
+        "token exchange",
+        "连续 3",
+        "disabled",
+        "paused",
+        "竞态",
+        "544 passed",
+    ):
+        assert phrase in release
+    release_lower = release.casefold()
+    for forbidden in (
+        "password-secret",
+        "web-sso-secret",
+        "access-token-secret",
+        "refresh-token-secret",
+    ):
+        assert forbidden not in release_lower
+
+
 def test_v2_uses_only_local_assets_and_has_server_rendered_legacy_fallback(
     isolated_v2_panel,
 ):

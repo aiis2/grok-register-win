@@ -923,6 +923,54 @@ def test_reauthorize_route_quarantines_all_access_denied_candidates(
     assert payload["cpa"]["run_status"] == "completed_with_failures"
 
 
+def test_reauthorize_preflight_stops_after_three_access_denials(
+    isolated_refresh_state, monkeypatch
+):
+    monkeypatch.setattr(
+        panel_app,
+        "unique_accounts",
+        lambda: [
+            {"email": f"user-{index}@example.com", "sso": f"sso-{index}"}
+            for index in range(5)
+        ],
+    )
+    preflight_calls = []
+
+    def preflight(candidate, _batch_id):
+        preflight_calls.append(candidate["email"])
+        return False, "consent 失败: Access denied"
+
+    monkeypatch.setattr(
+        panel_app,
+        "_run_cpa_reauthorization_preflight",
+        preflight,
+        raising=False,
+    )
+
+    response = panel_app.app.test_client().post(
+        "/api/cpa/reauthorize",
+        json={"limit": 10000},
+    )
+
+    assert response.status_code == 422
+    payload = response.get_json()
+    assert payload["ok"] is False
+    assert payload["disabled"] == 3
+    assert payload["queued"] == 0
+    assert payload["skipped"] == 2
+    assert preflight_calls == [
+        "user-4@example.com",
+        "user-3@example.com",
+        "user-2@example.com",
+    ]
+    assert payload["cpa"]["circuit_open"] is True
+    assert payload["cpa"]["run_status"] == "paused"
+    assert (
+        payload["cpa"]["run_error_signature"]
+        == "oauth_access_denied"
+    )
+
+
 def test_reauthorize_route_still_aborts_on_systemic_preflight_failure(
     isolated_refresh_state, monkeypatch
 ):

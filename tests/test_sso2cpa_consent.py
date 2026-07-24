@@ -78,6 +78,45 @@ class _Session:
         )
 
 
+class _RedirectDeniedSession(_Session):
+    def post(self, url, *, data, **kwargs):
+        self.posts.append((url, data, kwargs))
+        if url.startswith("https://accounts.x.ai/oauth2/consent"):
+            return _Response(
+                status_code=303,
+                url=url,
+                headers={
+                    "Location": (
+                        "http://127.0.0.1:56121/callback"
+                        "?error=access_denied"
+                        "&error_description=Access%20denied"
+                        "&state=opaque"
+                    )
+                },
+            )
+        raise AssertionError("token exchange must not run after consent denial")
+
+
+class _TokenDeniedSession(_Session):
+    def post(self, url, *, data, **kwargs):
+        self.posts.append((url, data, kwargs))
+        if url.startswith("https://accounts.x.ai/oauth2/consent"):
+            return _Response(
+                status_code=200,
+                url=url,
+                text='0:{"a":"$@1"}\n1:{"success":true,"code":"authorization-code"}',
+            )
+        return _Response(
+            status_code=400,
+            url=url,
+            text='{"error":"invalid_grant","error_description":"Access denied"}',
+            payload={
+                "error": "invalid_grant",
+                "error_description": "Access denied",
+            },
+        )
+
+
 def test_extract_next_action_id_is_bound_to_consent_action():
     script = (
         'createServerReference)("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
@@ -114,8 +153,54 @@ def test_consent_uses_current_next_server_action_protocol(monkeypatch):
     assert "https://accounts.x.ai/" in requested_urls
 
 
-def test_parse_consent_code_surfaces_server_action_error():
-    with pytest.raises(sso2cpa_core.ConvertError, match="Access denied"):
+def test_parse_consent_code_classifies_server_action_access_denied():
+    with pytest.raises(
+        sso2cpa_core.OAuthAuthorizationDenied
+    ) as raised:
         sso2cpa_core.parse_consent_code(
-            '0:{"a":"$@1"}\n1:{"success":false,"error":"Access denied"}'
+            '0:{"a":"$@1"}\n'
+            '1:{"success":false,"error":"Access denied"}',
+            status_code=200,
         )
+
+    assert raised.value.stage == "consent_action"
+    assert raised.value.http_status == 200
+    assert raised.value.oauth_error == "access_denied"
+    assert raised.value.transport == "rsc"
+
+
+def test_consent_redirect_access_denied_is_not_reported_as_missing_code(
+    monkeypatch,
+):
+    session = _RedirectDeniedSession()
+    monkeypatch.setattr(sso2cpa_core, "new_session", lambda _proxy="": session)
+    monkeypatch.setattr(sso2cpa_core, "_CONSENT_ACTION_ID_CACHE", "")
+
+    with pytest.raises(
+        sso2cpa_core.OAuthAuthorizationDenied
+    ) as raised:
+        sso2cpa_core.sso_to_token("header.payload.signature")
+
+    assert raised.value.stage == "consent_redirect"
+    assert raised.value.http_status == 303
+    assert raised.value.oauth_error == "access_denied"
+    assert raised.value.transport == "redirect"
+
+
+def test_token_access_denied_is_classified_without_leaking_response_body(
+    monkeypatch,
+):
+    session = _TokenDeniedSession()
+    monkeypatch.setattr(sso2cpa_core, "new_session", lambda _proxy="": session)
+    monkeypatch.setattr(sso2cpa_core, "_CONSENT_ACTION_ID_CACHE", "")
+
+    with pytest.raises(
+        sso2cpa_core.OAuthAuthorizationDenied
+    ) as raised:
+        sso2cpa_core.sso_to_token("header.payload.signature")
+
+    assert raised.value.stage == "token_exchange"
+    assert raised.value.http_status == 400
+    assert raised.value.oauth_error == "invalid_grant"
+    assert raised.value.transport == "json"
+    assert "Access denied" in str(raised.value)

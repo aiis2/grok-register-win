@@ -696,6 +696,9 @@ _cpa_state: Dict = {
     "run_started_at": "",
     "run_finished_at": "",
     "circuit_open": False,
+    "circuit_scope": "",
+    "circuit_reason": "",
+    "policy_denial_streak": 0,
 }
 _cpa_done: Set[str] = set()  # sso fingerprints already converted
 _cpa_inflight: Set[str] = set()
@@ -1746,6 +1749,9 @@ def _reset_cpa_workspace_state() -> None:
                 "run_started_at": "",
                 "run_finished_at": "",
                 "circuit_open": False,
+                "circuit_scope": "",
+                "circuit_reason": "",
+                "policy_denial_streak": 0,
             }
         )
 
@@ -1782,6 +1788,9 @@ def _begin_cpa_run(kind: str, total: int) -> str:
                 "run_started_at": now,
                 "run_finished_at": "",
                 "circuit_open": False,
+                "circuit_scope": "",
+                "circuit_reason": "",
+                "policy_denial_streak": 0,
             }
         )
     return run_id
@@ -1809,6 +1818,8 @@ def _finish_cpa_run_if_complete_locked() -> None:
 
 
 def _systemic_cpa_error_signature(error: Exception) -> str:
+    if is_access_denied_error(error):
+        return "oauth_access_denied"
     text = str(error or "").casefold()
     if "submitoauth2consent" in text:
         return "consent_protocol_changed"
@@ -1877,12 +1888,74 @@ def _trip_cpa_batch_circuit(
         ):
             return 0
         _cpa_state["circuit_open"] = True
+        _cpa_state["circuit_scope"] = "batch"
+        _cpa_state["circuit_reason"] = (
+            "OAuth 服务端连续拒绝，当前 CPA 批次已暂停"
+            if signature == "oauth_access_denied"
+            else "CPA 批次连续发生相同系统错误，已暂停"
+        )
         _cpa_state["run_status"] = "paused"
         _cpa_state["run_error_signature"] = signature
         _cpa_state["run_last_error"] = error
     drained = _drain_cpa_batch(batch_id)
     log_line(
         "[CPA] 批次熔断暂停: "
+        f"signature={signature} · 已跳过待执行账号={drained}"
+    )
+    return drained
+
+
+def _drain_unbatched_cpa_queue() -> int:
+    drained: List[dict] = []
+    preserved: List[Optional[dict]] = []
+    while True:
+        try:
+            queued_item = _cpa_q.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            if queued_item is not None and not str(
+                queued_item.get("batch_id") or ""
+            ):
+                drained.append(queued_item)
+            else:
+                preserved.append(queued_item)
+        finally:
+            _cpa_q.task_done()
+    for queued_item in preserved:
+        _cpa_q.put(queued_item)
+
+    if not drained:
+        return 0
+    with _cpa_lock:
+        for item in drained:
+            fp = item.get("fp") or sso_fingerprint(item.get("sso") or "")
+            _cpa_inflight.discard(fp)
+        _cpa_state["pending"] = max(
+            0,
+            int(_cpa_state.get("pending") or 0) - len(drained),
+        )
+        _refresh_cpa_running_locked()
+    return len(drained)
+
+
+def _trip_cpa_automatic_policy_circuit(
+    signature: str,
+    error: str,
+) -> int:
+    with _cpa_lock:
+        if bool(_cpa_state.get("circuit_open")):
+            return 0
+        _cpa_state["circuit_open"] = True
+        _cpa_state["circuit_scope"] = "automatic"
+        _cpa_state["circuit_reason"] = (
+            "OAuth 服务端连续拒绝，自动 CPA 已暂停"
+        )
+        _cpa_state["run_error_signature"] = signature
+        _cpa_state["run_last_error"] = error
+    drained = _drain_unbatched_cpa_queue()
+    log_line(
+        "[CPA] 自动转换熔断暂停: "
         f"signature={signature} · 已跳过待执行账号={drained}"
     )
     return drained
@@ -1901,6 +1974,21 @@ def enqueue_cpa_convert(
         return False, "auto_cpa disabled"
     if not _CPA_CORE_OK or convert_one is None:
         return False, f"sso2cpa core unavailable: {_CPA_CORE_ERR}"
+    with _cpa_lock:
+        batch_paused = bool(
+            batch_id
+            and _cpa_state.get("circuit_open")
+            and _cpa_state.get("run_id") == batch_id
+        )
+        automatic_paused = bool(
+            not batch_id
+            and not force
+            and _cpa_state.get("circuit_open")
+        )
+    if batch_paused:
+        return False, "oauth batch circuit open"
+    if automatic_paused:
+        return False, "oauth access denied circuit open"
     sso = normalize_sso(sso)
     if not sso:
         return False, "empty sso"
@@ -1919,6 +2007,18 @@ def enqueue_cpa_convert(
             workspace_directory = str(workspace_lease.directory)
             workspace_epoch = workspace_lease.epoch()
             with _cpa_lock:
+                if (
+                    batch_id
+                    and _cpa_state.get("circuit_open")
+                    and _cpa_state.get("run_id") == batch_id
+                ):
+                    return False, "oauth batch circuit open"
+                if (
+                    not batch_id
+                    and not force
+                    and _cpa_state.get("circuit_open")
+                ):
+                    return False, "oauth access denied circuit open"
                 if fp in _cpa_inflight:
                     return False, "already queued"
                 if not force and fp in _cpa_done:
@@ -2194,14 +2294,27 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
             )
             stale_workspace = item_generation != _cpa_workspace_generation
             batch_id = str(item.get("batch_id") or "")
-            circuit_cancelled = bool(
+            batch_circuit_cancelled = bool(
                 batch_id
                 and _cpa_state.get("run_id") == batch_id
                 and _cpa_state.get("circuit_open")
             )
+            automatic_circuit_cancelled = bool(
+                not batch_id
+                and not bool(item.get("force"))
+                and _cpa_state.get("circuit_open")
+            )
+            circuit_cancelled = (
+                batch_circuit_cancelled
+                or automatic_circuit_cancelled
+            )
             if stale_workspace or circuit_cancelled or disabled_account:
                 _cpa_inflight.discard(fp)
-                if circuit_cancelled or disabled_account:
+                if (
+                    batch_id
+                    and _cpa_state.get("run_id") == batch_id
+                    and (circuit_cancelled or disabled_account)
+                ):
                     _cpa_state["run_skipped"] = (
                         int(_cpa_state.get("run_skipped") or 0) + 1
                     )
@@ -2214,9 +2327,12 @@ def _cpa_oauth_worker_loop(worker_id: int) -> None:
 
         if stale_workspace or circuit_cancelled or disabled_account:
             if circuit_cancelled:
-                log_line(
-                    f"[CPA] SKIP paused batch {email or fp[:12]}"
+                scope = (
+                    "automatic"
+                    if automatic_circuit_cancelled
+                    else "batch"
                 )
+                log_line(f"[CPA] SKIP paused {scope} {email or fp[:12]}")
             elif disabled_account:
                 suffix = (
                     f" · {disabled_check_error}"
@@ -2395,12 +2511,19 @@ def _record_cpa_failure(
     account_denied = is_access_denied_error(error)
     batch_id = str(item.get("batch_id") or "")
     trip_signature = ""
+    trip_automatic_policy = False
     with _cpa_lock:
         _cpa_inflight.discard(fp)
         if account_denied:
             _cpa_done.discard(fp)
         _cpa_state["fail"] = int(_cpa_state.get("fail") or 0) + 1
         _cpa_state["last_error"] = err
+        if account_denied:
+            _cpa_state["policy_denial_streak"] = (
+                int(_cpa_state.get("policy_denial_streak") or 0) + 1
+            )
+        else:
+            _cpa_state["policy_denial_streak"] = 0
         if batch_id and _cpa_state.get("run_id") == batch_id:
             _cpa_state["run_fail"] = (
                 int(_cpa_state.get("run_fail") or 0) + 1
@@ -2426,6 +2549,13 @@ def _record_cpa_failure(
             ):
                 trip_signature = signature
             _finish_cpa_run_if_complete_locked()
+        elif (
+            account_denied
+            and int(_cpa_state.get("policy_denial_streak") or 0)
+            >= CPA_CIRCUIT_THRESHOLD
+            and not bool(_cpa_state.get("circuit_open"))
+        ):
+            trip_automatic_policy = True
     if persist:
         try:
             paths = cpa_paths or current_cpa_paths()
@@ -2455,6 +2585,11 @@ def _record_cpa_failure(
             )
     if trip_signature:
         _trip_cpa_batch_circuit(batch_id, trip_signature, err)
+    elif trip_automatic_policy:
+        _trip_cpa_automatic_policy_circuit(
+            "oauth_access_denied",
+            err,
+        )
 
 
 def _authorization_recency(candidate: dict) -> Tuple[int, str]:
@@ -2660,6 +2795,7 @@ def _commit_cpa_result(result: dict) -> Tuple[bool, str]:
             _cpa_state["ok"] = int(_cpa_state.get("ok") or 0) + 1
             _cpa_state["last_ok_email"] = email_out
             _cpa_state["last_error"] = ""
+            _cpa_state["policy_denial_streak"] = 0
             batch_id = str(item.get("batch_id") or "")
             if batch_id and _cpa_state.get("run_id") == batch_id:
                 _cpa_state["run_ok"] = (
@@ -6224,7 +6360,10 @@ async function poll(){
       const run = cpa.run_id
         ? ` · 本轮 ${cpa.run_status||'idle'} (${cpa.run_ok||0}/${cpa.run_fail||0}/${cpa.run_skipped||0})`
         : '';
-      const circuit = cpa.circuit_open ? ' · 已熔断暂停' : '';
+      const circuit = cpa.circuit_open
+        ? (' · 已熔断暂停'
+          + (cpa.circuit_reason ? (': '+cpa.circuit_reason) : ''))
+        : '';
       document.getElementById('cpa_hint').textContent =
         `代理走本机 Clash · 自动CPA: ${cpa.enabled?'开':'关'} · ${core} · 文件 ${cpa.files||0}${run}${circuit}${last}${err}`;
     }
@@ -8077,6 +8216,7 @@ def api_cpa_refresh_all():
         disabled_count = 0
         preflight_ok = False
         preflight_error = ""
+        access_denied_circuit = False
         while remaining_candidates:
             preflight_index, preflight_candidate = (
                 _select_reauthorization_preflight_candidate(
@@ -8134,8 +8274,63 @@ def api_cpa_refresh_all():
                     "[CPA] 预检账号 Access denied，已禁用并继续: "
                     f"{preflight_candidate.get('email') or 'unknown'}"
                 )
+                if (
+                    disabled_count >= CPA_CIRCUIT_THRESHOLD
+                    and remaining_candidates
+                ):
+                    access_denied_circuit = True
+                    break
                 continue
             break
+
+        if access_denied_circuit:
+            safe_error = (
+                "OAuth 服务端连续拒绝 3 个不同账号；"
+                "已暂停剩余 CPA，继续重试不会改变授权结果"
+            )
+            untried = len(remaining_candidates)
+            with _cpa_lock:
+                if _cpa_state.get("run_id") == batch_id:
+                    _cpa_state["circuit_open"] = True
+                    _cpa_state["circuit_scope"] = "batch"
+                    _cpa_state["circuit_reason"] = safe_error
+                    _cpa_state["run_status"] = "paused"
+                    _cpa_state[
+                        "run_error_signature"
+                    ] = "oauth_access_denied"
+                    _cpa_state["run_error_streak"] = disabled_count
+                    _cpa_state["policy_denial_streak"] = disabled_count
+                    _cpa_state["run_last_error"] = safe_error
+                    _cpa_state["run_skipped"] = (
+                        int(_cpa_state.get("run_skipped") or 0) + untried
+                    )
+                    _cpa_state["run_finished_at"] = (
+                        datetime.now().isoformat(timespec="seconds")
+                    )
+                    _finish_cpa_run_if_complete_locked()
+            log_line(
+                "[CPA] 重新生成账号授权已暂停: "
+                f"连续 Access denied={disabled_count} · 未尝试={untried}"
+            )
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": safe_error,
+                        "total": total,
+                        "queued": 0,
+                        "skipped": untried,
+                        "disabled": disabled_count,
+                        "duplicates_skipped": duplicates_skipped,
+                        "preflight": {
+                            "ok": False,
+                            "error": safe_error,
+                        },
+                        "cpa": cpa_stats(),
+                    }
+                ),
+                422,
+            )
 
         if not preflight_ok and remaining_candidates:
             safe_error = sanitize_log_message(

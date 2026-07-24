@@ -411,7 +411,7 @@ def test_identical_systemic_batch_failures_open_circuit_and_drain_remainder(
     assert not panel_app._cpa_inflight
 
 
-def test_account_specific_access_denied_does_not_open_batch_circuit(
+def test_three_distinct_access_denials_open_batch_policy_circuit(
     isolated_pipeline,
 ):
     batch_id = "account-specific-denial"
@@ -444,7 +444,117 @@ def test_account_specific_access_denied_does_not_open_batch_circuit(
         )
 
     assert panel_app._cpa_state["run_fail"] == 3
-    assert panel_app._cpa_state["circuit_open"] is False
+    assert panel_app._cpa_state["circuit_open"] is True
+    assert panel_app._cpa_state["run_status"] == "paused"
+    assert (
+        panel_app._cpa_state["run_error_signature"]
+        == "oauth_access_denied"
+    )
+
+
+def test_three_unbatched_access_denials_pause_and_drain_automatic_cpa(
+    isolated_pipeline,
+):
+    for index in range(2):
+        sso = f"queued-after-denial-{index}"
+        item = {
+            "email": f"queued-{index}@example.invalid",
+            "sso": sso,
+            "fp": panel_app.sso_fingerprint(sso),
+            "batch_id": "",
+        }
+        panel_app._cpa_inflight.add(item["fp"])
+        panel_app._cpa_q.put(item)
+        panel_app._cpa_state["pending"] += 1
+
+    for index in range(3):
+        sso = f"automatic-denied-{index}"
+        item = {
+            "email": f"denied-{index}@example.invalid",
+            "sso": sso,
+            "fp": panel_app.sso_fingerprint(sso),
+            "batch_id": "",
+        }
+        panel_app._cpa_inflight.add(item["fp"])
+        panel_app._record_cpa_failure(
+            item,
+            item["fp"],
+            RuntimeError("consent 失败: Access denied"),
+            persist=False,
+        )
+
+    assert panel_app._cpa_state["circuit_open"] is True
+    assert (
+        panel_app._cpa_state["circuit_reason"]
+        == "OAuth 服务端连续拒绝，自动 CPA 已暂停"
+    )
+    assert panel_app._cpa_state["pending"] == 0
+    assert panel_app._cpa_q.empty()
+    assert not panel_app._cpa_inflight
+
+    queued, reason = panel_app.enqueue_cpa_convert(
+        email="new@example.invalid",
+        sso="new-sso-after-circuit",
+        source="register",
+    )
+
+    assert queued is False
+    assert reason == "oauth access denied circuit open"
+
+
+def test_worker_skips_automatic_item_observed_after_policy_circuit(
+    isolated_pipeline, monkeypatch
+):
+    calls = 0
+
+    def convert(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"access_token": "must-not-run"}, None, 1
+
+    monkeypatch.setattr(panel_app, "_convert_cpa_with_retry", convert)
+    panel_app._cpa_state.update(
+        {
+            "circuit_open": True,
+            "circuit_scope": "automatic",
+            "circuit_reason": "OAuth 服务端连续拒绝，自动 CPA 已暂停",
+        }
+    )
+    sso = "raced-automatic-sso"
+    fingerprint = panel_app.sso_fingerprint(sso)
+    workspace_lease = panel_app._acquire_current_cpa_workspace_lease()
+    workspace_directory = str(workspace_lease.directory)
+    workspace_epoch = workspace_lease.epoch()
+    workspace_lease.release()
+    panel_app._cpa_inflight.add(fingerprint)
+    panel_app._cpa_state["pending"] = 1
+    panel_app._cpa_q.put(
+        {
+            "email": "raced@example.invalid",
+            "sso": sso,
+            "fp": fingerprint,
+            "batch_id": "",
+            "force": False,
+            "workspace_generation": 11,
+            "workspace_directory": workspace_directory,
+            "workspace_epoch": workspace_epoch,
+        }
+    )
+    panel_app._cpa_q.put(None)
+
+    worker = threading.Thread(
+        target=panel_app._cpa_oauth_worker_loop,
+        args=(1,),
+    )
+    worker.start()
+    panel_app._cpa_q.join()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert calls == 0
+    assert fingerprint not in panel_app._cpa_inflight
+    assert panel_app._cpa_state["pending"] == 0
+    assert panel_app._cpa_result_q.empty()
 
 
 def test_access_denied_quarantines_account_and_disables_existing_cpa(
